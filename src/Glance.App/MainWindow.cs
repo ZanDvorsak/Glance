@@ -14,6 +14,7 @@ using Ellipse = Avalonia.Controls.Shapes.Ellipse;
 using Avalonia.Threading;
 using Glance.App.Services;
 using Glance.Core.Display;
+using Glance.Core.Editing;
 using Glance.Core.Usb;
 using Glance.Core.Settings;
 using Glance.App.Views;

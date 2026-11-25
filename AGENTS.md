@@ -25,6 +25,7 @@ Read this first, then `README.md` (user-facing) and `docs/PROTOCOL.md` (the disp
 | `src/Glance.App` | Avalonia 12 editor (code-built UI, no XAML beyond `App.axaml`) |
 | `src/Glance.Runner` | Elevated WinForms tray app that owns the display and serves sensors |
 | `src/Glance.SensorHost` | Older standalone elevated sensor feed (the runner supersedes it) |
+| `src/Glance.Tests` | xUnit tests for `Glance.Core` |
 | `src/Glance.Demo`, `src/UsbProbe` | Small diagnostic tools, not shipped |
 | `build/` | `publish.ps1` (package + zip), `make-installer.ps1` (Inno Setup) |
 | `installer/` | Inno Setup script and the "before you start" text |
@@ -117,13 +118,20 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
 
 ## Verifying changes
 
-There is **no automated test project yet.** Verification so far was done with throw-away console harnesses that reference `Glance.Core`
-(rendering to PNG with real sensor data, replaying logic, hostile-input tests) and by capturing editor windows with `PrintWindow`.
-If you add logic, prefer adding a real xUnit project. The pure, hardware-free pieces that deserve tests first:
-`DisplayPusher.NextPageIndex`, `SetupChecks.DiagnoseDisplay`, `ThemePackage.Import` (safety), `UndoManager`, `Theme` snapshots/migration, `AidaImporter`.
+```powershell
+dotnet test src/Glance.Tests -c Release      # ~240 tests, about 2 seconds, no hardware needed
+```
 
-Anything involving the physical display (timing, colours, rotation, blanking) must be confirmed by a person looking at it, or reported as unverified.
-
+- `src/Glance.Tests` (xUnit) covers the hardware-free logic: page rotation, setup diagnoses, `.glance` import safety, undo,
+  theme snapshots and old-file migration, presets and templates (every preset on a typical fake PC and on a PC with no sensors),
+  the AIDA64 importer and sensor mapping, pixel-level rendering checks (bars, thresholds, alignment, gauges), colour conversion and the sensor pipe.
+  `TestSupport.cs` has `Fake.Typical()` (a realistic LibreHardwareMonitor-style sensor list) and helpers to render a theme to a bitmap.
+- Tests never use the real pipe names (`SensorPipeServer`/`PipeSensorClient` take a name) so they cannot collide with a running runner.
+- CI (`.github/workflows/ci.yml`) builds the solution and runs the tests on every push.
+- When you fix a bug or add logic, add a test. A good habit: break the code on purpose and check a test fails (a "mutation check");
+  this found a real gap once (the stale-sensor-feed rule was untested).
+- **Not testable here:** anything involving the physical display (timing, colours, rotation, blanking), real sensors, drivers or installers.
+  Confirm those by running the app and looking, or report them as unverified. Editor windows can be captured with `PrintWindow` for a visual check.
 ## Git
 
 - `main` on `https://github.com/ZanDvorsak/Glance` (HTTPS; Git Credential Manager holds the login).
@@ -135,4 +143,4 @@ Anything involving the physical display (timing, colours, rotation, blanking) mu
 - No Linux/macOS support yet (needs libusb 1.0 USB backend and per-OS sensors); the code is Windows-only today.
 - Installer and exes are unsigned (SmartScreen will warn); no GitHub release has been published.
 - Full-screen video is limited to ~2.5 fps by USB; GIFs and small animations look better.
-- No automated tests (see above).
+- UI code (`Glance.App`) has no automated tests; its logic should live in `Glance.Core` where it can be tested.

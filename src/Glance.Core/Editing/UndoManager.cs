@@ -1,4 +1,4 @@
-namespace Glance.App.Services;
+namespace Glance.Core.Editing;
 
 /// <summary>Snapshot-based undo/redo. Snapshots are whole-theme JSON strings, which keeps every kind of edit undoable the same way.</summary>
 public sealed class UndoManager

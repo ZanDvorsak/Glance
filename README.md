@@ -38,6 +38,14 @@ dotnet build Glance.sln -c Release
 
 Run `Glance.Runner` (asks for administrator rights) and `Glance.App` (the editor) from their `bin\Release` folders.
 
+## Tests
+
+```powershell
+dotnet test src/Glance.Tests -c Release
+```
+
+About 240 unit tests cover the logic that does not need the display. They also run on GitHub for every push.
+
 ## Package and installer
 
 ```powershell
@@ -57,6 +65,7 @@ and find each other there.
 | `src/Glance.App` | Avalonia editor |
 | `src/Glance.Runner` | Elevated tray app that owns the display |
 | `src/Glance.SensorHost` | Standalone elevated sensor feed |
+| `src/Glance.Tests` | Unit tests |
 | `src/UsbProbe` | Small diagnostic tool for the USB protocol |
 | `build/` | Publish and installer scripts |
 | `installer/` | Inno Setup definition |

@@ -15,6 +15,10 @@ public sealed class SensorPipeServer : IDisposable
 {
     private readonly CancellationTokenSource _cts = new();
     private volatile string _latest = "[]";
+    private readonly string _pipeName;
+
+    /// <param name="pipeName">Defaults to the name the editor looks for. Tests pass their own so they never collide with a running runner.</param>
+    public SensorPipeServer(string? pipeName = null) => _pipeName = pipeName ?? PipeSensorClient.PipeName;
 
     public void Publish(IReadOnlyList<SensorInfo> snapshot) => _latest = JsonSerializer.Serialize(snapshot);
 
@@ -28,7 +32,7 @@ public sealed class SensorPipeServer : IDisposable
             {
                 try
                 {
-                    var server = NamedPipeServerStreamAcl.Create(PipeSensorClient.PipeName, PipeDirection.Out, 16,
+                    var server = NamedPipeServerStreamAcl.Create(_pipeName, PipeDirection.Out, 16,
                         PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 0, 0, security);
                     await server.WaitForConnectionAsync(_cts.Token);
                     _ = Serve(server);
