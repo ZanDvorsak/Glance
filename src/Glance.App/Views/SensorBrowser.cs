@@ -24,7 +24,7 @@ public sealed class SensorBrowser : DockPanel
     private readonly TextBox _filter = new() { PlaceholderText = "Search sensors (e.g. fan, nct, core #3)...", Margin = new Thickness(0, 0, 0, 6) };
     private readonly WrapPanel _groupChips = new() { Margin = new Thickness(0, 0, 0, 4) };
     private readonly WrapPanel _typeChips = new() { Margin = new Thickness(0, 0, 0, 6) };
-    private readonly ListBox _list = new();
+    private readonly ListBox _list = new() { MinHeight = 150 };
     private readonly TextBlock _count = new() { Opacity = 0.6, FontSize = 11, Margin = new Thickness(0, 4, 0, 0) };
 
     private readonly Dictionary<string, Row> _rows = new();
@@ -108,7 +108,7 @@ public sealed class SensorBrowser : DockPanel
         {
             var chip = new ToggleButton
             {
-                Content = text, IsChecked = isOn, FontSize = 11, Padding = new Thickness(9, 3), Margin = new Thickness(0, 0, 4, 4),
+                Content = text, IsChecked = isOn, FontSize = 10.5, Padding = new Thickness(8, 2), Margin = new Thickness(0, 0, 3, 3),
                 CornerRadius = new CornerRadius(999), MinHeight = 0,
             };
             chip.Click += (_, _) =>

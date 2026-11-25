@@ -10,9 +10,11 @@ public static class Handles
     /// <summary>Bars, gauges, graphs, images and panels resize freely; text widgets scale their font from the corners.</summary>
     public static bool IsFree(Widget w) => w.Kind is WidgetKind.Bar or WidgetKind.Gauge or WidgetKind.Graph or WidgetKind.Image or WidgetKind.Panel;
 
-    public static IEnumerable<(Handle handle, SKRect rect)> Layout(Widget w, float size)
+    public static IEnumerable<(Handle handle, SKRect rect)> Layout(Widget w, float size) => Layout(w.LastBounds, IsFree(w), size);
+
+    /// <param name="free">All eight handles (true) or only the corners (text, which scales its font).</param>
+    public static IEnumerable<(Handle handle, SKRect rect)> Layout(SKRect b, bool free, float size)
     {
-        var b = w.LastBounds;
         if (b.Width <= 0 && b.Height <= 0) yield break;
         float h = size / 2, cx = b.MidX, cy = b.MidY;
         SKRect At(float x, float y) => new(x - h, y - h, x + h, y + h);
@@ -21,7 +23,7 @@ public static class Handles
         yield return (Handle.TopRight, At(b.Right, b.Top));
         yield return (Handle.BottomLeft, At(b.Left, b.Bottom));
         yield return (Handle.BottomRight, At(b.Right, b.Bottom));
-        if (!IsFree(w)) yield break;
+        if (!free) yield break;
         yield return (Handle.Top, At(cx, b.Top));
         yield return (Handle.Bottom, At(cx, b.Bottom));
         yield return (Handle.Left, At(b.Left, cy));
@@ -29,9 +31,11 @@ public static class Handles
     }
 
     /// <summary>The handle under a point (theme coordinates), or None. <paramref name="tolerance"/> enlarges the hit area.</summary>
-    public static Handle HitTest(Widget w, float x, float y, float size, float tolerance)
+    public static Handle HitTest(Widget w, float x, float y, float size, float tolerance) => HitTest(w.LastBounds, IsFree(w), x, y, size, tolerance);
+
+    public static Handle HitTest(SKRect b, bool free, float x, float y, float size, float tolerance)
     {
-        foreach (var (handle, rect) in Layout(w, size))
+        foreach (var (handle, rect) in Layout(b, free, size))
         {
             var r = rect;
             r.Inflate(tolerance, tolerance);

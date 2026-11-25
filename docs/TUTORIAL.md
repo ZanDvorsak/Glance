@@ -55,7 +55,8 @@ The window can be made smaller; the top and bottom bars wrap and the right colum
   The font file is copied into the theme's `assets` folder when you save and goes into `.glance` exports, so the theme looks the same on another PC. Clear the **Font file** box to go back to the installed font.
   Bold and italic on a font file are simulated, so for a real bold style pick that style's own font file.
 - **Thresholds** change the colour with the value (for example amber at 75 and red at 90 for temperatures).
-- Widgets that came from the same preset share a **Group** and move together. Hold **Alt** while dragging to move just one piece.
+- Widgets that came from the same preset share a **Group**. A group moves together and is **resized together**: select any part and a yellow outline with handles appears around the whole group; dragging a handle scales every part (text and thickness included, hold **Shift** to keep the shape). Hold **Alt** while dragging to move just one piece.
+- **Make your own group**: Ctrl+click or Shift+click several layers in the layer list, then click **Group**. **Ungroup** splits a group again.
 - **Undo/Redo** (Ctrl+Z / Ctrl+Y) cover everything, including page changes.
 - **Up / Down / Copy / Delete** under the layer list reorder, duplicate and remove widgets.
 

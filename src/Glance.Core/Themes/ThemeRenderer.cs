@@ -53,9 +53,18 @@ public sealed class ThemeRenderer : IDisposable
                 PathEffect = SKPathEffect.CreateDash(new[] { 4f, 3f }, 0) };
             canvas.DrawRect(selected.LastBounds, p);
 
+            // a widget in a group is resized as a whole: draw the group's outline and put the handles on it
+            var members = GroupOps.Members(page.Widgets, selected);
+            var box = members.Count > 1 ? GroupOps.Union(members) : selected.LastBounds;
+            if (members.Count > 1)
+            {
+                using var gp = new SKPaint { Style = SKPaintStyle.Stroke, StrokeWidth = 1.5f, Color = new SKColor(0xFF, 0xC8, 0x40), IsAntialias = true };
+                canvas.DrawRect(box, gp);
+            }
+
             using var fill = new SKPaint { Style = SKPaintStyle.Fill, Color = SKColors.White, IsAntialias = true };
             using var edge = new SKPaint { Style = SKPaintStyle.Stroke, StrokeWidth = 1.5f, Color = new SKColor(0x40, 0xC4, 0xFF), IsAntialias = true };
-            foreach (var (_, rect) in Handles.Layout(selected, HandleSize))
+            foreach (var (_, rect) in Handles.Layout(box, members.Count > 1 || Handles.IsFree(selected), HandleSize))
             {
                 canvas.DrawRect(rect, fill);
                 canvas.DrawRect(rect, edge);

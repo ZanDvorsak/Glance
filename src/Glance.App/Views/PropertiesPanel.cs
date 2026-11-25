@@ -26,7 +26,17 @@ public sealed class PropertiesPanel : ScrollViewer
     private static readonly Lazy<string[]> Fonts = new(() =>
         Avalonia.Media.FontManager.Current.SystemFonts.Select(f => f.Name).Distinct().OrderBy(n => n).ToArray());
 
-    public PropertiesPanel() { Content = _stack; HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled; }
+    // a subclass only gets the ScrollViewer template (scroll area, scrollbar, wheel support) with this key
+    protected override Type StyleKeyOverride => typeof(ScrollViewer);
+
+    public PropertiesPanel()
+    {
+        Content = _stack;
+        HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled;
+        VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto;
+        // same thin overlay scrollbar as every other scroll area in the app (the default), so no custom bar settings here
+        _stack.Margin = new Thickness(10, 10, 14, 10);   // keeps the overlay bar off the fields
+    }
 
     public void Show(Theme theme, Widget? w)
     {

@@ -93,6 +93,7 @@ public sealed class MainWindow : Window
     private Handle _handle;                       // resize handle currently being dragged
     private SKRect _startRect;
     private double _startFont;
+    private GroupOps.Scaler? _groupScaler;   // set while a whole group is being resized
 
     // undo / redo
     private UndoManager _undo = null!;
@@ -250,10 +251,12 @@ public sealed class MainWindow : Window
             add.Children.Add(b);
         }
 
-        var actions = new UniformGrid { Columns = 4, Margin = new Thickness(0, 8, 0, 0) };
+        var actions = new UniformGrid { Columns = 3, Margin = new Thickness(0, 8, 0, 0) };
         actions.Children.Add(SmallBtn("Up", "Bring forward", (_, _) => MoveSelected(+1)));
         actions.Children.Add(SmallBtn("Down", "Send backward", (_, _) => MoveSelected(-1)));
         actions.Children.Add(SmallBtn("Copy", "Duplicate", (_, _) => DuplicateSelected()));
+        actions.Children.Add(SmallBtn("Group", "Group the layers selected in the list (Ctrl+click or Shift+click to select several). A group moves and resizes as one.", (_, _) => GroupSelected()));
+        actions.Children.Add(SmallBtn("Ungroup", "Split the selected widget's group back into separate widgets", (_, _) => UngroupSelected()));
         var del = SmallBtn("Delete", "Delete (Del key)", (_, _) => DeleteSelected());
         del.Classes.Add("danger");
         actions.Children.Add(del);
@@ -274,7 +277,13 @@ public sealed class MainWindow : Window
         DockPanel.SetDock(layerCap, Dock.Top); dock.Children.Add(layerCap);
         DockPanel.SetDock(actions, Dock.Bottom); dock.Children.Add(actions);
         dock.Children.Add(_layers);
-        return Card(dock);
+
+        // On a short window the card keeps a usable height and the whole column scrolls, so the Add widget buttons stay reachable.
+        const double minColumnHeight = 640;
+        var card = Card(dock);
+        var scroll = new ScrollViewer { Content = card, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
+        scroll.SizeChanged += (_, e) => card.Height = Math.Max(minColumnHeight, e.NewSize.Height);
+        return scroll;
     }
 
     private Control BuildCentre()
@@ -452,13 +461,15 @@ public sealed class MainWindow : Window
     private Control BuildRight()
     {
         var grid = new Grid { RowSpacing = 12, RowDefinitions = new RowDefinitions("2*,3*") };
+        grid.RowDefinitions[0].MinHeight = 240;   // properties
+        grid.RowDefinitions[1].MinHeight = 440;   // sensor search: chips take about 220 px, the rest is the list
         var propsCard = Card(_props, new Thickness(0)); propsCard.ClipToBounds = true;
         var sensorCard = Card(_sensors); Grid.SetRow(sensorCard, 1);
         grid.Children.Add(propsCard);
         grid.Children.Add(sensorCard);
 
         // On a short window the two cards keep a usable minimum height and the column scrolls, instead of squeezing the sensor list away.
-        const double minColumnHeight = 600;
+        const double minColumnHeight = 700;
         var scroll = new ScrollViewer { Content = grid, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
         scroll.SizeChanged += (_, e) => grid.Height = Math.Max(minColumnHeight, e.NewSize.Height);
         return scroll;
@@ -538,9 +549,15 @@ public sealed class MainWindow : Window
 
     private void WireEvents()
     {
+        _layers.SelectionMode = SelectionMode.Multiple;   // Ctrl/Shift+click several layers, then Group
         _layers.SelectionChanged += (_, _) =>
         {
             if (_syncingLayers) return;
+            if (_layers.Selection.SelectedIndexes.Count > 1)
+            {
+                _status.Text = $"{_layers.Selection.SelectedIndexes.Count} layers selected. Click Group to make them move and resize together.";
+                return;
+            }
             var idx = _layers.SelectedIndex;
             SelectWidget(idx >= 0 ? _theme.Widgets[_theme.Widgets.Count - 1 - idx] : null, fromList: true);
         };
@@ -549,7 +566,7 @@ public sealed class MainWindow : Window
         _preview.PointerMoved += OnPreviewMoved;
         _preview.PointerReleased += (_, e) =>
         {
-            _dragging = false; _handle = Handle.None;
+            _dragging = false; _handle = Handle.None; _groupScaler = null;
             e.Pointer.Capture(null);
             _commitTimer.Stop(); CommitNow();      // one undo step per drag or resize
         };
@@ -939,6 +956,34 @@ public sealed class MainWindow : Window
             : $"Added \"{preset.Name}\", but no sensor was found for: {string.Join(", ", result.Missing)}. Assign one from the sensor list.";
     }
 
+    /// <summary>Groups the layers selected in the list (Ctrl/Shift+click) so they move and resize as one.</summary>
+    private void GroupSelected()
+    {
+        var picked = _layers.Selection.SelectedIndexes.Select(i => _theme.Widgets[_theme.Widgets.Count - 1 - i]).ToList();
+        if (picked.Count < 2) { _status.Text = "Select two or more layers first (Ctrl+click or Shift+click in the layer list), then click Group."; return; }
+        var name = GroupOps.NewGroupName(_theme.Pages.SelectMany(p => p.Widgets).Select(w => w.Group));
+        foreach (var w in picked) w.Group = name;
+        var keep = _selected is not null && picked.Contains(_selected) ? _selected : picked[0];
+        RefreshLayers();
+        SelectWidget(keep);
+        _status.Text = $"Grouped {picked.Count} widgets as \"{name}\". Drag to move them together, drag the outline handles to resize them together.";
+    }
+
+    /// <summary>Breaks the selected widget's group (or the whole selection) back into separate widgets.</summary>
+    private void UngroupSelected()
+    {
+        var targets = _layers.Selection.SelectedIndexes.Select(i => _theme.Widgets[_theme.Widgets.Count - 1 - i]).ToList();
+        if (targets.Count == 0 && _selected is not null) targets.Add(_selected);
+        var groups = targets.Select(w => w.Group).Where(g => !string.IsNullOrEmpty(g)).ToHashSet();
+        if (groups.Count == 0) { _status.Text = "That widget is not in a group."; return; }
+        var affected = _theme.Widgets.Where(w => groups.Contains(w.Group)).ToList();
+        foreach (var w in affected) w.Group = "";
+        var keep = _selected;
+        RefreshLayers();
+        SelectWidget(keep);
+        _status.Text = $"Ungrouped {affected.Count} widgets. They now move and resize on their own.";
+    }
+
     private void DeleteSelected()
     {
         if (_selected is null) return;
@@ -1019,10 +1064,12 @@ public sealed class MainWindow : Window
         // resize handles of the selected widget take priority over everything underneath
         if (_selected is not null)
         {
-            var h = Handles.HitTest(_selected, (float)p.X, (float)p.Y, ThemeRenderer.HandleSize, 3);
+            var (box, free, members) = SelectionBox();
+            var h = Handles.HitTest(box, free, (float)p.X, (float)p.Y, ThemeRenderer.HandleSize, 3);
             if (h != Handle.None)
             {
-                _handle = h; _startRect = _selected.LastBounds; _startFont = _selected.FontSize;
+                _handle = h; _startRect = box; _startFont = _selected.FontSize;
+                _groupScaler = members.Count > 1 ? new GroupOps.Scaler(members, box) : null;
                 e.Pointer.Capture(_preview);
                 return;
             }
@@ -1061,7 +1108,12 @@ public sealed class MainWindow : Window
 
     private void UpdateCursor(Point p)
     {
-        var h = _selected is null ? Handle.None : Handles.HitTest(_selected, (float)p.X, (float)p.Y, ThemeRenderer.HandleSize, 3);
+        Handle h = Handle.None;
+        if (_selected is not null)
+        {
+            var (box, free, _) = SelectionBox();
+            h = Handles.HitTest(box, free, (float)p.X, (float)p.Y, ThemeRenderer.HandleSize, 3);
+        }
         var type = h switch
         {
             Handle.TopLeft => StandardCursorType.TopLeftCorner,
@@ -1077,33 +1129,33 @@ public sealed class MainWindow : Window
     }
 
     /// <summary>Bars, images and panels resize by edges; text widgets scale their font from the corners. Shift keeps the aspect ratio.</summary>
+    /// <summary>The selected widget, and the box its resize handles sit on: the whole group's outline when it belongs to one.</summary>
+    private (SKRect box, bool free, List<Widget> members) SelectionBox()
+    {
+        var members = GroupOps.Members(_theme.Widgets, _selected!);
+        return members.Count > 1
+            ? (GroupOps.Union(members), true, members)
+            : (_selected!.LastBounds, Handles.IsFree(_selected), members);
+    }
+
     private void ResizeTo(Point p, bool keepAspect)
     {
         var w = _selected!;
         double px = Math.Round(p.X), py = Math.Round(p.Y);
         var r = _startRect;
         bool left = _handle is Handle.TopLeft or Handle.Left or Handle.BottomLeft;
-        bool right = _handle is Handle.TopRight or Handle.Right or Handle.BottomRight;
         bool top = _handle is Handle.TopLeft or Handle.Top or Handle.TopRight;
-        bool bottom = _handle is Handle.BottomLeft or Handle.Bottom or Handle.BottomRight;
+
+        if (_groupScaler is not null)
+        {
+            _groupScaler.Apply(GroupOps.DragRect(r, _handle, px, py, keepAspect, 8));
+            return;
+        }
 
         if (Handles.IsFree(w))
         {
-            const double Min = 2;
-            double l = r.Left, t = r.Top, rt = r.Right, b = r.Bottom;
-            if (left) l = Math.Min(px, rt - Min);
-            if (right) rt = Math.Max(px, l + Min);
-            if (top) t = Math.Min(py, b - Min);
-            if (bottom) b = Math.Max(py, t + Min);
-            bool corner = (left || right) && (top || bottom);
-            if (keepAspect && corner && r.Height > 0)
-            {
-                double ratio = r.Width / r.Height, nw = rt - l, nh = b - t;
-                if (nw / nh > ratio) nw = nh * ratio; else nh = nw / ratio;
-                if (left) l = rt - nw; else rt = l + nw;
-                if (top) t = b - nh; else b = t + nh;
-            }
-            w.X = l; w.Y = t; w.Width = rt - l; w.Height = b - t;
+            var d = GroupOps.DragRect(r, _handle, px, py, keepAspect);
+            w.X = d.Left; w.Y = d.Top; w.Width = d.Width; w.Height = d.Height;
             return;
         }
 
