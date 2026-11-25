@@ -11,7 +11,9 @@ and keep them on the display from a small background app.
 - **Editor** (Avalonia): live preview, drag and resize, undo/redo, pages, premade widgets, a virtual display for demos without the hardware.
 - **Widgets**: text, sensor values, clock, bars, gauges, history graphs, images, GIFs, video (needs FFmpeg), panels. Colour thresholds.
 - **Sensors**: everything LibreHardwareMonitor can read (CPU, GPU, motherboard, fans, voltages, drives), plus drive space. Searchable by group and type.
+- **Starter themes and premade widgets**: five ready-made themes (minimal, dashboard, gaming, a two-page overview, desk clock) and a gallery of about 30 cards, gauges, rings and graphs that bind to your own sensors.
 - **AIDA64 import**: loads `.axlcd` themes with a preview, maps their items to your sensors.
+- **Sharing**: export a theme as one `.glance` file (images and videos included) and open it on another PC.
 - **Runner** (tray app): shows your theme on the display without the editor, rotates pages, reloads when you save, blanks the screen on exit.
 
 ## Requirements
@@ -60,3 +62,4 @@ and find each other there.
 | `installer/` | Inno Setup definition |
 | `assets/` | Application icon |
 | `docs/PROTOCOL.md` | The display's USB protocol, reverse-engineered from a capture |
+| `AGENTS.md` | Notes for AI coding agents working on this repo |
