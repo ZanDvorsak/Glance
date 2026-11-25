@@ -34,7 +34,8 @@ public sealed class VideoSource : IDisposable
         {
             RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true,
         };
-        foreach (var a in new[] { "-hide_banner", "-loglevel", "error", "-stream_loop", "-1", "-i", path, "-an", "-vf", $"{scale},fps={fps}", "-f", "rawvideo", "-pix_fmt", "bgra", "pipe:1" })
+        // -re reads the file at its native speed; without it ffmpeg decodes as fast as the CPU allows and the video plays far too fast
+        foreach (var a in new[] { "-hide_banner", "-loglevel", "error", "-stream_loop", "-1", "-re", "-i", path, "-an", "-vf", $"{scale},fps={fps}", "-f", "rawvideo", "-pix_fmt", "bgra", "pipe:1" })
             psi.ArgumentList.Add(a);
         try { _proc = Process.Start(psi); }
         catch (Exception ex) { Error = ex.Message; return; }
