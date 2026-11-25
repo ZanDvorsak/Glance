@@ -31,3 +31,13 @@ Then data (OUT on `0x01` or IN on `0x81`), then a 13-byte CSW read from `0x81` (
 | `06 12 x0 y0 x1 y1 00` | Blit rectangle (x1/y1 inclusive, each LE16) | w*h*2 bytes OUT |
 
 AIDA64 sends the full frame (`06 12 00 00 00 00 DF 01 3F 01 00`, 307200 bytes) in 64 KiB writes about once per second, and sets backlight 0 when it exits.
+
+## Measured limits
+
+- **Full frame: about 400 ms** (307200 bytes), so roughly **2.5 updates per second** at most. This is the USB link, not rendering.
+- **Partial updates do not work.** A blit with a smaller rectangle (480x160 at 0,0 and 160x120 at 160,100, same CDB layout as above,
+  data length matching the rectangle) never produces a CSW: the status read times out after about 3 s, and nothing is drawn on the
+  screen (confirmed by eye). The display recovers afterwards and accepts full frames again. The firmware appears to support only
+  whole-screen blits, which matches AIDA64 never sending anything else.
+- Glance therefore sends only whole frames, and skips a frame entirely when it is identical to the previous one
+  (with a forced refresh every 10 s).

@@ -93,7 +93,11 @@ public sealed unsafe class Ax206Display : IDisposable
         ReadStatus();
     }
 
-    /// <summary>Sends a rectangle of RGB565 big-endian pixels (w*h*2 bytes).</summary>
+    /// <summary>
+    /// Sends a rectangle of RGB565 big-endian pixels (w*h*2 bytes).
+    /// NOTE: the 1908:0102 display only accepts full-screen updates (0,0,Width,Height). Smaller rectangles were measured on the
+    /// real display: the transfer times out and nothing is drawn. See docs/PROTOCOL.md.
+    /// </summary>
     public void Blit(int x, int y, int w, int h, byte[] rgb565Be)
     {
         if (rgb565Be.Length != w * h * 2) throw new ArgumentException("Buffer size does not match rectangle.");

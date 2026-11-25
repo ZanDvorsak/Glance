@@ -19,6 +19,9 @@ public sealed class DisplayPusher : IDisposable
     private int _step;
     private volatile int _pageIndex;
 
+    private const long ForcedRefreshMs = 10_000;
+
+    /// <summary>Frames actually sent to the display per second (frames that were identical to the last one are skipped).</summary>
     public double Fps { get; private set; }
     public string? LastError { get; private set; }
 
@@ -65,7 +68,8 @@ public sealed class DisplayPusher : IDisposable
         using var canvas = new SKCanvas(bmp);
         var applied = _brightness;
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        int frames = 0; long mark = 0, pageSince = 0;
+        int frames = 0; long mark = 0, pageSince = 0, lastSentAt = 0;
+        byte[]? lastSent = null;
         while (!_cts.IsCancellationRequested)
         {
             var frameStart = sw.ElapsedMilliseconds;
@@ -85,8 +89,17 @@ public sealed class DisplayPusher : IDisposable
                 canvas.ClipRect(new SKRect(0, 0, theme.Width, theme.Height));
                 renderer.Render(canvas, theme, _sensors, null, page);
                 canvas.Restore();
-                _lcd.Blit(0, 0, _lcd.Width, _lcd.Height, FrameConverter.ToRgb565Be(bmp));
-                frames++;
+
+                // A full frame takes ~400 ms over USB (this display only accepts whole frames), so do not send one
+                // when nothing changed. A refresh every few seconds keeps the picture honest if it was ever lost.
+                var rgb = FrameConverter.ToRgb565Be(bmp);
+                bool unchanged = lastSent is not null && rgb.AsSpan().SequenceEqual(lastSent);
+                if (!unchanged || frameStart - lastSentAt > ForcedRefreshMs)
+                {
+                    _lcd.Blit(0, 0, _lcd.Width, _lcd.Height, rgb);
+                    lastSent = rgb; lastSentAt = frameStart;
+                    frames++;
+                }
                 LastError = null;
             }
             catch (IOException ex) { LastError = ex.Message; Thread.Sleep(1000); }
