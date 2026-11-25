@@ -1,0 +1,109 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="Glance.App.App"
+             RequestedThemeVariant="Dark">
+
+  <Application.Resources>
+    <Color x:Key="AccentColor">#FF4F8CFF</Color>
+    <SolidColorBrush x:Key="AppBg">#0D0F14</SolidColorBrush>
+    <SolidColorBrush x:Key="CardBg">#151922</SolidColorBrush>
+    <SolidColorBrush x:Key="CardBorder">#232A37</SolidColorBrush>
+    <SolidColorBrush x:Key="Chip">#1E2430</SolidColorBrush>
+    <SolidColorBrush x:Key="ChipHover">#283041</SolidColorBrush>
+    <SolidColorBrush x:Key="AccentBrush">#4F8CFF</SolidColorBrush>
+    <SolidColorBrush x:Key="MutedText">#8C96A8</SolidColorBrush>
+  </Application.Resources>
+
+  <Application.Styles>
+    <FluentTheme>
+      <FluentTheme.Palettes>
+        <ColorPaletteResources x:Key="Dark" Accent="#FF4F8CFF" RegionColor="#FF0D0F14" />
+      </FluentTheme.Palettes>
+    </FluentTheme>
+    <StyleInclude Source="avares://Avalonia.Controls.ColorPicker/Themes/Fluent/Fluent.xaml" />
+
+    <Style Selector="Window">
+      <Setter Property="Background" Value="{StaticResource AppBg}" />
+    </Style>
+
+    <!-- Cards -->
+    <Style Selector="Border.card">
+      <Setter Property="Background" Value="{StaticResource CardBg}" />
+      <Setter Property="BorderBrush" Value="{StaticResource CardBorder}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="14" />
+      <Setter Property="Padding" Value="12" />
+    </Style>
+
+    <!-- Section captions -->
+    <Style Selector="TextBlock.caption">
+      <Setter Property="FontSize" Value="11" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="LetterSpacing" Value="1" />
+      <Setter Property="Foreground" Value="{StaticResource MutedText}" />
+    </Style>
+
+    <!-- Buttons -->
+    <Style Selector="Button">
+      <Setter Property="Background" Value="{StaticResource Chip}" />
+      <Setter Property="CornerRadius" Value="9" />
+      <Setter Property="Padding" Value="12,7" />
+      <Setter Property="BorderThickness" Value="0" />
+    </Style>
+    <Style Selector="Button:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{StaticResource ChipHover}" />
+    </Style>
+    <Style Selector="Button:pressed /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{StaticResource AccentBrush}" />
+    </Style>
+    <Style Selector="Button.danger:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#7A2A33" />
+    </Style>
+
+    <Style Selector="ToggleButton">
+      <Setter Property="Background" Value="{StaticResource Chip}" />
+      <Setter Property="CornerRadius" Value="9" />
+      <Setter Property="Padding" Value="14,7" />
+      <Setter Property="BorderThickness" Value="0" />
+    </Style>
+    <Style Selector="ToggleButton:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{StaticResource ChipHover}" />
+    </Style>
+    <Style Selector="ToggleButton:checked /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{StaticResource AccentBrush}" />
+      <Setter Property="Foreground" Value="White" />
+    </Style>
+    <Style Selector="ToggleButton:checked:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#6A9CFF" />
+    </Style>
+
+    <!-- Inputs -->
+    <Style Selector="TextBox">
+      <Setter Property="CornerRadius" Value="9" />
+      <Setter Property="Background" Value="{StaticResource Chip}" />
+    </Style>
+    <Style Selector="NumericUpDown">
+      <Setter Property="CornerRadius" Value="9" />
+    </Style>
+    <Style Selector="ComboBox">
+      <Setter Property="CornerRadius" Value="9" />
+    </Style>
+
+    <!-- Lists -->
+    <Style Selector="ListBox">
+      <Setter Property="Background" Value="Transparent" />
+    </Style>
+    <Style Selector="ListBoxItem">
+      <Setter Property="CornerRadius" Value="9" />
+      <Setter Property="Margin" Value="0,1" />
+      <Setter Property="Padding" Value="8,6" />
+    </Style>
+
+    <!-- Status chips -->
+    <Style Selector="Border.chip">
+      <Setter Property="Background" Value="{StaticResource Chip}" />
+      <Setter Property="CornerRadius" Value="999" />
+      <Setter Property="Padding" Value="10,4" />
+    </Style>
+  </Application.Styles>
+</Application>

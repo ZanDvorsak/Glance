@@ -4,7 +4,7 @@ A modern, open replacement for AIDA64's LCD customizer, for small USB displays t
 (USB ID `1908:0102`, 480×320). Design your own screens with live hardware data, backgrounds, gauges, graphs and pages,
 and keep them on the display from a small background app.
 
-> Status: early. Windows first. The code and project names still say `MiniLcd`; renaming to Glance is planned.
+> Status: early. Windows first.
 
 ## What it does
 
@@ -25,18 +25,18 @@ and keep them on the display from a small background app.
 
 ```powershell
 cd src
-dotnet build MiniLcd.sln -c Release
+dotnet build Glance.sln -c Release
 ```
 
-Run `MiniLcd.Runner` (asks for administrator rights) and `MiniLcd.App` (the editor) from their `bin\Release` folders.
+Run `Glance.Runner` (asks for administrator rights) and `Glance.App` (the editor) from their `bin\Release` folders.
 
 ## Layout
 
 | Folder | Purpose |
 |---|---|
-| `src/MiniLcd.Core` | Display driver, renderer, themes, sensors, presets, importer |
-| `src/MiniLcd.App` | Avalonia editor |
-| `src/MiniLcd.Runner` | Elevated tray app that owns the display |
-| `src/MiniLcd.SensorHost` | Standalone elevated sensor feed |
+| `src/Glance.Core` | Display driver, renderer, themes, sensors, presets, importer |
+| `src/Glance.App` | Avalonia editor |
+| `src/Glance.Runner` | Elevated tray app that owns the display |
+| `src/Glance.SensorHost` | Standalone elevated sensor feed |
 | `src/UsbProbe` | Small diagnostic tool for the USB protocol |
 | `docs/PROTOCOL.md` | The display's USB protocol, reverse-engineered from a capture |
