@@ -4,7 +4,9 @@ A modern, open replacement for AIDA64's LCD customizer, for small USB displays t
 (USB ID `1908:0102`, 480×320). Design your own screens with live hardware data, backgrounds, gauges, graphs and pages,
 and keep them on the display from a small background app.
 
-> Status: early. Windows first.
+> Status: early. Windows first. New here? Read the [tutorial](docs/TUTORIAL.md) (with screenshots).
+
+![Glance editor](docs/images/02-editor.png)
 
 ## What it does
 

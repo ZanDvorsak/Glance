@@ -119,7 +119,7 @@ public sealed class MainWindow : Window
     {
         Title = "Glance";
         try { Icon = new WindowIcon(AssetLoader.Open(new Uri("avares://Glance.App/Assets/glance.ico"))); } catch { /* cosmetic */ }
-        Width = 1440; Height = 880; MinWidth = 1100; MinHeight = 680;
+        Width = 1440; Height = 880; MinWidth = 1280; MinHeight = 680;
         _theme = LoadInitialTheme();
         _undo = new UndoManager(_theme.ToSnapshot());
         HookTheme();
@@ -149,6 +149,8 @@ public sealed class MainWindow : Window
             if (startArgs.Contains("--setup")) OpenSetupCheck();
             if (startArgs.Contains("--new")) NewTheme();
             if (startArgs.Contains("--gallery")) OpenGallery();
+            if (startArgs.Contains("--service")) new ServiceWindow().Show(this);
+            if (startArgs.Contains("--virtual")) OpenVirtualDisplay();
             try { await MaybeShowSetupOnFirstRunAsync(); } catch { /* never block startup */ }
         };
 
@@ -189,7 +191,7 @@ public sealed class MainWindow : Window
             new TextBlock { Text = "Display designer", FontSize = 11, Foreground = Brush("#8C96A8") },
         }};
 
-        var files = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
+        var files = new WrapPanel { VerticalAlignment = VerticalAlignment.Center };   // wraps to a second line on narrow windows
         files.Children.Add(Btn("New", (_, _) => NewTheme()));
         files.Children.Add(Btn("Open", async (_, _) => await OpenAsync()));
         files.Children.Add(Btn("Save", async (_, _) => await SaveAsync(false)));
@@ -201,6 +203,7 @@ public sealed class MainWindow : Window
         _undoBtn = Btn("Undo", (_, _) => DoUndo()); ToolTip.SetTip(_undoBtn, "Undo (Ctrl+Z)");
         _redoBtn = Btn("Redo", (_, _) => DoRedo()); ToolTip.SetTip(_redoBtn, "Redo (Ctrl+Y)");
         files.Children.Add(_undoBtn); files.Children.Add(_redoBtn);
+        foreach (var c in files.Children.OfType<Button>()) c.Margin = new Thickness(0, 3, 6, 3);   // WrapPanel has no spacing of its own
         UpdateUndoButtons();
 
         var slider = new Slider { Minimum = 0, Maximum = 7, Value = _settings.Brightness, Width = 120, TickFrequency = 1, IsSnapToTickEnabled = true, VerticalAlignment = VerticalAlignment.Center };
@@ -212,8 +215,6 @@ public sealed class MainWindow : Window
             if (_liveToRunner) { var b = _settings.Brightness; Task.Run(() => RunnerClient.Send($"BRIGHTNESS {b}")); }
         };
         var right = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, VerticalAlignment = VerticalAlignment.Center };
-        right.Children.Add(Btn("Setup check", (_, _) => OpenSetupCheck()));
-        right.Children.Add(Btn("Background service", async (_, _) => await new ServiceWindow().ShowDialog(this)));
         right.Children.Add(new TextBlock { Text = "Backlight", VerticalAlignment = VerticalAlignment.Center, Foreground = Brush("#8C96A8"), Margin = new Thickness(8, 0, 0, 0) });
         right.Children.Add(slider);
         var off = Btn("Display off", (_, _) => TurnDisplayOff());
@@ -221,12 +222,16 @@ public sealed class MainWindow : Window
         right.Children.Add(off);
         right.Children.Add(_send);
 
-        var dock = new DockPanel();
-        DockPanel.SetDock(right, Dock.Right);
-        dock.Children.Add(right);
-        var leftSide = new StackPanel { Orientation = Orientation.Horizontal, Children = { logo, title, files } };
-        dock.Children.Add(leftSide);
-        return Card(dock, new Thickness(12, 9));
+        // two columns: the file buttons take what is left and wrap onto more lines when needed; the display controls keep their own column.
+        // (A DockPanel let the two groups draw over each other on narrow windows.)
+        var brand = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Children = { logo, title } };
+        var leftSide = new WrapPanel { VerticalAlignment = VerticalAlignment.Center, Children = { brand, files } };
+        var grid = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto"), ColumnSpacing = 16 };
+        right.VerticalAlignment = VerticalAlignment.Center;
+        Grid.SetColumn(right, 1);
+        grid.Children.Add(leftSide);
+        grid.Children.Add(right);
+        return Card(grid, new Thickness(12, 9));
     }
 
     private Control BuildLeft()
@@ -450,7 +455,12 @@ public sealed class MainWindow : Window
         var sensorCard = Card(_sensors); Grid.SetRow(sensorCard, 1);
         grid.Children.Add(propsCard);
         grid.Children.Add(sensorCard);
-        return grid;
+
+        // On a short window the two cards keep a usable minimum height and the column scrolls, instead of squeezing the sensor list away.
+        const double minColumnHeight = 600;
+        var scroll = new ScrollViewer { Content = grid, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
+        scroll.SizeChanged += (_, e) => grid.Height = Math.Max(minColumnHeight, e.NewSize.Height);
+        return scroll;
     }
 
     private Control BuildStatusBar()
@@ -463,13 +473,19 @@ public sealed class MainWindow : Window
         };
         _ffmpegBtn.Click += async (_, _) => await InstallFfmpegAsync();
 
-        var right = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children =
-            { _ffmpegBtn, _helperBtn, Chip(_displayDot, _displayText), Chip(_sensorDot, _sensorText) } };
-        var dock = new DockPanel { Margin = new Thickness(4, 0) };
-        DockPanel.SetDock(right, Dock.Right);
-        dock.Children.Add(right);
-        dock.Children.Add(_status);
-        return dock;
+        // the status text gets the leftover width (and is trimmed with an ellipsis); the buttons and chips wrap instead of overlapping
+        var right = new WrapPanel { VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right };
+        foreach (var c in new Control[] { _ffmpegBtn, _helperBtn, StatusBtn("Setup check", (_, _) => OpenSetupCheck()), StatusBtn("Background service", async (_, _) => await new ServiceWindow().ShowDialog(this)), Chip(_displayDot, _displayText), Chip(_sensorDot, _sensorText) })
+        {
+            c.Margin = new Thickness(8, 2, 0, 2);
+            right.Children.Add(c);
+        }
+        _status.TextTrimming = TextTrimming.CharacterEllipsis;
+        var grid = new Grid { Margin = new Thickness(4, 0), ColumnDefinitions = new ColumnDefinitions("*,Auto"), ColumnSpacing = 12 };
+        Grid.SetColumn(right, 1);
+        grid.Children.Add(_status);
+        grid.Children.Add(right);
+        return grid;
     }
 
     // ---- small UI helpers ---------------------------------------------------------------------------------------
@@ -495,6 +511,13 @@ public sealed class MainWindow : Window
             Width = 22, Height = 22, CornerRadius = new CornerRadius(7), Background = new SolidColorBrush(Color.FromArgb(0x33, c.R, c.G, c.B)),
             Child = new TextBlock { Text = letter, FontSize = 11, FontWeight = FontWeight.Bold, Foreground = new SolidColorBrush(c), HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center },
         };
+    }
+
+    private static Button StatusBtn(string text, EventHandler<Avalonia.Interactivity.RoutedEventArgs> click)
+    {
+        var b = new Button { Content = text, FontSize = 12, Padding = new Thickness(11, 5) };
+        b.Click += click;
+        return b;
     }
 
     private static Button Btn(string text, EventHandler<Avalonia.Interactivity.RoutedEventArgs> click)
@@ -561,6 +584,19 @@ public sealed class MainWindow : Window
 
     private AppTheme LoadInitialTheme()
     {
+        // Glance.App.exe <theme.json | theme.glance> opens that file instead of the last theme (also how "Open with" would work)
+        var fileArg = Environment.GetCommandLineArgs().Skip(1).FirstOrDefault(a => !a.StartsWith("--") && File.Exists(a));
+        if (fileArg is not null)
+        {
+            try
+            {
+                var path = fileArg.EndsWith(ThemePackage.Extension, StringComparison.OrdinalIgnoreCase) ? ImportPackage(fileArg) : fileArg;
+                _themePath = path;
+                return AppTheme.Load(path);
+            }
+            catch { _themePath = null; /* fall through to the usual start-up theme */ }
+        }
+
         if (_settings.LastTheme is { } p && File.Exists(p))
         {
             try { _themePath = p; return AppTheme.Load(p); } catch { _themePath = null; }
