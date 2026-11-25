@@ -37,6 +37,10 @@ public partial class Widget : ObservableObject
     [ObservableProperty] private string _fontFamily = "Segoe UI";
     [ObservableProperty] private double _fontSize = 20;
     [ObservableProperty] private bool _bold;
+    [ObservableProperty] private bool _italic;
+    /// <summary>Optional font file (.ttf, .otf, .ttc), either an absolute path or relative to the theme folder (assets/...).
+    /// When set it is used instead of <see cref="FontFamily"/>, and it travels with the theme when saved or exported.</summary>
+    [ObservableProperty] private string _fontFile = "";
     [ObservableProperty] private TextAlign _align = TextAlign.Left;
 
     /// <summary>Text colour / bar, gauge and graph colour / panel colour, as #AARRGGBB.</summary>

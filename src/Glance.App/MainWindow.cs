@@ -125,6 +125,7 @@ public sealed class MainWindow : Window
         HookTheme();
         _commitTimer.Tick += (_, _) => { _commitTimer.Stop(); CommitNow(); };
         _props.PickImage = PickImageAsync;
+        _props.PickFont = PickFontAsync;
         _props.Edited += name => { if (name is "Name" or "Visible") RefreshLayers(); };
 
         Content = BuildLayout();
@@ -831,6 +832,18 @@ public sealed class MainWindow : Window
         {
             Title = "Choose an image, GIF or video", AllowMultiple = false,
             FileTypeFilter = new[] { new FilePickerFileType("Images, GIFs and videos") { Patterns = new[] { "*.png", "*.jpg", "*.jpeg", "*.bmp", "*.gif", "*.webp", "*.mp4", "*.webm", "*.mkv", "*.mov", "*.avi", "*.m4v", "*.wmv" } } },
+        });
+        var path = files.Count > 0 ? files[0].TryGetLocalPath() : null;
+        if (path is not null) _renderer.ClearImageCache();
+        return path;
+    }
+
+    private async Task<string?> PickFontAsync()
+    {
+        var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+        {
+            Title = "Choose a font file", AllowMultiple = false,
+            FileTypeFilter = new[] { new FilePickerFileType("Fonts") { Patterns = new[] { "*.ttf", "*.otf", "*.ttc" } } },
         });
         var path = files.Count > 0 ? files[0].TryGetLocalPath() : null;
         if (path is not null) _renderer.ClearImageCache();

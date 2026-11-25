@@ -27,10 +27,12 @@ public static class ThemePackage
         var used = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // source file -> entry name
         var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var w in copy.Pages.SelectMany(p => p.Widgets).Where(w => !string.IsNullOrEmpty(w.ImagePath)))
+        // adds a referenced file (image, video or font) to the package and returns its path inside it
+        string Pack(string path)
         {
-            var source = copy.ResolveAsset(w.ImagePath);
-            if (source is null || !File.Exists(source)) continue;
+            if (string.IsNullOrEmpty(path)) return path;
+            var source = copy.ResolveAsset(path);
+            if (source is null || !File.Exists(source)) return path;
             if (!used.TryGetValue(source, out var entry))
             {
                 var baseName = SafeFileName(Path.GetFileName(source));
@@ -40,7 +42,12 @@ public static class ThemePackage
                 used[source] = entry;
                 zip.CreateEntryFromFile(source, entry, CompressionLevel.Optimal);
             }
-            w.ImagePath = entry;
+            return entry;
+        }
+        foreach (var w in copy.Pages.SelectMany(p => p.Widgets))
+        {
+            w.ImagePath = Pack(w.ImagePath);
+            w.FontFile = Pack(w.FontFile);
         }
 
         var json = zip.CreateEntry(ThemeEntry, CompressionLevel.Optimal);

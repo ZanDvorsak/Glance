@@ -51,6 +51,9 @@ The window can be made smaller; the top and bottom bars wrap and the right colum
 
 - Click a widget in the preview or in the layer list to select it. Drag it to move, drag a handle to resize, arrow keys nudge it.
 - The right panel shows its properties: position and size, font, colours, the sensor it shows, and for bars and gauges the min and max.
+- **Fonts**: pick any installed font from the **Font** list, with **Bold** and **Italic**. To use a font that is not installed, click **Use a font file...** and choose a `.ttf`, `.otf` or `.ttc`.
+  The font file is copied into the theme's `assets` folder when you save and goes into `.glance` exports, so the theme looks the same on another PC. Clear the **Font file** box to go back to the installed font.
+  Bold and italic on a font file are simulated, so for a real bold style pick that style's own font file.
 - **Thresholds** change the colour with the value (for example amber at 75 and red at 90 for temperatures).
 - Widgets that came from the same preset share a **Group** and move together. Hold **Alt** while dragging to move just one piece.
 - **Undo/Redo** (Ctrl+Z / Ctrl+Y) cover everything, including page changes.

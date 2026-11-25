@@ -65,17 +65,24 @@ public partial class Theme : ObservableObject
         var dir = Path.GetDirectoryName(Path.GetFullPath(path))!;
         Directory.CreateDirectory(dir);
         var assets = Path.Combine(dir, "assets");
-        foreach (var w in Pages.SelectMany(p => p.Widgets).Where(w => !string.IsNullOrEmpty(w.ImagePath) && Path.IsPathRooted(w.ImagePath)))
+
+        // returns the relative path to store, or the original when it is not an existing absolute file
+        string Adopt(string path)
         {
-            if (!File.Exists(w.ImagePath)) continue;
+            if (string.IsNullOrEmpty(path) || !Path.IsPathRooted(path) || !File.Exists(path)) return path;
             Directory.CreateDirectory(assets);
-            var name = Path.GetFileName(w.ImagePath);
+            var name = Path.GetFileName(path);
             var dest = Path.Combine(assets, name);
             var n = 1;
-            while (File.Exists(dest) && new FileInfo(dest).Length != new FileInfo(w.ImagePath).Length)
+            while (File.Exists(dest) && new FileInfo(dest).Length != new FileInfo(path).Length)
                 dest = Path.Combine(assets, $"{Path.GetFileNameWithoutExtension(name)}_{n++}{Path.GetExtension(name)}");
-            if (!File.Exists(dest)) File.Copy(w.ImagePath, dest);
-            w.ImagePath = "assets/" + Path.GetFileName(dest);
+            if (!File.Exists(dest)) File.Copy(path, dest);
+            return "assets/" + Path.GetFileName(dest);
+        }
+        foreach (var w in Pages.SelectMany(p => p.Widgets))
+        {
+            w.ImagePath = Adopt(w.ImagePath);
+            w.FontFile = Adopt(w.FontFile);
         }
         BaseFolder = dir;
         File.WriteAllText(path, JsonSerializer.Serialize(this, Json));

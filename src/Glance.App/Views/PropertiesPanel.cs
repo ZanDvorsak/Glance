@@ -21,6 +21,7 @@ public sealed class PropertiesPanel : ScrollViewer
     public event Action<string>? Edited;
     /// <summary>Asks the host to show a file picker; returns the chosen path or null.</summary>
     public Func<Task<string?>>? PickImage { get; set; }
+    public Func<Task<string?>>? PickFont { get; set; }
 
     private static readonly Lazy<string[]> Fonts = new(() =>
         Avalonia.Media.FontManager.Current.SystemFonts.Select(f => f.Name).Distinct().OrderBy(n => n).ToArray());
@@ -187,18 +188,23 @@ public sealed class PropertiesPanel : ScrollViewer
         Row("Font", combo);
         Num("Size", "FontSize", 4, 400, 1);
         Check("Bold", "Bold");
+        Check("Italic", "Italic");
+        Text("Font file", "FontFile");
+        BrowseButton("FontFile", "Use a font file...", PickFont);
+        Hint("A font file (.ttf, .otf) replaces the font above and is saved and exported with the theme. Clear the box to go back to the installed font.");
         EnumRow("Align", "Align");
     }
 
-    private void BrowseButton()
+    private void BrowseButton(string prop = "ImagePath", string label = "Browse for image...", Func<Task<string?>>? pick = null)
     {
-        var b = new Button { Content = "Browse for image..." };
+        pick ??= PickImage;
+        var b = new Button { Content = label };
         b.Click += async (_, _) =>
         {
-            if (PickImage is null) return;
-            var path = await PickImage();
-            if (path is not null) Set("ImagePath", path);
-            if (path is not null && _updaters.TryGetValue("ImagePath", out var up)) up();
+            if (pick is null) return;
+            var path = await pick();
+            if (path is not null) Set(prop, path);
+            if (path is not null && _updaters.TryGetValue(prop, out var up)) up();
         };
         _stack.Children.Add(b);
     }

@@ -10,7 +10,9 @@ public sealed class ThemeRenderer : IDisposable
     private readonly Dictionary<string, AnimatedImage?> _images = new();
     private readonly Dictionary<string, VideoSource> _videos = new();
     private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
-    private readonly Dictionary<(string, bool), SKTypeface> _faces = new();
+    private readonly Dictionary<(string, bool, bool), SKTypeface> _faces = new();
+    private readonly Dictionary<string, SKTypeface?> _fileFaces = new();
+    private Theme? _theme;
     private readonly SensorHistory _history = new();
     private IReadOnlyList<SensorInfo>? _indexedFor;
     private Dictionary<string, SensorInfo> _index = new();
@@ -22,6 +24,7 @@ public sealed class ThemeRenderer : IDisposable
     public void Render(SKCanvas canvas, Theme theme, ISensorSource? sensors, Widget? selected = null, ThemePage? page = null)
     {
         Index(sensors);
+        _theme = theme;
         page ??= theme.ActivePage;
         var bg = string.IsNullOrWhiteSpace(page.BackgroundColor) ? theme.BackgroundColor : page.BackgroundColor!;
         canvas.Clear(Parse(bg, SKColors.Black));
@@ -172,8 +175,8 @@ public sealed class ThemeRenderer : IDisposable
         }
 
         // value in the middle (number large, unit small), optional caption below
-        using var vf = new SKFont(Face(w.FontFamily, w.Bold), (float)w.FontSize) { Edging = SKFontEdging.SubpixelAntialias };
-        using var uf = new SKFont(Face(w.FontFamily, false), (float)(w.FontSize * 0.5)) { Edging = SKFontEdging.SubpixelAntialias };
+        using var vf = MakeFont(w, w.FontSize, w.Bold);
+        using var uf = MakeFont(w, w.FontSize * 0.5, false);
         using var tp = new SKPaint { Color = Parse(w.TextColor, SKColors.White), IsAntialias = true };
         var number = FormatNumber(w);
         var unit = w.Unit ?? "";
@@ -186,7 +189,7 @@ public sealed class ThemeRenderer : IDisposable
         if (unit.Length > 0) c.DrawText(unit, left + vw + 2, baseline, SKTextAlign.Left, uf, tp);
         if (caption)
         {
-            using var cf = new SKFont(Face(w.FontFamily, false), (float)Math.Max(8, w.FontSize * 0.42));
+            using var cf = MakeFont(w, Math.Max(8, w.FontSize * 0.42), false);
             using var cp = new SKPaint { Color = tp.Color.WithAlpha(170), IsAntialias = true };
             c.DrawText(w.Text, cx, baseline + (float)w.FontSize * 0.62f, SKTextAlign.Center, cf, cp);
         }
@@ -355,7 +358,7 @@ public sealed class ThemeRenderer : IDisposable
 
     private void DrawText(SKCanvas c, Widget w, string text, SKColor? color = null)
     {
-        using var font = new SKFont(Face(w.FontFamily, w.Bold), (float)w.FontSize) { Edging = SKFontEdging.SubpixelAntialias };
+        using var font = MakeFont(w, w.FontSize, w.Bold);
         using var paint = new SKPaint { Color = color ?? Parse(w.Color, SKColors.White), IsAntialias = true };
         var m = font.Metrics;
         float baseline = (float)w.Y - m.Ascent;
@@ -366,12 +369,34 @@ public sealed class ThemeRenderer : IDisposable
         w.LastBounds = new SKRect(left, (float)w.Y, left + width, (float)w.Y + (m.Descent - m.Ascent));
     }
 
-    private SKTypeface Face(string family, bool bold)
+    private SKTypeface Face(string family, bool bold, bool italic = false)
     {
-        if (_faces.TryGetValue((family, bold), out var f)) return f;
+        var key = (family, bold, italic);
+        if (_faces.TryGetValue(key, out var f)) return f;
         f = SKTypeface.FromFamilyName(string.IsNullOrWhiteSpace(family) ? "Segoe UI" : family,
-            bold ? SKFontStyle.Bold : SKFontStyle.Normal) ?? SKTypeface.Default;
-        return _faces[(family, bold)] = f;
+            new SKFontStyle(bold ? SKFontStyleWeight.Bold : SKFontStyleWeight.Normal, SKFontStyleWidth.Normal,
+                italic ? SKFontStyleSlant.Italic : SKFontStyleSlant.Upright)) ?? SKTypeface.Default;
+        return _faces[key] = f;
+    }
+
+    /// <summary>The widget's font: its font file when it has a usable one, otherwise the installed family.
+    /// A font file is one style, so bold and italic are synthesized for it.</summary>
+    private SKFont MakeFont(Widget w, double size, bool bold)
+    {
+        var path = _theme?.ResolveAsset(w.FontFile);
+        if (!string.IsNullOrEmpty(path) && FileFace(path) is { } custom)
+        {
+            return new SKFont(custom, (float)size) { Edging = SKFontEdging.SubpixelAntialias, Embolden = bold, SkewX = w.Italic ? -0.25f : 0 };
+        }
+        return new SKFont(Face(w.FontFamily, bold, w.Italic), (float)size) { Edging = SKFontEdging.SubpixelAntialias };
+    }
+
+    /// <summary>Loads a font file once (null when it is missing or not a font).</summary>
+    private SKTypeface? FileFace(string path)
+    {
+        if (_fileFaces.TryGetValue(path, out var f)) return f;
+        try { f = File.Exists(path) ? SKTypeface.FromFile(path) : null; } catch { f = null; }
+        return _fileFaces[path] = f;
     }
 
     private AnimatedImage? LoadImage(string? path)
@@ -389,9 +414,15 @@ public sealed class ThemeRenderer : IDisposable
         _images.Clear();
         foreach (var v in _videos.Values) v.Dispose();
         _videos.Clear();
+        _fileFaces.Clear();   // font files are re-read the next time they are drawn
     }
 
     private static SKColor Parse(string s, SKColor fallback) => SKColor.TryParse(s, out var c) ? c : fallback;
 
-    public void Dispose() { ClearImageCache(); _history.Clear(); }
+    public void Dispose()
+    {
+        foreach (var f in _fileFaces.Values) f?.Dispose();
+        ClearImageCache();
+        _history.Clear();
+    }
 }
