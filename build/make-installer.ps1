@@ -2,6 +2,7 @@
   Compiles installer\Glance.iss into dist\Glance-Setup-<version>.exe.
   Run .\build\publish.ps1 first. Needs Inno Setup 6:  winget install JRSoftware.InnoSetup
 #>
+param([switch]$Sign)   # sign the finished installer (see build\sign.ps1)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 
@@ -24,4 +25,8 @@ $version = $props.Project.PropertyGroup.Version
 if ($LASTEXITCODE -ne 0) { throw 'Inno Setup failed.' }
 
 $setup = Join-Path $repo "dist\Glance-Setup-$version.exe"
+if ($Sign) {
+    . (Join-Path $PSScriptRoot 'sign.ps1')
+    Invoke-GlanceSign -Path $setup
+}
 Write-Host ("Installer: {0}  ({1:N0} MB)" -f $setup, ((Get-Item $setup).Length / 1MB)) -ForegroundColor Green

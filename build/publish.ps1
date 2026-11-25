@@ -14,7 +14,8 @@ param(
     [string]$Configuration = 'Release',
     [string]$Runtime = 'win-x64',
     [switch]$FrameworkDependent,
-    [switch]$NoZip
+    [switch]$NoZip,
+    [switch]$Sign          # sign the Glance exes before zipping (see build\sign.ps1; self-signed unless GLANCE_SIGN_THUMBPRINT is set)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,6 +48,12 @@ foreach ($project in 'Glance.App', 'Glance.Runner') {
 
 # native libraries ship large debug symbols that users never need
 Get-ChildItem $out -Recurse -Filter *.pdb | Remove-Item -Force
+
+if ($Sign) {
+    . (Join-Path $PSScriptRoot 'sign.ps1')
+    Write-Host 'Signing ...' -ForegroundColor Cyan
+    Invoke-GlanceSign -Path (Get-ChildItem $out -Filter 'Glance.*.exe' | ForEach-Object FullName)
+}
 
 Copy-Item (Join-Path $repo 'README.md') $out -Force
 Copy-Item (Join-Path $repo 'assets\glance.ico') $out -Force
