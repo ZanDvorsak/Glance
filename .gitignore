@@ -12,3 +12,6 @@ obj/
 # Captures and scratch files
 *.pcap
 *.log
+
+# Packaging output
+dist/

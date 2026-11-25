@@ -116,6 +116,7 @@ public sealed class MainWindow : Window
     public MainWindow()
     {
         Title = "Glance";
+        try { Icon = new WindowIcon(AssetLoader.Open(new Uri("avares://Glance.App/Assets/glance.ico"))); } catch { /* cosmetic */ }
         Width = 1440; Height = 880; MinWidth = 1100; MinHeight = 680;
         _theme = LoadInitialTheme();
         _undo = new UndoManager(_theme.ToSnapshot());

@@ -8,6 +8,7 @@
     <Nullable>enable</Nullable>
     <PlatformTarget>x64</PlatformTarget>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\..\assets\glance.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>

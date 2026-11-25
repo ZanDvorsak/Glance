@@ -1,0 +1,15 @@
+Before you start
+
+Glance needs two things that are not part of this installer:
+
+1. The display driver
+   The USB display (ID 1908:0102) must use the libusb-win32 driver.
+   Install it with Zadig (https://zadig.akeo.ie/): select the display, choose "libusb-win32", and click Install Driver.
+   This replaces the driver AIDA64 uses for the same display, so AIDA64 will not be able to use it until it is switched back.
+
+2. Sensor access (optional but recommended)
+   CPU and motherboard temperatures, fans and voltages need the PawnIO driver (https://pawnio.eu/).
+   Without it, Glance still shows GPU, drive, memory and network sensors.
+
+Glance's background runner asks for administrator rights because reading those sensors requires them.
+Your themes and settings are stored in %AppData%\Glance and are kept when you uninstall.

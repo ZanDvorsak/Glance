@@ -1,0 +1,8 @@
+<Project>
+  <!-- Shared by every project in the solution. Bump Version here for a release. -->
+  <PropertyGroup>
+    <Version>0.1.0</Version>
+    <Product>Glance</Product>
+    <Description>Design and run live hardware screens on small USB LCDs.</Description>
+  </PropertyGroup>
+</Project>

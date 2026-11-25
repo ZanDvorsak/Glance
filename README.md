@@ -21,6 +21,12 @@ and keep them on the display from a small background app.
 - [PawnIO](https://pawnio.eu/) for CPU and motherboard sensors (LibreHardwareMonitor needs it)
 - Optional: FFmpeg for video backgrounds
 
+## Install
+
+Download `Glance-<version>-win-x64.zip` (no .NET needed), unzip it somewhere permanent, and run `Glance.App.exe`.
+Start the background runner from the editor (**Background service**), or run `Glance.Runner.exe`; it asks for administrator rights.
+There is also an installer (`Glance-Setup-<version>.exe`) that puts Glance in Program Files with Start menu shortcuts.
+
 ## Build and run
 
 ```powershell
@@ -29,6 +35,17 @@ dotnet build Glance.sln -c Release
 ```
 
 Run `Glance.Runner` (asks for administrator rights) and `Glance.App` (the editor) from their `bin\Release` folders.
+
+## Package and installer
+
+```powershell
+.\build\publish.ps1                      # dist\Glance and a self-contained zip (~215 MB folder, ~90 MB zip)
+.\build\publish.ps1 -FrameworkDependent  # much smaller; needs the .NET 8 Desktop Runtime on the target PC
+.\build\make-installer.ps1               # dist\Glance-Setup-<version>.exe (needs Inno Setup 6)
+```
+
+Bump the version in `src/Directory.Build.props` for a release. The editor and the runner live side by side in one folder
+and find each other there.
 
 ## Layout
 
@@ -39,4 +56,7 @@ Run `Glance.Runner` (asks for administrator rights) and `Glance.App` (the editor
 | `src/Glance.Runner` | Elevated tray app that owns the display |
 | `src/Glance.SensorHost` | Standalone elevated sensor feed |
 | `src/UsbProbe` | Small diagnostic tool for the USB protocol |
+| `build/` | Publish and installer scripts |
+| `installer/` | Inno Setup definition |
+| `assets/` | Application icon |
 | `docs/PROTOCOL.md` | The display's USB protocol, reverse-engineered from a capture |

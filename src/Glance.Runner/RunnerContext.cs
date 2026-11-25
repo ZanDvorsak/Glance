@@ -291,6 +291,7 @@ internal sealed class RunnerContext : ApplicationContext
 
     private static Icon MakeIcon()
     {
+        try { if (Icon.ExtractAssociatedIcon(Application.ExecutablePath) is { } own) return own; } catch { /* fall back to a drawn icon */ }
         using var bmp = new Bitmap(32, 32);
         using (var g = Graphics.FromImage(bmp))
         {
