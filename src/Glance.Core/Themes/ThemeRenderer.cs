@@ -130,7 +130,7 @@ public sealed class ThemeRenderer : IDisposable
     {
         var r = Box(w);
         w.LastBounds = r;
-        float rad = (float)Math.Min(w.CornerRadius, w.Height / 2);
+        float rad = (float)Math.Min(w.CornerRadius, (w.Vertical ? w.Width : w.Height) / 2);
         using var back = new SKPaint { Color = Parse(w.BackColor, SKColors.Gray), IsAntialias = true };
         c.DrawRoundRect(r, rad, rad, back);
         var v = Value(w);
@@ -140,7 +140,7 @@ public sealed class ThemeRenderer : IDisposable
         c.Save();
         c.ClipRoundRect(new SKRoundRect(r, rad, rad), antialias: true);
         using var fill = new SKPaint { Color = ColorFor(w, v), IsAntialias = true };
-        c.DrawRect(new SKRect(r.Left, r.Top, r.Left + r.Width * frac, r.Bottom), fill);
+        c.DrawRect(w.Vertical ? new SKRect(r.Left, r.Bottom - r.Height * frac, r.Right, r.Bottom) : new SKRect(r.Left, r.Top, r.Left + r.Width * frac, r.Bottom), fill);
         c.Restore();
     }
 

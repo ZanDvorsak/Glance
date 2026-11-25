@@ -144,7 +144,10 @@ public sealed class MainWindow : Window
 
         Opened += async (_, _) =>
         {
-            if (Environment.GetCommandLineArgs().Contains("--setup")) OpenSetupCheck();   // Glance.App.exe --setup opens the setup check straight away
+            var startArgs = Environment.GetCommandLineArgs();   // handy for demos and testing: open a window straight away
+            if (startArgs.Contains("--setup")) OpenSetupCheck();
+            if (startArgs.Contains("--new")) NewTheme();
+            if (startArgs.Contains("--gallery")) OpenGallery();
             try { await MaybeShowSetupOnFirstRunAsync(); } catch { /* never block startup */ }
         };
 
@@ -191,6 +194,8 @@ public sealed class MainWindow : Window
         files.Children.Add(Btn("Save", async (_, _) => await SaveAsync(false)));
         files.Children.Add(Btn("Save as", async (_, _) => await SaveAsync(true)));
         files.Children.Add(Btn("Import AIDA64", async (_, _) => await ImportAidaAsync()));
+        var export = Btn("Export", async (_, _) => await ExportAsync()); ToolTip.SetTip(export, "Share this theme as a single .glance file");
+        files.Children.Add(export);
         files.Children.Add(new Border { Width = 1, Margin = new Thickness(6, 4), Background = Brush("#2B3342") });
         _undoBtn = Btn("Undo", (_, _) => DoUndo()); ToolTip.SetTip(_undoBtn, "Undo (Ctrl+Z)");
         _redoBtn = Btn("Redo", (_, _) => DoRedo()); ToolTip.SetTip(_redoBtn, "Redo (Ctrl+Y)");
@@ -661,7 +666,49 @@ public sealed class MainWindow : Window
         _redoBtn.IsEnabled = _undo.CanRedo;
     }
 
-    private void NewTheme() => SetTheme(AppTheme.CreateDefault(FindStarterBackground()), null);
+    private TemplatesWindow? _templates;
+
+    /// <summary>"New" opens the starter themes. The current theme stays as it is until the user picks one.</summary>
+    private void NewTheme()
+    {
+        if (_templates is { IsVisible: true }) { _templates.Activate(); return; }
+        _templates = new TemplatesWindow(_hub, (template, options) =>
+        {
+            var theme = template.Build(_hub.Snapshot, options);
+            SetTheme(theme, null);
+            _renderer.SeedGraphHistory(_theme.ActivePage, _hub);
+            _status.Text = $"New theme from \"{template.Name}\". Use Save to keep it.";
+        });
+        _templates.Closed += (_, _) => _templates = null;
+        _templates.Show(this);
+    }
+
+    /// <summary>Shares the current theme as one .glance file with its images and videos inside.</summary>
+    private async Task ExportAsync()
+    {
+        var file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+        {
+            Title = "Export theme", SuggestedFileName = SafeName(_theme.Name) + ThemePackage.Extension, DefaultExtension = "glance",
+            FileTypeChoices = new[] { new FilePickerFileType("Glance theme") { Patterns = new[] { "*.glance" } } },
+        });
+        if (file?.TryGetLocalPath() is not { } path) return;
+        try
+        {
+            await Task.Run(() => ThemePackage.Export(_theme, path));
+            _status.Text = $"Exported to {path} ({new FileInfo(path).Length / 1024.0 / 1024.0:0.0} MB). Anyone can open it with Glance.";
+        }
+        catch (Exception ex) { _status.Text = "Export failed: " + ex.Message; }
+    }
+
+    /// <summary>Opens a .glance file by unpacking it into its own folder under the themes folder.</summary>
+    private string ImportPackage(string package)
+    {
+        var baseName = SafeName(Path.GetFileNameWithoutExtension(package));
+        var folder = Path.Combine(AppSettings.ThemesFolder, baseName);
+        for (int n = 2; Directory.Exists(folder); n++) folder = Path.Combine(AppSettings.ThemesFolder, $"{baseName} {n}");
+        try { return ThemePackage.Import(package, folder); }
+        catch { try { if (Directory.Exists(folder)) Directory.Delete(folder, true); } catch { } throw; }   // do not leave a half-imported folder
+    }
 
     private async Task OpenAsync()
     {
@@ -670,10 +717,14 @@ public sealed class MainWindow : Window
         {
             Title = "Open theme", AllowMultiple = false,
             SuggestedStartLocation = await StorageProvider.TryGetFolderFromPathAsync(AppSettings.ThemesFolder),
-            FileTypeFilter = new[] { new FilePickerFileType("Theme") { Patterns = new[] { "*.json" } } },
+            FileTypeFilter = new[] { new FilePickerFileType("Glance theme") { Patterns = new[] { "*.json", "*.glance" } } },
         });
         if (files.Count == 0 || files[0].TryGetLocalPath() is not { } path) return;
-        try { SetTheme(AppTheme.Load(path), path); _settings.LastTheme = path; _status.Text = "Opened " + path; }
+        try
+        {
+            if (path.EndsWith(ThemePackage.Extension, StringComparison.OrdinalIgnoreCase)) path = ImportPackage(path);   // a shared theme: unpack it first
+            SetTheme(AppTheme.Load(path), path); _settings.LastTheme = path; _status.Text = "Opened " + path;
+        }
         catch (Exception ex) { _status.Text = "Could not open theme: " + ex.Message; }
     }
 

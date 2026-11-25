@@ -46,6 +46,8 @@ public partial class Widget : ObservableObject
     /// <summary>Colour of the value text inside a gauge.</summary>
     [ObservableProperty] private string _textColor = "#FFFFFFFF";
     [ObservableProperty] private double _cornerRadius = 6;
+    /// <summary>Bar only: fill from the bottom up instead of left to right.</summary>
+    [ObservableProperty] private bool _vertical;
     [ObservableProperty] private double _min;
     [ObservableProperty] private double _max = 100;
 

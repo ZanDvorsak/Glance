@@ -116,7 +116,8 @@ public sealed class GalleryWindow : Window
 
     private Control MakeCard(WidgetPreset preset, PresetResult result, PresetOptions options, ThemeRenderer renderer)
     {
-        var image = new Image { Source = Thumbnail(result, renderer), Stretch = Stretch.None, HorizontalAlignment = HorizontalAlignment.Center };
+        // shown at real size, but scaled down (never up) when a widget is wider than the card
+        var image = new Image { Source = Thumbnail(result, renderer), Stretch = Stretch.Uniform, StretchDirection = StretchDirection.DownOnly, HorizontalAlignment = HorizontalAlignment.Center };
         var stage = new Border
         {
             Child = image, Height = 190, CornerRadius = new CornerRadius(10), Padding = new Thickness(10), ClipToBounds = true,

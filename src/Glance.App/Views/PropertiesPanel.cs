@@ -77,7 +77,7 @@ public sealed class PropertiesPanel : ScrollViewer
                     Num("Width", "Width", 1, 4000, 1); Num("Height", "Height", 1, 4000, 1);
                     Text("Sensor", "SensorId"); Hint("Double-click a sensor in the list on the right to assign it.");
                     Num("Min", "Min", -100000, 100000, 1); Num("Max", "Max", -100000, 100000, 1);
-                    Num("Corner radius", "CornerRadius", 0, 200, 1); ColorRow("Fill", "Color"); ColorRow("Track", "BackColor"); Thresholds(); break;
+                    Num("Corner radius", "CornerRadius", 0, 200, 1); Check("Vertical", "Vertical"); ColorRow("Fill", "Color"); ColorRow("Track", "BackColor"); Thresholds(); break;
                 case WidgetKind.Image:
                     Num("Width", "Width", 1, 4000, 1); Num("Height", "Height", 1, 4000, 1);
                     Text("File", "ImagePath"); BrowseButton();

@@ -42,6 +42,32 @@ internal sealed class Ctx
 
     public string Accent => Options.Accent;
 
+    public static readonly string[] CpuIds = { "/amdcpu/", "/intelcpu/", "/cpu/" };
+    public static readonly string[] GpuIds = { "/gpu-", "/gpu/" };
+    public static readonly string[] StorageIds = { "/nvme/", "/hdd/", "/ssd/", "/storage/" };
+
+    /// <summary>Looks a sensor up by hardware, type and name (exact name first, then partial), recording it as missing when absent.</summary>
+    public (string id, double mult) Find(string what, string[] idHas, string type, params string[] names)
+    {
+        var candidates = Sensors.Where(s => s.Type == type && idHas.Any(h => s.Id.Contains(h, StringComparison.OrdinalIgnoreCase))).ToList();
+        SensorInfo? hit = null;
+        foreach (var n in names)
+        {
+            hit = candidates.FirstOrDefault(s => s.Name.Equals(n, StringComparison.OrdinalIgnoreCase))
+                  ?? candidates.FirstOrDefault(s => s.Name.Contains(n, StringComparison.OrdinalIgnoreCase));
+            if (hit is not null) break;
+        }
+        hit ??= candidates.FirstOrDefault();
+        if (hit is null) { Missing.Add(what); return ("", 1); }
+        return (hit.Id, 1);
+    }
+
+    /// <summary>Per-core CPU load sensors ("CPU Core #1" ...), in core order, capped at 32.</summary>
+    public List<SensorInfo> CpuCoreLoads() =>
+        Sensors.Where(s => s.Type == "Load" && CpuIds.Any(h => s.Id.Contains(h, StringComparison.OrdinalIgnoreCase))
+                           && System.Text.RegularExpressions.Regex.IsMatch(s.Name, @"^CPU Core #\d+$"))
+               .OrderBy(s => int.Parse(System.Text.RegularExpressions.Regex.Match(s.Name, @"\d+").Value)).Take(32).ToList();
+
     /// <summary>Finds a sensor by its AIDA64-style code (TCPU, SGPU1UTI, ...). <paramref name="aidaUnit"/> controls unit conversion.</summary>
     public (string id, double mult) Sensor(string code, string what, string aidaUnit = "")
     {
@@ -198,6 +224,71 @@ public static class PresetLibrary
             var fan = c.Sensor("FCPU", "CPU fan");
             return c.Done(200, 84, c.Panel(200, 84), c.Label("CPU FAN", 14, 10), c.Value("CPU fan", fan, 14, 32, 30, " RPM"));
         }),
+        P("gpu-fan-card", "GPU fan speed", "System", "Fan speed in RPM.", c =>
+        {
+            var fan = c.Sensor("FGPU1", "GPU fan");
+            return c.Done(200, 84, c.Panel(200, 84), c.Label("GPU FAN", 14, 10), c.Value("GPU fan", fan, 14, 32, 30, " RPM"));
+        }),
+        P("cpu-power-card", "CPU power", "System", "Package power in watts.", c =>
+        {
+            var p = c.Find("CPU power", Ctx.CpuIds, "Power", "Package");
+            return c.Done(180, 84, c.Panel(180, 84), c.Label("CPU POWER", 14, 10), c.Value("CPU power", p, 14, 32, 30, " W"));
+        }),
+        P("gpu-power-card", "GPU power", "System", "Board power in watts.", c =>
+        {
+            var p = c.Find("GPU power", Ctx.GpuIds, "Power", "GPU Package", "Package", "Power");
+            return c.Done(180, 84, c.Panel(180, 84), c.Label("GPU POWER", 14, 10), c.Value("GPU power", p, 14, 32, 30, " W"));
+        }),
+        P("cpu-clock-card", "CPU clock", "System", "Average core clock in MHz.", c =>
+        {
+            var clk = c.Sensor("SCPUCLK", "CPU clock");
+            return c.Done(210, 84, c.Panel(210, 84), c.Label("CPU CLOCK", 14, 10), c.Value("CPU clock", clk, 14, 32, 30, " MHz"));
+        }),
+        P("disk-activity-card", "Disk activity", "System", "How busy the first drive is, with a level bar.", c =>
+        {
+            var a = c.Find("Disk activity", Ctx.StorageIds, "Load", "Total Activity");
+            return c.Done(210, 96, c.Panel(210, 96), c.Label("DISK ACTIVITY", 14, 10), c.Value("Disk activity", a, 14, 28, 40, "%", warn: 80, crit: 95),
+                c.Bar("Disk bar", a, 14, 78, 182, 8, warn: 80, crit: 95));
+        }),
+        P("cpu-cores", "CPU cores", "Utilization", "One vertical bar per core, so you can see the load spread.", c =>
+        {
+            var cores = c.CpuCoreLoads();
+            if (cores.Count == 0) { c.Missing.Add("CPU core load"); cores = new List<SensorInfo>(); }
+            const double barW = 10, gap = 4, top = 36, barH = 70;
+            double width = Math.Max(160, 28 + cores.Count * (barW + gap) - gap), height = 120;
+            var items = new List<Widget?> { c.Panel(width, height), c.Label("CPU CORES", 14, 10) };
+            for (int i = 0; i < cores.Count; i++)
+            {
+                var b = c.Bar($"Core {i + 1}", (cores[i].Id, 1.0), 14 + i * (barW + gap), top, barW, barH, warn: 80, crit: 95);
+                b.Vertical = true; b.CornerRadius = 3;
+                items.Add(b);
+            }
+            return c.Done(width, height, items.ToArray());
+        }),
+        P("ram-ring", "Memory ring", "Utilization", "Full ring with the memory percentage.", c =>
+            GaugeCard(c, "RAM", "SMEMUTI", "Memory utilization", "%", 0, 100, 80, 95, ring: true)),
+        P("vram-ring", "Video memory ring", "Utilization", "Full ring with the video memory percentage.", c =>
+            GaugeCard(c, "VRAM", "SVMEMUSAGE", "Video memory utilization", "%", 0, 100, 85, 95, ring: true)),
+        P("drive-ring", "Drive usage ring", "System", "Full ring showing how full the first drive is.", c =>
+        {
+            var drive = c.Sensors.Where(s => s.Id.StartsWith("/drive/") && s.Id.EndsWith("/load/0")).OrderBy(s => s.Id).FirstOrDefault();
+            if (drive is null) c.Missing.Add("Drive utilization");
+            string letter = drive is null ? "C" : drive.Id.Split('/')[2].ToUpperInvariant();
+            var s = (drive?.Id ?? "", 1.0);
+            return c.Done(150, 150, c.Panel(150, 150), c.Gauge($"Drive {letter} ring", s, 10, 10, 130, "%", $"DRIVE {letter}:", 0, 100, 85, 95, ring: true));
+        }),
+        P("network-graph", "Download speed graph", "System", "Last minute of download speed.", c =>
+            GraphCard(c, "Download speed", "SNIC1DLRATE", "Download speed", " KB/s", 0, 0, 0, 0, "KB/s")),
+        P("temps-pair", "CPU and GPU temperature", "Temperature", "Both temperatures side by side with level bars.", c =>
+        {
+            var cpu = c.Sensor("TCPU", "CPU temperature"); var gpu = c.Sensor("TGPU1", "GPU temperature");
+            return c.Done(300, 96, c.Panel(300, 96),
+                c.Label("CPU", 14, 10), c.Value("CPU temp", cpu, 14, 28, 40, "°C", warn: 75, crit: 90), c.Bar("CPU bar", cpu, 14, 78, 122, 8, warn: 75, crit: 90),
+                c.Label("GPU", 164, 10), c.Value("GPU temp", gpu, 164, 28, 40, "°C", warn: 75, crit: 90), c.Bar("GPU bar", gpu, 164, 78, 122, 8, warn: 75, crit: 90));
+        }),
+        P("clock-compact", "Compact clock", "System", "Just the time, small.", c =>
+            c.Done(150, 56, c.Panel(150, 56),
+                new Widget { Kind = WidgetKind.Clock, Name = "Time", X = 14, Y = 8, Text = "HH:mm", FontSize = 34, Bold = true, Color = Ctx.White })),
     };
 
     private static (string, double) Miss(Ctx c, string what) { c.Missing.Add(what); return ("", 1.0); }
@@ -224,9 +315,9 @@ public static class PresetLibrary
         return c.Done(150, 150, c.Panel(150, 150), c.Gauge(title + " gauge", s, 10, 10, 130, unit, title, min, max, warn, crit, ring));
     }
 
-    private static PresetResult GraphCard(Ctx c, string title, string code, string what, string unit, double min, double max, double warn, double crit)
+    private static PresetResult GraphCard(Ctx c, string title, string code, string what, string unit, double min, double max, double warn, double crit, string aidaUnit = "")
     {
-        var s = c.Sensor(code, what);
+        var s = c.Sensor(code, what, aidaUnit);
         const double w = 260, h = 110;
         return c.Done(w, h, c.Panel(w, h), c.Label(title.ToUpperInvariant(), 14, 10, 12), c.Value(title + " value", s, w - 14, 6, 20, unit, "0", TextAlign.Right, warn, crit),
             c.Graph(title + " graph", s, 12, 36, w - 24, h - 46, min, max, warn, crit));
