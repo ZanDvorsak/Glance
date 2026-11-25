@@ -3,19 +3,29 @@ using System.Text.Json;
 
 namespace Glance.Core.Sensors;
 
-/// <summary>Receives sensor snapshots from the elevated Glance.SensorHost over a named pipe.</summary>
+/// <summary>Receives sensor snapshots from the elevated runner (or Glance.SensorHost) over a named pipe.</summary>
 public sealed class PipeSensorClient : ISensorSource, IDisposable
 {
     public const string PipeName = "Glance.Sensors";
 
+    /// <summary>The runner sends a snapshot every second; this long without one means it has stopped.</summary>
+    private const long StaleAfterMs = 5000;
+
     private readonly CancellationTokenSource _cts = new();
     private readonly object _lock = new();
     private IReadOnlyList<SensorInfo> _snapshot = Array.Empty<SensorInfo>();
+    private long _lastUpdateMs;
 
     public PipeSensorClient() => Task.Run(Loop);
 
     public IReadOnlyList<SensorInfo> Snapshot { get { lock (_lock) return _snapshot; } }
-    public bool HasData => Snapshot.Count > 0;
+
+    /// <summary>True only while snapshots are arriving. After the sender stops, the last values are stale and must not be shown as live.</summary>
+    public bool HasData
+    {
+        get { lock (_lock) return _snapshot.Count > 0 && Environment.TickCount64 - _lastUpdateMs < StaleAfterMs; }
+    }
+
     public void Update() { }
 
     private async Task Loop()
@@ -30,11 +40,13 @@ public sealed class PipeSensorClient : ISensorSource, IDisposable
                 while (!_cts.IsCancellationRequested && await reader.ReadLineAsync(_cts.Token) is { } line)
                 {
                     var list = JsonSerializer.Deserialize<List<SensorInfo>>(line);
-                    if (list is not null) lock (_lock) _snapshot = list;
+                    if (list is not null) lock (_lock) { _snapshot = list; _lastUpdateMs = Environment.TickCount64; }
                 }
             }
             catch (OperationCanceledException) { return; }
-            catch (Exception) { /* host not running or disconnected: retry */ }
+            catch (Exception) { /* sender not running or disconnected: retry */ }
+
+            lock (_lock) _snapshot = Array.Empty<SensorInfo>();   // the connection is gone: drop the old values
             try { await Task.Delay(1000, _cts.Token); } catch (OperationCanceledException) { return; }
         }
     }

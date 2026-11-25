@@ -19,6 +19,7 @@ using Glance.Core.Settings;
 using Glance.App.Views;
 using Glance.Core.Media;
 using Glance.Core.Presets;
+using Glance.Core.Setup;
 using Glance.Core.Sensors;
 using Glance.Core.Themes;
 using SkiaSharp;
@@ -141,6 +142,12 @@ public sealed class MainWindow : Window
         slow.Tick += (_, _) => SlowTick();
         slow.Start();
 
+        Opened += async (_, _) =>
+        {
+            if (Environment.GetCommandLineArgs().Contains("--setup")) OpenSetupCheck();   // Glance.App.exe --setup opens the setup check straight away
+            try { await MaybeShowSetupOnFirstRunAsync(); } catch { /* never block startup */ }
+        };
+
         Closing += (_, _) => { StopLive(); _pusher?.Dispose(); _renderer.Dispose(); _hub.Dispose(); _settings.Save(); };
     }
 
@@ -199,6 +206,7 @@ public sealed class MainWindow : Window
             if (_liveToRunner) { var b = _settings.Brightness; Task.Run(() => RunnerClient.Send($"BRIGHTNESS {b}")); }
         };
         var right = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, VerticalAlignment = VerticalAlignment.Center };
+        right.Children.Add(Btn("Setup check", (_, _) => OpenSetupCheck()));
         right.Children.Add(Btn("Background service", async (_, _) => await new ServiceWindow().ShowDialog(this)));
         right.Children.Add(new TextBlock { Text = "Backlight", VerticalAlignment = VerticalAlignment.Center, Foreground = Brush("#8C96A8"), Margin = new Thickness(8, 0, 0, 0) });
         right.Children.Add(slider);
@@ -766,6 +774,32 @@ public sealed class MainWindow : Window
         _theme.Widgets.Add(w);
         RefreshLayers();
         SelectWidget(w);
+    }
+
+    // ---- setup check -------------------------------------------------------------------------------------------
+
+    private SetupWindow? _setup;
+
+    private SetupContext CurrentSetupContext() => new(_hub.IsElevated, _hub.Snapshot.Count, Autostart.IsInstalled());
+
+    private void OpenSetupCheck()
+    {
+        if (_setup is { IsVisible: true }) { _setup.Activate(); return; }
+        _setup = new SetupWindow(CurrentSetupContext, () => Dispatcher.UIThread.Post(async () => await new ServiceWindow().ShowDialog(this)));
+        _setup.Closed += (_, _) => _setup = null;
+        _setup.Show(this);
+    }
+
+    /// <summary>On the very first run, open the setup check by itself if something required (the display) is not ready.</summary>
+    private async Task MaybeShowSetupOnFirstRunAsync()
+    {
+        if (_settings.SetupCheckShown) return;
+        await Task.Delay(2500);   // let sensors and the runner connection settle first
+        var ctx = CurrentSetupContext();
+        var results = await Task.Run(() => SetupChecks.Run(ctx));
+        if (!SetupChecks.NeedsAttention(results)) return;
+        _settings.SetupCheckShown = true; _settings.Save();
+        OpenSetupCheck();
     }
 
     // ---- premade widgets ----------------------------------------------------------------------------------------

@@ -16,6 +16,26 @@ public sealed unsafe class Ax206Display : IDisposable
 
     private Ax206Display(IntPtr handle) => _handle = handle;
 
+    /// <summary>True if a 1908:0102 display is visible through the libusb-win32 driver. Throws DllNotFoundException if libusb0.dll is missing.</summary>
+    public static bool IsPresent() => Libusb0.Enumerate().Any(d => d.Vid == Vid && d.Pid == Pid);
+
+    /// <summary>Opens and immediately closes the display to see whether another program holds it. Returns the error, or null if it can be opened.</summary>
+    public static string? TryProbeOpen()
+    {
+        var found = Libusb0.Enumerate().FirstOrDefault(d => d.Vid == Vid && d.Pid == Pid);
+        if (found is null) return "not found";
+        var h = Libusb0.usb_open(found.Device);
+        if (h == IntPtr.Zero) return Libusb0.LastError();
+        try
+        {
+            // opening can succeed even while another program owns the display; claiming the interface is what fails then
+            if (Libusb0.usb_claim_interface(h, 0) < 0) return Libusb0.LastError();
+            Libusb0.usb_release_interface(h, 0);
+            return null;
+        }
+        finally { Libusb0.usb_close(h); }
+    }
+
     /// <summary>Opens the first matching display. Throws if it is missing or used by another program.</summary>
     public static Ax206Display Open()
     {

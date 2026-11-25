@@ -8,6 +8,8 @@ public sealed class AppSettings
     public int Brightness { get; set; } = 7;
     /// <summary>While the editor sends to the display, keep it on the page being edited instead of rotating.</summary>
     public bool PinDisplayToPage { get; set; }
+    /// <summary>The setup check opens by itself the first time something required is missing; this remembers that it did.</summary>
+    public bool SetupCheckShown { get; set; }
 
     /// <summary>%AppData%\Glance. The first time it is needed, settings and themes from the app's earlier name (%AppData%\MiniLcd) are copied over.</summary>
     public static string Folder { get; } = ResolveFolder();
