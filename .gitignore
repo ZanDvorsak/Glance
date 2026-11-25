@@ -1,0 +1,14 @@
+# Build output
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# Personal files and third-party binaries that should not be redistributed
+/Themes/
+/Driver isntaller/
+
+# Captures and scratch files
+*.pcap
+*.log
