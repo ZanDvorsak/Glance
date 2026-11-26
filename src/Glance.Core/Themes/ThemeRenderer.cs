@@ -7,7 +7,7 @@ namespace Glance.Core.Themes;
 /// <summary>Draws a <see cref="Theme"/> page onto a Skia canvas. Used for both the editor preview and the real display.</summary>
 public sealed class ThemeRenderer : IDisposable
 {
-    private readonly Dictionary<string, AnimatedImage?> _images = new();
+    private readonly Dictionary<string, ImageEntry> _images = new();
     private readonly Dictionary<string, VideoSource> _videos = new();
 
     /// <summary>Creates video sources; tests swap it to avoid starting ffmpeg.</summary>
@@ -20,7 +20,9 @@ public sealed class ThemeRenderer : IDisposable
     internal const long VideoRetryMs = 5000;
     private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
     private readonly Dictionary<(string, bool, bool), SKTypeface> _faces = new();
-    private readonly Dictionary<string, SKTypeface?> _fileFaces = new();
+    private readonly Dictionary<string, FontEntry> _fileFaces = new();
+    private long _pass;         // one per Render call: pictures drawn in the current frame are never evicted
+    private long _lastSweep;
     private Theme? _theme;
     private readonly SensorHistory _history = new();
     private IReadOnlyList<SensorInfo>? _indexedFor;
@@ -34,6 +36,7 @@ public sealed class ThemeRenderer : IDisposable
     {
         Index(sensors);
         _theme = theme;
+        _pass++;
         page ??= theme.ActivePage;
         var bg = string.IsNullOrWhiteSpace(page.BackgroundColor) ? theme.BackgroundColor : page.BackgroundColor!;
         canvas.Clear(Parse(bg, SKColors.Black));
@@ -55,6 +58,7 @@ public sealed class ThemeRenderer : IDisposable
         }
 
         SweepVideos();
+        SweepIdle();
 
         if (selected is not null && selected.Visible)
         {
@@ -84,20 +88,26 @@ public sealed class ThemeRenderer : IDisposable
     /// <summary>
     /// Pre-fills graph history with a gentle synthetic curve around each graph's current value, so a freshly placed
     /// graph (or a gallery thumbnail) does not look empty. Real samples replace it as time passes.
+    /// Only sensors with no history yet are seeded, once each (for the longest graph showing them), so seeding a page
+    /// again, for example after adding a preset, never draws synthetic samples over real ones.
     /// </summary>
     public void SeedGraphHistory(ThemePage page, ISensorSource sensors)
     {
         Index(sensors);
         long now = _clock.ElapsedMilliseconds;
-        foreach (var w in page.Widgets.Where(w => w.Kind == WidgetKind.Graph && w.SensorId.Length > 0))
+        var graphs = page.Widgets.Where(w => w.Kind == WidgetKind.Graph && w.SensorId.Length > 0)
+            .GroupBy(w => w.SensorId)
+            .Select(g => (id: g.Key, seconds: g.Max(w => Math.Clamp(w.HistorySeconds, 5, 900))));
+        foreach (var (id, seconds) in graphs.ToList())
         {
-            if (!_index.TryGetValue(w.SensorId, out var s) || s.Value is not { } raw) continue;
-            int n = (int)(Math.Clamp(w.HistorySeconds, 5, 900) * 1000 / SensorHistory.SampleMs);
+            if (_history.HasSamples(id)) continue;
+            if (!_index.TryGetValue(id, out var s) || s.Value is not { } raw) continue;
+            int n = (int)(seconds * 1000 / SensorHistory.SampleMs);
             for (int i = 0; i < n; i++)
             {
-                double phase = i * 0.11 + w.SensorId.Length;
+                double phase = i * 0.11 + id.Length;
                 double wobble = 0.04 * Math.Sin(phase) + 0.015 * Math.Sin(phase * 2.3);
-                _history.Seed(w.SensorId, now - (n - i) * SensorHistory.SampleMs, (float)(raw * (1 + wobble)));
+                _history.Seed(id, now - (n - i) * SensorHistory.SampleMs, (float)(raw * (1 + wobble)));
             }
         }
     }
@@ -309,7 +319,7 @@ public sealed class ThemeRenderer : IDisposable
             fit = ImageFit.Stretch; // ffmpeg already fitted the frame to the widget box
             if (img is null) note = v.Error is null ? "Loading video..." : v.Error;
         }
-        else if (LoadImage(path) is { } anim)
+        else if (LoadImage(path, Math.Max(1, (int)Math.Ceiling(r.Width)), Math.Max(1, (int)Math.Ceiling(r.Height)), w.Fit) is { } anim)
         {
             img = anim.At(_clock.ElapsedMilliseconds);
         }
@@ -399,6 +409,11 @@ public sealed class ThemeRenderer : IDisposable
         w.LastBounds = new SKRect(left, (float)w.Y, left + width, (float)w.Y + (m.Descent - m.Ascent));
     }
 
+    /// <summary>
+    /// An installed font. SkiaSharp returns one shared object per family and style to every caller in the process
+    /// (and <see cref="SKTypeface.Default"/> for unknown families) and ignores Dispose on them, so this cache only
+    /// remembers them; disposing would be a no-op today and would break the other renderers if that ever changed.
+    /// </summary>
     private SKTypeface Face(string family, bool bold, bool italic = false)
     {
         var key = (family, bold, italic);
@@ -421,38 +436,188 @@ public sealed class ThemeRenderer : IDisposable
         return new SKFont(Face(w.FontFamily, bold, w.Italic), (float)size) { Edging = SKFontEdging.SubpixelAntialias };
     }
 
-    /// <summary>Loads a font file once (null when it is missing or not a font).</summary>
+    /// <summary>
+    /// A font file's typeface (null when it is missing or not a font). Like pictures, it is read again when the file
+    /// changes and looked for again while it is missing; a replaced typeface is freed.
+    /// </summary>
     private SKTypeface? FileFace(string path)
     {
-        if (_fileFaces.TryGetValue(path, out var f)) return f;
-        try { f = File.Exists(path) ? SKTypeface.FromFile(path) : null; } catch { f = null; }
-        return _fileFaces[path] = f;
+        var now = Now();
+        if (_fileFaces.TryGetValue(path, out var e))
+        {
+            e.LastUsedAt = now;
+            if (now - e.CheckedAt < StatIntervalMs) return e.Face;
+            e.CheckedAt = now;
+            var stamp = FileStamp.Of(path);
+            if (stamp == e.Stamp) return e.Face;
+            e.Face?.Dispose();
+            e.Face = null;
+        }
+        else _fileFaces[path] = e = new FontEntry { LastUsedAt = now };
+
+        e.CheckedAt = now;
+        e.Stamp = FileStamp.Of(path);
+        e.Face = ReadFontFile(path, e.Stamp);
+        return e.Face;
     }
 
-    private AnimatedImage? LoadImage(string? path)
+    /// <summary>
+    /// Reads the font into memory. <c>SKTypeface.FromFile</c> maps the file and keeps it locked for as long as the
+    /// typeface lives, so the user could not replace or delete it while the editor or the runner was open.
+    /// </summary>
+    private static SKTypeface? ReadFontFile(string path, FileStamp stamp)
+    {
+        if (!stamp.Exists || stamp.Length > MaxFontFileBytes) return null;
+        try
+        {
+            using var data = SKData.CreateCopy(File.ReadAllBytes(path));
+            return SKTypeface.FromData(data);
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// The picture for <paramref name="path"/>, decoded at about the size it is drawn at. Cached entries notice when
+    /// the file changes (checked at most every <see cref="StatIntervalMs"/>), a missing file is looked for again on
+    /// the same schedule, and a widget drawn bigger than its decode gets a sharper one.
+    /// </summary>
+    private AnimatedImage? LoadImage(string? path, int boxW, int boxH, ImageFit fit)
     {
         if (string.IsNullOrEmpty(path)) return null;
-        if (_images.TryGetValue(path, out var b)) return b;
-        b = File.Exists(path) ? AnimatedImage.Load(path) : null;
-        return _images[path] = b;
+        var now = Now();
+        if (_images.TryGetValue(path, out var e))
+        {
+            e.LastPass = _pass; e.LastUsedAt = now;
+            bool changed = false;
+            if (now - e.CheckedAt >= StatIntervalMs)
+            {
+                e.CheckedAt = now;
+                changed = FileStamp.Of(path) != e.Stamp;
+            }
+            if (!changed && (e.Image is null || e.Image.IsSharpEnoughFor(boxW, boxH, fit))) return e.Image;
+            if (!changed) { boxW += boxW / 4 + 1; boxH += boxH / 4 + 1; }   // a widget being enlarged: leave room so a drag does not decode on every step
+            e.Image?.Dispose();
+            e.Image = null;
+        }
+        else _images[path] = e = new ImageEntry { LastPass = _pass, LastUsedAt = now };
+
+        e.CheckedAt = now;
+        e.Stamp = FileStamp.Of(path);   // read before decoding, so a change made during the decode is seen next time
+        if (e.Stamp.Exists)
+        {
+            ImageDecodes++;
+            e.Image = AnimatedImage.Load(path, AvailableImageBytes(path), boxW, boxH, fit);
+            TrimImages(path);
+        }
+        return e.Image;
     }
 
-    /// <summary>Forget cached images and stop videos (call after a file changes on disk).</summary>
+    /// <summary>What is left of the budget for <paramref name="path"/> after the other pictures drawn this frame.</summary>
+    private long AvailableImageBytes(string path)
+    {
+        long inUse = _images.Where(kv => kv.Key != path && kv.Value.LastPass == _pass).Sum(kv => kv.Value.Image?.Bytes ?? 0);
+        return Math.Max(0, ImageBudgetBytes - inUse);
+    }
+
+    /// <summary>Frees the least recently drawn pictures (never ones drawn this frame) until the cache fits the budget.</summary>
+    private void TrimImages(string keep)
+    {
+        long total = CachedImageBytes;
+        if (total <= ImageBudgetBytes) return;
+        foreach (var (k, e) in _images.Where(kv => kv.Key != keep && kv.Value.LastPass != _pass && kv.Value.Image is not null)
+                     .OrderBy(kv => kv.Value.LastUsedAt).ToList())
+        {
+            total -= e.Image!.Bytes;
+            e.Image.Dispose();
+            _images.Remove(k);
+            if (total <= ImageBudgetBytes) break;
+        }
+    }
+
+    /// <summary>Drops pictures and font files that have not been drawn for a long time (a deleted widget, an old theme).</summary>
+    private void SweepIdle()
+    {
+        var now = Now();
+        if (now - _lastSweep < SweepEveryMs) return;
+        _lastSweep = now;
+        foreach (var k in _images.Where(kv => now - kv.Value.LastUsedAt > IdleMs).Select(kv => kv.Key).ToList())
+        {
+            _images[k].Image?.Dispose();
+            _images.Remove(k);
+        }
+        foreach (var k in _fileFaces.Where(kv => now - kv.Value.LastUsedAt > IdleMs).Select(kv => kv.Key).ToList())
+        {
+            _fileFaces[k].Face?.Dispose();
+            _fileFaces.Remove(k);
+        }
+    }
+
+    /// <summary>How often a cached file is checked for changes on disk (and a missing one looked for again).</summary>
+    internal const long StatIntervalMs = 1000;
+    /// <summary>A cached picture or font file not drawn for this long is freed.</summary>
+    internal const long IdleMs = 5 * 60 * 1000;
+    private const long SweepEveryMs = 10_000;
+    /// <summary>Total decoded picture memory one renderer keeps (each consumer has its own renderer).</summary>
+    public const long DefaultImageBudgetBytes = 96L * 1024 * 1024;
+    /// <summary>Font files bigger than this are not loaded (the installed font is used instead).</summary>
+    private const long MaxFontFileBytes = 64L * 1024 * 1024;
+
+    /// <summary>What identifies one version of a file: replacing or editing it changes the time or the size.</summary>
+    private readonly record struct FileStamp(bool Exists, DateTime Modified, long Length)
+    {
+        public static FileStamp Of(string path)
+        {
+            try
+            {
+                var fi = new FileInfo(path);
+                return fi.Exists ? new FileStamp(true, fi.LastWriteTimeUtc, fi.Length) : default;
+            }
+            catch { return default; }
+        }
+    }
+
+    private sealed class ImageEntry
+    {
+        public AnimatedImage? Image;
+        public FileStamp Stamp;
+        public long CheckedAt, LastUsedAt, LastPass;
+    }
+
+    private sealed class FontEntry
+    {
+        public SKTypeface? Face;
+        public FileStamp Stamp;
+        public long CheckedAt, LastUsedAt;
+    }
+
+    // ---- test hooks ---------------------------------------------------------------------------------------------
+    internal AnimatedImage? CachedImage(string path) => _images.TryGetValue(path, out var e) ? e.Image : null;
+    internal SKTypeface? CachedFileFace(string path) => _fileFaces.TryGetValue(path, out var e) ? e.Face : null;
+    internal long CachedImageBytes => _images.Values.Sum(e => e.Image?.Bytes ?? 0);
+    internal long ImageBudgetBytes { get; set; } = DefaultImageBudgetBytes;
+    internal int ImageDecodes { get; private set; }
+    internal SensorHistory History => _history;
+
+    /// <summary>
+    /// Forget cached images and font files and stop videos. Not needed when a file changes on disk (entries notice
+    /// that by themselves); use it to let go of everything, for example when another theme is opened.
+    /// </summary>
     public void ClearImageCache()
     {
-        foreach (var b in _images.Values) b?.Dispose();
+        foreach (var e in _images.Values) e.Image?.Dispose();
         _images.Clear();
         foreach (var v in _videos.Values) v.Dispose();
         _videos.Clear();
-        _fileFaces.Clear();   // font files are re-read the next time they are drawn
+        foreach (var e in _fileFaces.Values) e.Face?.Dispose();
+        _fileFaces.Clear();
     }
 
     private static SKColor Parse(string s, SKColor fallback) => SKColor.TryParse(s, out var c) ? c : fallback;
 
     public void Dispose()
     {
-        foreach (var f in _fileFaces.Values) f?.Dispose();
         ClearImageCache();
+        _faces.Clear();   // installed-font typefaces are shared process-wide by SkiaSharp: never disposed here (see Face)
         _history.Clear();
     }
 }

@@ -719,7 +719,8 @@ public sealed class MainWindow : Window
         _restoring = true;
         try { _theme.ApplySnapshot(snapshot); HookAll(); }
         finally { _restoring = false; }
-        _renderer.ClearImageCache();
+        // no cache clearing here: the renderer keys pictures by file and notices files that change on disk, so undo
+        // neither decodes every picture again on the UI thread nor restarts videos
         _selected = _theme.Widgets.FirstOrDefault(w => w.Id == selectedId);
         RefreshLayers();
         _props.Show(_theme, _selected);
@@ -816,7 +817,6 @@ public sealed class MainWindow : Window
             _undo.AfterSave(_theme.ToSnapshot(), moved);   // a plain save is not an undo step; a move to another folder clears the history
             UpdateUndoButtons();
             _themePath = path; _settings.LastTheme = path; _settings.Save();
-            _renderer.ClearImageCache();
             _status.Text = "Saved " + path + (moved ? " (undo history cleared: the theme now lives in a new folder)" : "");
         }
         catch (Exception ex) { _status.Text = "Save failed: " + ex.Message; }
@@ -863,9 +863,7 @@ public sealed class MainWindow : Window
             Title = "Choose an image, GIF or video", AllowMultiple = false,
             FileTypeFilter = new[] { new FilePickerFileType("Images, GIFs and videos") { Patterns = new[] { "*.png", "*.jpg", "*.jpeg", "*.bmp", "*.gif", "*.webp", "*.mp4", "*.webm", "*.mkv", "*.mov", "*.avi", "*.m4v", "*.wmv" } } },
         });
-        var path = files.Count > 0 ? files[0].TryGetLocalPath() : null;
-        if (path is not null) _renderer.ClearImageCache();
-        return path;
+        return files.Count > 0 ? files[0].TryGetLocalPath() : null;   // a changed file is noticed by the renderer itself
     }
 
     private async Task<string?> PickFontAsync()
@@ -875,9 +873,7 @@ public sealed class MainWindow : Window
             Title = "Choose a font file", AllowMultiple = false,
             FileTypeFilter = new[] { new FilePickerFileType("Fonts") { Patterns = new[] { "*.ttf", "*.otf", "*.ttc" } } },
         });
-        var path = files.Count > 0 ? files[0].TryGetLocalPath() : null;
-        if (path is not null) _renderer.ClearImageCache();
-        return path;
+        return files.Count > 0 ? files[0].TryGetLocalPath() : null;
     }
 
     // ---- widgets ------------------------------------------------------------------------------------------------
