@@ -3,7 +3,7 @@ using System.Text.Json;
 
 namespace Glance.Core.Sensors;
 
-/// <summary>Receives sensor snapshots from the elevated runner (or Glance.SensorHost) over a named pipe.</summary>
+/// <summary>Receives sensor snapshots from the Glance service over a named pipe, after checking that SYSTEM or Administrators serve it.</summary>
 public sealed class PipeSensorClient : ISensorSource, IDisposable
 {
     public const string PipeName = "Glance.Sensors";
@@ -17,9 +17,13 @@ public sealed class PipeSensorClient : ISensorSource, IDisposable
     private IReadOnlyList<SensorInfo> _snapshot = Array.Empty<SensorInfo>();
     private long _lastUpdateMs;
 
-    public PipeSensorClient(string? pipeName = null, TimeSpan? staleAfter = null)
+    private readonly IReadOnlyList<System.Security.Principal.SecurityIdentifier> _trustedOwners;
+
+    /// <param name="trustedOwners">Who may serve the pipe: default SYSTEM or Administrators (the Glance service). Tests pass the current user.</param>
+    public PipeSensorClient(string? pipeName = null, TimeSpan? staleAfter = null, IEnumerable<System.Security.Principal.SecurityIdentifier>? trustedOwners = null)
     {
         _pipeName = pipeName ?? PipeName;
+        _trustedOwners = (trustedOwners ?? Glance.Core.Service.PipeServerCheck.ServiceOwners).ToArray();
         _staleAfterMs = (long)(staleAfter ?? TimeSpan.FromSeconds(5)).TotalMilliseconds;
         Task.Run(Loop);
     }
@@ -42,6 +46,7 @@ public sealed class PipeSensorClient : ISensorSource, IDisposable
             {
                 using var pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.In);
                 await pipe.ConnectAsync(1000, _cts.Token);
+                Glance.Core.Service.PipeServerCheck.Verify(pipe, _trustedOwners);   // fake values from a squatter are never shown
                 using var reader = new StreamReader(pipe);
                 while (!_cts.IsCancellationRequested && await reader.ReadLineAsync(_cts.Token) is { } line)
                 {

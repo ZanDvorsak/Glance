@@ -83,9 +83,9 @@ public sealed class DisplayPusher : IDisposable
     /// <summary>When set, the display stays on this page (used while editing); null lets the theme rotate normally.</summary>
     public int? PinnedPage { get => _pinned < 0 ? null : _pinned; set => _pinned = value ?? -1; }
 
-    /// <summary>Opens the display; throws with a readable message if it is missing or busy.</summary>
+    /// <summary>Opens the display, through the Glance service when it runs, else over USB directly; throws with a readable message if it is missing or busy.</summary>
     public DisplayPusher(Func<Theme> theme, ISensorSource sensors, int brightness)
-        : this(theme, sensors, brightness, Ax206Display.Open()) { }
+        : this(theme, sensors, brightness, Service.DisplayConnector.Open()) { }
 
     /// <summary>Drives any <see cref="IFrameDisplay"/> (tests pass a fake and short timings). Takes ownership of <paramref name="lcd"/>, also when this throws.</summary>
     internal DisplayPusher(Func<Theme> theme, ISensorSource sensors, int brightness, IFrameDisplay lcd, PusherTiming? timing = null)

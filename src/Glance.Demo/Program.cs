@@ -6,13 +6,13 @@ using SkiaSharp;
 // Usage:
 //   Glance.Demo sensors   -> list every sensor found, then exit (no display needed)
 //   Glance.Demo [bg.png]  -> live demo on the display (Ctrl+C to stop)
-// Prefer the elevated SensorHost (full CPU/motherboard sensors); fall back to local, non-admin reading.
+// Prefer the Glance service's sensor feed (full CPU/motherboard sensors); fall back to local, non-admin reading.
 using var pipe = new PipeSensorClient();
 SensorService? local = null;
 for (int i = 0; i < 25 && !pipe.HasData; i++) await Task.Delay(100);
 ISensorSource sensors;
-if (pipe.HasData) { sensors = pipe; Console.WriteLine("Using SensorHost (elevated)."); }
-else { local = new SensorService(); sensors = local; Console.WriteLine("SensorHost not running: using local sensors (no admin => limited)."); }
+if (pipe.HasData) { sensors = pipe; Console.WriteLine("Using the Glance service's sensors."); }
+else { local = new SensorService(); sensors = local; Console.WriteLine("Glance service not running: using local sensors (no admin => limited)."); }
 using var _local = local;
 sensors.Update();
 

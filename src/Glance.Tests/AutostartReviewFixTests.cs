@@ -103,7 +103,7 @@ public class AutostartReviewFixTests
 
     [Theory]
     [InlineData(@"src\Glance.Runner\Glance.Runner.csproj")]
-    [InlineData(@"src\Glance.SensorHost\Glance.SensorHost.csproj")]
+    [InlineData(@"src\Glance.Service\Glance.Service.csproj")]   // Glance.SensorHost was removed (runner-service); the service keeps the rule
     public void H1_elevated_programs_turn_startup_hooks_off(string project)
     {
         var doc = XDocument.Load(Path.Combine(RepoRoot(), project));

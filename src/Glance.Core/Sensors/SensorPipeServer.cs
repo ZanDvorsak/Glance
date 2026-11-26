@@ -17,15 +17,18 @@ public sealed class SensorPipeServer : IDisposable
     private volatile string _latest = "[]";
     private readonly string _pipeName;
 
-    /// <param name="pipeName">Defaults to the name the editor looks for. Tests pass their own so they never collide with a running runner.</param>
-    public SensorPipeServer(string? pipeName = null) => _pipeName = pipeName ?? PipeSensorClient.PipeName;
+    private readonly PipeSecurity? _security;
+
+    /// <param name="pipeName">Defaults to the name the editor looks for. Tests pass their own so they never collide with a running service.</param>
+    /// <param name="security">The pipe's rules; null allows only the current user (the Glance service passes <c>ServicePipeSecurity.Build</c>).</param>
+    public SensorPipeServer(string? pipeName = null, PipeSecurity? security = null) { _pipeName = pipeName ?? PipeSensorClient.PipeName; _security = security; }
 
     public void Publish(IReadOnlyList<SensorInfo> snapshot) => _latest = JsonSerializer.Serialize(snapshot);
 
     public void Start()
     {
-        var security = new PipeSecurity();
-        security.AddAccessRule(new PipeAccessRule(WindowsIdentity.GetCurrent().User!, PipeAccessRights.FullControl, AccessControlType.Allow));
+        var security = _security ?? new PipeSecurity();
+        if (_security is null) security.AddAccessRule(new PipeAccessRule(WindowsIdentity.GetCurrent().User!, PipeAccessRights.FullControl, AccessControlType.Allow));
         _ = Task.Run(async () =>
         {
             while (!_cts.IsCancellationRequested)
