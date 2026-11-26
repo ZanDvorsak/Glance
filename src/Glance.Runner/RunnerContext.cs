@@ -30,6 +30,9 @@ internal sealed class RunnerContext : ApplicationContext
     private readonly System.Windows.Forms.Timer _supervisor = new() { Interval = 2000 };
     private readonly System.Windows.Forms.Timer _reloadDebounce = new() { Interval = 700 };
     private readonly List<FileSystemWatcher> _watchers = new();
+    private readonly DisplayPowerPolicy _power = new();
+    private SessionPowerWatcher? _powerWatcher;
+    private bool _quitting;
 
     private AppSettings _settings = AppSettings.Load();
     private Theme _theme = Theme.CreateDefault(null);
@@ -78,6 +81,7 @@ internal sealed class RunnerContext : ApplicationContext
 
         WatchFiles();
         _ = Task.Run(ControlLoop);
+        _powerWatcher = StartPowerWatcher();
     }
 
     // ---- theme / settings ---------------------------------------------------------------------------------------
@@ -142,6 +146,7 @@ internal sealed class RunnerContext : ApplicationContext
     {
         lock (_gate)
         {
+            if (!_power.MayDrive) { DisposePusher(); SetStatus(_power.Ended ? "Display off: Windows is ending the session" : "Display off while Windows sleeps"); return; }
             if (_paused) { DisposePusher(); SetStatus("Display paused"); return; }
             if (_pusher is null)
             {
@@ -163,6 +168,35 @@ internal sealed class RunnerContext : ApplicationContext
 
     /// <param name="blank">Turn the screen black as it closes. Not wanted when it is reopened immediately (reload, error recovery).</param>
     private void DisposePusher(bool blank = true) { _pusher?.Stop(blank); _pusher = null; _failingSince = null; }
+
+    // ---- shutdown, sign-out, sleep and wake ---------------------------------------------------------------------
+
+    private SessionPowerWatcher? StartPowerWatcher()
+    {
+        try { return new SessionPowerWatcher(OnPowerEvent, "Turning off the Glance display", Log); }
+        catch (Exception ex) { Log("Could not watch for shutdown and sleep: " + ex.Message); return null; }
+    }
+
+    /// <summary>
+    /// Runs on the watcher's own thread, and Windows waits for it: at a session end the process is killed soon after it returns,
+    /// so the display is blanked here, not later on the UI thread. It must never wait on the UI thread (BeginInvoke only).
+    /// </summary>
+    private void OnPowerEvent(PowerEvent e)
+    {
+        PowerAction action;
+        lock (_gate)
+        {
+            action = _power.Handle(e);
+            if (action is PowerAction.BlankAndStop or PowerAction.BlankAndHold) DisposePusher(blank: true);
+        }
+        Log($"Windows {e}: {action}");
+        switch (action)
+        {
+            case PowerAction.BlankAndStop: _ui.BeginInvoke(Quit); break;   // also covers an installer closing the app (Restart Manager)
+            case PowerAction.BlankAndHold:
+            case PowerAction.Reopen: _ui.BeginInvoke(Supervise); break;    // updates the status; after wake it reopens the display (and keeps retrying)
+        }
+    }
 
     private void SetPaused(bool paused)
     {
@@ -277,11 +311,14 @@ internal sealed class RunnerContext : ApplicationContext
 
     private void Quit()
     {
+        if (_quitting) return;   // a session end and the EXIT command can both ask
+        _quitting = true;
         Log("Runner exiting");
         _cts.Cancel();
         _supervisor.Stop();
         foreach (var w in _watchers) w.Dispose();
-        lock (_gate) DisposePusher();
+        lock (_gate) { if (_power.Handle(PowerEvent.Quit) == PowerAction.BlankAndStop) DisposePusher(); } // blank once, even if a session end got there first
+        _powerWatcher?.Dispose();
         _pipeServer.Dispose();
         _sensors.Dispose();
         _tray.Visible = false;

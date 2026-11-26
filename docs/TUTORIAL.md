@@ -95,7 +95,8 @@ Click **Background service** in the bottom bar:
 
 The runner is a small tray app that keeps your saved theme on the display, even with the editor closed. It asks for administrator rights once.
 Tick **Start automatically when I sign in to Windows** to create a scheduled task, so it starts at every login without a prompt.
-When the runner exits it blanks the display.
+When the runner exits it blanks the display. It also turns the display off when Windows shuts down, restarts, signs out or goes to sleep,
+and brings your theme back after the PC wakes up.
 
 ## 9. Try it without the display
 
@@ -112,6 +113,10 @@ You can also pick another screen size in the **Screen** menu, which is handy for
 ## Troubleshooting
 
 - **The display stays black or shows nothing**: check the Setup check. Close AIDA64 (only one program can use the display) and make sure the driver is libusb-win32.
+- **The display stays lit after shutting down the PC**: Glance turns it off when Windows shuts down, restarts, signs out or sleeps, but only if
+  the runner (or the editor, while it is sending) is running at that moment. If it is still lit, check `runner.log` in your Glance folder for a
+  line like `Windows SessionEnding: BlankAndStop`. Some PCs keep USB powered when off; turning that off in the BIOS/UEFI also works.
+- **The display stays black after the PC wakes up**: the runner reopens it within a few seconds. If it does not, unplug and replug it, or use **Reload theme** in the tray menu.
 - **CPU temperature is 0 °C or sensors are missing**: the runner is not running or PawnIO is not installed. Start the runner from **Background service**.
 - **Updates look slow**: the display accepts about 2.5 full frames per second, so fast animation is not possible. Glance skips frames that did not change.
 - **Colours look wrong**: report it with your display model; Glance sends RGB565 big-endian frames, which this display family expects.

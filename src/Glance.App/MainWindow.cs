@@ -156,7 +156,15 @@ public sealed class MainWindow : Window
             try { await MaybeShowSetupOnFirstRunAsync(); } catch { /* never block startup */ }
         };
 
-        Closing += (_, _) => { StopLive(); _pusher?.Dispose(); _renderer.Dispose(); _hub.Dispose(); _settings.Save(); };
+        Closing += (_, _) =>
+        {
+            StopLive();
+            lock (_powerGate) _power.Handle(PowerEvent.Quit);   // nothing may reopen the display from here on
+            ReleasePusher();
+            _powerWatcher?.Dispose();
+            _renderer.Dispose(); _hub.Dispose(); _settings.Save();
+        };
+        StartPowerWatcher();   // blank the display at shutdown, sign-out and sleep while the editor drives it
     }
 
     // ---- layout -------------------------------------------------------------------------------------------------
@@ -422,7 +430,7 @@ public sealed class MainWindow : Window
 
     private void ApplyPins()
     {
-        if (_pusher is not null) _pusher.PinnedPage = DesiredPin;
+        if (_pusher is { } pusher) pusher.PinnedPage = DesiredPin;   // read once: a Windows sleep event can clear it from another thread
         if (_liveToRunner) { var n = (DesiredPin ?? -1) + 1; Task.Run(() => RunnerClient.Send($"PAGE {n}")); }   // PAGE 0 releases the pin
     }
 
@@ -1311,8 +1319,7 @@ public sealed class MainWindow : Window
     {
         bool runner = RunnerClient.IsRunning;
         StopLive();
-        _pusher?.Dispose();               // blanks the screen as it closes
-        _pusher = null;
+        ReleasePusher();                  // blanks the screen as it closes
         _send.IsChecked = false;
         if (runner)
         {
@@ -1340,19 +1347,81 @@ public sealed class MainWindow : Window
 
     private void ToggleSend(bool on)
     {
-        _pusher?.Dispose(); _pusher = null;
+        ReleasePusher();
         StopLive();
         if (!on) { _status.Text = "Stopped sending."; return; }
         if (RunnerClient.IsRunning) { StartLive(); return; }
-        try
+        if (TryStartPusher(out var error)) _status.Text = "Sending to the display...";
+        else
         {
-            _pusher = new DisplayPusher(() => _theme, _hub, _settings.Brightness) { PinnedPage = DesiredPin };
-            _status.Text = "Sending to the display...";
-        }
-        catch (Exception ex)
-        {
-            _status.Text = ex.Message + "  (No display? Use Virtual display to preview and demo your theme on screen.)";
+            _status.Text = error + "  (No display? Use Virtual display to preview and demo your theme on screen.)";
             _send.IsChecked = false;
         }
+    }
+
+    // ---- shutdown, sign-out, sleep and wake while the editor itself drives the display ------------------------------
+
+    private readonly DisplayPowerPolicy _power = new();
+    private readonly object _powerGate = new();     // opening the display vs. a Windows event blanking it
+    private SessionPowerWatcher? _powerWatcher;
+    private bool _resumeAfterSleep;
+
+    private void StartPowerWatcher()
+    {
+        try { _powerWatcher = new SessionPowerWatcher(OnPowerEvent); }
+        catch { /* without it the display just keeps its last frame at shutdown, as before */ }
+    }
+
+    /// <summary>Opens the display unless Windows is sleeping or ending the session.</summary>
+    private bool TryStartPusher(out string? error)
+    {
+        lock (_powerGate)
+        {
+            if (!_power.MayDrive) { error = "Windows is going to sleep or ending the session."; return false; }
+            try { _pusher = new DisplayPusher(() => _theme, _hub, _settings.Brightness) { PinnedPage = DesiredPin }; error = null; return true; }
+            catch (Exception ex) { error = ex.Message; return false; }
+        }
+    }
+
+    /// <summary>Stops the editor's own pusher and blanks the display. Safe from any thread; only one caller gets to dispose it.</summary>
+    private bool ReleasePusher()
+    {
+        var p = Interlocked.Exchange(ref _pusher, null);
+        p?.Dispose();                     // blanks the screen as it closes
+        return p is not null;
+    }
+
+    /// <summary>Runs on the watcher's thread and Windows waits for it, so the display is blanked here, not on the UI thread.</summary>
+    private void OnPowerEvent(PowerEvent e)
+    {
+        PowerAction action;
+        bool released = false;
+        lock (_powerGate)
+        {
+            action = _power.Handle(e);
+            if (action is PowerAction.BlankAndStop or PowerAction.BlankAndHold) released = ReleasePusher();
+            if (action == PowerAction.BlankAndHold) _resumeAfterSleep = released;
+        }
+        if (action == PowerAction.BlankAndHold && released)
+            Dispatcher.UIThread.Post(() => _status.Text = "Display off while Windows sleeps.");
+        else if (action == PowerAction.Reopen && _resumeAfterSleep)
+        {
+            _resumeAfterSleep = false;
+            Dispatcher.UIThread.Post(ResumeSendingAfterSleep);
+        }
+    }
+
+    /// <summary>After wake, reopen the display if the editor was sending to it. The USB device can take a moment to come back.</summary>
+    private async void ResumeSendingAfterSleep()
+    {
+        string? error = null;
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            await Task.Delay(1500);
+            if (_send.IsChecked != true || _pusher is not null || _liveToRunner || !_power.MayDrive) return; // the user (or Windows) moved on
+            if (TryStartPusher(out error)) { _status.Text = "Sending to the display..."; return; }
+        }
+        _status.Text = "Could not reopen the display after sleep: " + error;
+        _send.IsChecked = false;
     }
 }

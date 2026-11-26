@@ -85,6 +85,12 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
 - **Only whole-screen updates work.** Partial rectangles time out and draw nothing (measured on the real display). A full frame takes ~400 ms, so ~2.5 updates/s max.
   `DisplayPusher` therefore skips frames identical to the last one and force-refreshes every 10 s. Do not build features that assume faster updates.
 - On exit/pause the display is blanked (black frame, backlight 0), otherwise it keeps its last picture. Reload/error recovery deliberately does not blank (flicker).
+- **Shutdown, restart, sign-out and sleep** also blank it (the USB port often stays powered, so the last frame would stay lit). `SessionPowerWatcher`
+  (Core) runs a hidden top-level window on its own thread and turns `WM_ENDSESSION`/`WM_POWERBROADCAST` into `PowerEvent`s; the handler runs
+  synchronously before the message is answered (Windows waits for it), with a shutdown block reason set during a session end.
+  `DisplayPowerPolicy` (pure, tested) decides: session end/quit -> blank once and never reopen; suspend -> blank and hold; resume -> reopen
+  (the runner's `Supervise` does it, the editor retries if it was sending). Owners check `MayDrive` before opening the display.
+  Only verifiable by hand: shut down / sleep with the display attached and look.
 - AIDA64 uses the same device; only one program can hold it.
 - The display and runner pages: `DisplayPusher.NextPageIndex` is the pure rotation logic (shared with the virtual display window).
 
