@@ -16,7 +16,7 @@ namespace Glance.Core.Storage;
 public static class AtomicFile
 {
     /// <summary>How long a save or a read keeps trying while the file is busy.</summary>
-    internal static readonly TimeSpan RetryBudget = TimeSpan.FromSeconds(1);
+    internal static TimeSpan RetryBudget { get; set; } = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(50);
 
     /// <summary>Where <see cref="Write"/> keeps the previous version when asked to.</summary>

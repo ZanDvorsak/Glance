@@ -125,11 +125,31 @@ public sealed class AppSettings
         catch { /* logging must never break loading */ }
     }
 
-    /// <summary>Saves to %AppData%\Glance\settings.json. Failures are not fatal and are ignored.</summary>
-    public void Save()
+    // ---- seam for the review fixes (same behaviour as above) ----
+
+    public static SettingsRead Read(Action<string>? log = null) => Read(FilePath, log ?? DefaultLog);
+
+    public static SettingsRead Read(string path, Action<string>? log = null)
     {
-        try { Directory.CreateDirectory(Folder); Save(FilePath); }
-        catch { /* non-fatal */ }
+        var existed = File.Exists(path);
+        var ok = TryLoad(path, out var s, log);
+        return new SettingsRead(s, !ok ? SettingsFileState.Unreadable : existed ? SettingsFileState.Loaded : SettingsFileState.Missing, null, null);
+    }
+
+    public bool TrySave(string path, Action<string>? log = null)
+    {
+        try { Save(path); return true; }
+        catch { return false; }
+    }
+
+    internal static void AppendLog(string file, string message, long maxBytes) =>
+        File.AppendAllText(file, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  {message}{Environment.NewLine}");
+
+    /// <summary>Saves to %AppData%\Glance\settings.json. Failures are not fatal and are ignored.</summary>
+    public bool Save()
+    {
+        try { Directory.CreateDirectory(Folder); Save(FilePath); return true; }
+        catch { return false; }
     }
 
     /// <summary>Saves all or nothing (see <see cref="AtomicFile"/>): a failure leaves the previous file as it was, and throws.</summary>
