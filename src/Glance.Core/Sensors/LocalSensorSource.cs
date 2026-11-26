@@ -28,7 +28,7 @@ public sealed class LocalSensorSource : ISensorSource, IDisposable
         {
             while (!_cts.IsCancellationRequested)
             {
-                try { await Task.Delay(1000, _cts.Token); } catch (OperationCanceledException) { return; }
+                try { await Task.Delay(1000, _cts.Token).ConfigureAwait(false); } catch (OperationCanceledException) { return; }
                 try { _service.Update(); Merge(); Updated?.Invoke(); } catch { /* keep going */ }
             }
         });

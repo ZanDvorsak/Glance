@@ -13,6 +13,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- CA2007 as an error: every await in Core needs ConfigureAwait(false) (reason in the file; ConfigureAwaitGuardTests checks it) -->
+    <GlobalAnalyzerConfigFiles Include="Core.globalconfig" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
     <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
     <PackageReference Include="SkiaSharp" Version="4.157.0" />

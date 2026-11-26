@@ -51,7 +51,9 @@ internal sealed class RunnerContext : ApplicationContext
     private string? _loggedRenderError;     // each distinct theme error is logged once, not every frame
     private DateTime? _failingSince;
     private string? _lastError;
-    private bool _paused;
+    private readonly BackgroundOpener _opener = new();                       // opens the display off the UI thread
+    private readonly LogLimiter _openLog = new(TimeSpan.FromMinutes(1));     // a missing display is retried every 2 s
+    private volatile bool _paused;
     private int? _pinPage;
     private int _brightness;
 
@@ -88,16 +90,18 @@ internal sealed class RunnerContext : ApplicationContext
         _tray.DoubleClick += (_, _) => OpenEditor();
 
         _reloadDebounce.Tick += (_, _) => { _reloadDebounce.Stop(); Reload(); };
-        _supervisor.Tick += (_, _) => Supervise();
-        _supervisor.Start();
-        Supervise();
 
+        // The control pipe, the watchers and the timers come first, and the display is opened last and off this (UI)
+        // thread: Glance 0.2.0 opened it right here, deadlocked on the service pipe, and never got any further.
         WatchFiles();
         _ = Task.Run(ControlLoop);
         _powerWatcher = StartPowerWatcher();
+        _supervisor.Tick += (_, _) => Supervise();
         _supervisor.Tick += (_, _) => HealStuckSleep();
         _supervisor.Tick += (_, _) => { RereadLockedSettings(); CheckService(); };
         CheckService();
+        _supervisor.Start();
+        Supervise();   // starts the first open in the background; returns at once
     }
 
     // ---- theme / settings ---------------------------------------------------------------------------------------
@@ -189,18 +193,12 @@ internal sealed class RunnerContext : ApplicationContext
             {
                 if (_closingPusher is { IsClosed: false })
                     _lastError = "the display is finishing its last transfer";   // still claimed; opening now would fail with "busy"
-                else
+                else if (!_opener.IsOpening)
                 {
+                    // never on this (UI) thread: the service pipe or USB can take seconds; Opened takes the result
                     _closingPusher = null;
-                    try { _pusher = new DisplayPusher(() => Current, _sensors, _brightness) { PinnedPage = _pinPage }; _failingSince = null; _lastError = null; Log("Display opened"); }
-                    catch (Exception ex) { _lastError = ex.Message; }
-                    // Windows may have started a shutdown or sleep while it opened (the power event does not wait behind this lock)
-                    if (_pusher is not null && !_power.MayDrive)
-                    {
-                        Log("Windows is ending the session or sleeping; closing the display just opened");
-                        _blankOwed = false;
-                        DisposePusher(blank: true, DisplayPusher.QuickStopTimeout);
-                    }
+                    int brightness = _brightness;
+                    _opener.TryStart(() => new DisplayPusher(() => Current, _sensors, brightness), Opened);
                 }
             }
             else
@@ -221,10 +219,48 @@ internal sealed class RunnerContext : ApplicationContext
             }
 
             SetStatus(_pusher is null
-                ? "Waiting for the display: " + (_lastError ?? "not found")
+                ? _lastError is null && _opener.IsOpening ? "Opening the display..." : "Waiting for the display: " + (_lastError ?? "not found")
                 : _pusher.LastRenderError is { } drawError ? "Could not draw the theme: " + drawError
                 : _live is not null ? $"Live preview from the editor, {_pusher.Fps:0.0} fps" : $"Showing \"{_theme.Name}\"{(Current.Pages.Count > 1 ? $" (page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count})" : "")}, {_pusher.Fps:0.0} fps");
         }
+    }
+
+    /// <summary>
+    /// The background open finished (thread pool). Takes the new pusher unless things changed meanwhile: Windows started a
+    /// shutdown or sleep, the user paused, the app is quitting (the policy then forbids driving) or another pusher is running.
+    /// Failures are logged, at most once a minute per distinct message, and shown in the tray menu.
+    /// </summary>
+    private void Opened(DisplayPusher? opened, Exception? error)
+    {
+        lock (_gate)
+        {
+            if (opened is null)
+            {
+                _lastError = error?.Message ?? "unknown error";
+                if (_openLog.Filter("Could not open the display: " + _lastError) is { } line) Log(line);
+            }
+            else if (!_power.MayDrive)
+            {
+                // the power event found nothing to blank while this opened; the new pusher may already have drawn a frame
+                Log("Windows is ending the session or sleeping; closing the display just opened");
+                _blankOwed = false;
+                if (!opened.Stop(blank: true, DisplayPusher.QuickStopTimeout)) RememberClosing(opened);
+            }
+            else if (_paused || _pusher is not null)
+            {
+                if (!opened.Stop(blank: _paused, DisplayPusher.StopTimeout)) RememberClosing(opened);
+            }
+            else
+            {
+                opened.PinnedPage = _pinPage;
+                opened.SetBrightness(_brightness);   // in case it changed while opening
+                _pusher = opened;
+                _failingSince = null;
+                _lastError = null;
+                Log(opened.ViaService ? "Display opened through the Glance service" : "Display opened over USB (no Glance service)");
+            }
+        }
+        try { _ui.BeginInvoke(Supervise); } catch { /* the app is closing */ }   // status now (and a retry later if it failed)
     }
 
     /// <param name="blank">Turn the screen black as it closes. Not wanted when it is reopened immediately (reload, error recovery).</param>
@@ -253,8 +289,9 @@ internal sealed class RunnerContext : ApplicationContext
     /// <summary>
     /// Runs on a watcher thread while Windows waits for the answer: at a session end the process is killed soon after, so the
     /// display is blanked here, not later on the UI thread. It never waits on the UI thread (BeginInvoke only), and the blank is
-    /// bounded: if the UI thread holds <see cref="_gate"/> for long (opening or reloading the display), it gives up and leaves
-    /// the blank to the UI thread, which sees the policy and pays the owed blank when it lets go.
+    /// bounded: if the UI thread holds <see cref="_gate"/> for long (stopping or reloading the display), it gives up and leaves
+    /// the blank to the UI thread, which sees the policy and pays the owed blank when it lets go. A display that is still being
+    /// opened in the background is not under the lock; <see cref="Opened"/> sees the policy and blanks it.
     /// </summary>
     private void OnPowerEvent(PowerEvent e)
     {
