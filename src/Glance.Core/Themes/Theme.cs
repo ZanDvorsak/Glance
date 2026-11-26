@@ -97,8 +97,14 @@ public partial class Theme : ObservableObject
         var t = JsonSerializer.Deserialize<Theme>(json, Json) ?? throw new InvalidOperationException("Bad snapshot");
         t.Normalize();
         Name = t.Name; Width = t.Width; Height = t.Height; BackgroundColor = t.BackgroundColor; AutoRotate = t.AutoRotate;
-        Pages.Clear();
-        foreach (var p in t.Pages) Pages.Add(p);
+        // Replace page by page instead of Clear() + Add: a display pusher may be drawing this same theme on another thread,
+        // and the list must never be empty while it looks (Normalize guarantees the snapshot has at least one page).
+        for (int i = 0; i < t.Pages.Count; i++)
+        {
+            if (i < Pages.Count) Pages[i] = t.Pages[i];
+            else Pages.Add(t.Pages[i]);
+        }
+        while (Pages.Count > t.Pages.Count) Pages.RemoveAt(Pages.Count - 1);
         ActivePageIndex = Math.Clamp(ActivePageIndex, 0, Pages.Count - 1);
     }
 

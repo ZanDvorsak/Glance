@@ -148,6 +148,12 @@ internal sealed class RunnerContext : ApplicationContext
                 try { _pusher = new DisplayPusher(() => Current, _sensors, _brightness) { PinnedPage = _pinPage }; _failingSince = null; _lastError = null; Log("Display opened"); }
                 catch (Exception ex) { _lastError = ex.Message; }
             }
+            else if (!_pusher.IsAlive)
+            {
+                // the loop ended without being stopped; treat it like a failing display and reopen it on the next tick
+                Log("Display loop stopped; reopening: " + (_pusher.LastError ?? "unknown error"));
+                DisposePusher(blank: false);
+            }
             else if (_pusher.LastError is not null)
             {
                 _failingSince ??= DateTime.UtcNow;

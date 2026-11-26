@@ -1244,6 +1244,7 @@ public sealed class MainWindow : Window
         _ffmpegBtn.IsEnabled = !_installingFfmpeg;
         _ffmpegBtn.Content = _installingFfmpeg ? "Installing FFmpeg..." : "Install FFmpeg for video";
 
+        if (_pusher is { IsAlive: false } dead) RestartDeadPusher(dead);
         if (_pusher is { } p)
         {
             _displayDot.Fill = p.LastError is null ? Brush("#34D399") : Brush("#FF6B6B");
@@ -1336,6 +1337,24 @@ public sealed class MainWindow : Window
         _lastLive = snap;
         var folder = _theme.BaseFolder;
         Task.Run(() => RunnerClient.SendLive(snap, folder));
+    }
+
+    /// <summary>The pusher's loop ended without being stopped (it should not, but it must never freeze the display silently): reopen it.</summary>
+    private void RestartDeadPusher(DisplayPusher dead)
+    {
+        var why = dead.LastError ?? "unknown error";
+        dead.Stop(blank: false);   // the loop has ended, so this returns at once
+        _pusher = null;
+        try
+        {
+            _pusher = new DisplayPusher(() => _theme, _hub, _settings.Brightness) { PinnedPage = DesiredPin };
+            _status.Text = "The display stopped (" + why + "); reopened it.";
+        }
+        catch (Exception ex)
+        {
+            _send.IsChecked = false;   // runs ToggleSend(false), which sets its own status; ours goes after it
+            _status.Text = "The display stopped (" + why + ") and could not be reopened: " + ex.Message;
+        }
     }
 
     private void ToggleSend(bool on)
