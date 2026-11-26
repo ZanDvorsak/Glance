@@ -19,6 +19,17 @@ public sealed class UndoManager
     /// <summary>Change the baseline without creating an undo step (e.g. save normalising image paths).</summary>
     public void Rebase(string snapshot) => _current = snapshot;
 
+    /// <summary>
+    /// Call after a save with the saved snapshot and whether the theme moved to another folder.
+    /// A plain save only rebases (saving rewrites paths, which is not an undo step). After Save As to another folder
+    /// the older snapshots hold paths relative to the old folder, which may not exist in the new one (a deleted
+    /// widget's picture was never copied, or a file was renamed to avoid a clash), so the history is cleared.
+    /// </summary>
+    public void AfterSave(string snapshot, bool themeMoved)
+    {
+        if (themeMoved) Reset(snapshot); else Rebase(snapshot);
+    }
+
     /// <summary>Records a new state. Returns true if it differed from the last one.</summary>
     public bool Commit(string snapshot)
     {

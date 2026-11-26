@@ -61,46 +61,99 @@ public partial class Theme : ObservableObject
 
     /// <summary>
     /// Saves the theme and copies the files it uses (images, videos, fonts) into an assets folder next to it.
-    /// Absolute paths are always copied; relative paths are copied too when the theme moves to another folder
-    /// (Save As), so the new copy never points at files that are only in the old folder.
+    /// Absolute paths are always copied. Relative paths are copied too when the theme moves to another folder
+    /// (Save As), so the new copy never points at files that are only in the old folder. A theme that was never
+    /// saved has no folder to resolve relative paths against, so those are kept as they are, like missing files.
+    /// Save As flattens subfolders: every copied file lands directly in <c>assets/</c>.
+    /// <para>All or nothing: the files are copied and the theme file is written first; only then are the widget
+    /// paths and <see cref="BaseFolder"/> changed. If anything fails, the files this call copied are removed,
+    /// the previous theme file is kept, and the theme object is unchanged.</para>
     /// </summary>
-    public void Save(string path)
+    /// <returns>True when the theme moved from one folder to another (Save As), so older relative paths no longer resolve.</returns>
+    public bool Save(string path)
     {
-        var dir = Path.GetDirectoryName(Path.GetFullPath(path))!;
+        var target = Path.GetFullPath(path);
+        var dir = Path.GetDirectoryName(target)!;
         Directory.CreateDirectory(dir);
         var assets = Path.Combine(dir, "assets");
+        var assetsExisted = Directory.Exists(assets);
+        // String comparison only: a junction or subst drive looks like another folder, which costs a redundant copy, nothing worse.
         var sameFolder = BaseFolder is not null && SameFolder(BaseFolder, dir);
+        var created = new List<string>();
+        var adopted = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // source file -> stored path
+        var temp = target + ".saving";   // not *.json, so the runner's watcher ignores it until it is renamed
 
-        // returns the relative path to store, or the original when the file cannot be found
-        string Adopt(string path)
+        // returns the relative path to store, or the stored value as it is when the file cannot be found
+        string Adopt(string stored)
         {
-            if (string.IsNullOrEmpty(path)) return path;
-            var rooted = Path.IsPathRooted(path);
-            if (!rooted && sameFolder) return path;          // already next to the theme
-            var source = rooted ? path : ResolveAsset(path); // relative paths belong to the old folder
-            if (source is null || !File.Exists(source)) return path;
+            if (string.IsNullOrEmpty(stored)) return stored;
+            var rooted = Path.IsPathRooted(stored);
+            if (!rooted && sameFolder) return stored;            // already next to the theme
+            var source = rooted ? stored : ResolveAsset(stored); // relative paths belong to the old folder
+            if (source is null || !File.Exists(source)) return stored;
+            source = Path.GetFullPath(source);
+            if (adopted.TryGetValue(source, out var known)) return known;
             Directory.CreateDirectory(assets);
             var name = Path.GetFileName(source);
             var dest = Path.Combine(assets, name);
-            var n = 1;
-            while (File.Exists(dest) && new FileInfo(dest).Length != new FileInfo(source).Length)
-                dest = Path.Combine(assets, $"{Path.GetFileNameWithoutExtension(name)}_{n++}{Path.GetExtension(name)}");
-            if (!File.Exists(dest)) File.Copy(source, dest);
-            return "assets/" + Path.GetFileName(dest);
+            // an existing file is reused only when it has the same content; otherwise pick the next free name
+            for (var n = 1; File.Exists(dest) && !SameContent(source, dest); n++)
+                dest = Path.Combine(assets, $"{Path.GetFileNameWithoutExtension(name)}_{n}{Path.GetExtension(name)}");
+            if (!File.Exists(dest)) { File.Copy(source, dest); created.Add(dest); }
+            return adopted[source] = "assets/" + Path.GetFileName(dest);
         }
-        foreach (var w in Pages.SelectMany(p => p.Widgets))
+
+        var widgets = Pages.SelectMany(p => p.Widgets).ToList();
+        try
         {
-            w.ImagePath = Adopt(w.ImagePath);
-            w.FontFile = Adopt(w.FontFile);
+            // 1) copy every file and work out the new paths, without touching the theme
+            var updates = widgets.Select(w => (Image: Adopt(w.ImagePath), Font: Adopt(w.FontFile))).ToList();
+
+            // 2) write the theme file from a copy that has the new paths, then swap it in
+            var copy = JsonSerializer.Deserialize<Theme>(ToSnapshot(), Json)!;
+            var copyWidgets = copy.Pages.SelectMany(p => p.Widgets).ToList();
+            for (var i = 0; i < updates.Count; i++) { copyWidgets[i].ImagePath = updates[i].Image; copyWidgets[i].FontFile = updates[i].Font; }
+            File.WriteAllText(temp, JsonSerializer.Serialize(copy, Json));
+            File.Move(temp, target, overwrite: true);
+
+            // 3) everything is on disk: now change the open theme
+            for (var i = 0; i < updates.Count; i++) { widgets[i].ImagePath = updates[i].Image; widgets[i].FontFile = updates[i].Font; }
+            var moved = BaseFolder is not null && !sameFolder;
+            BaseFolder = dir;
+            return moved;
         }
-        BaseFolder = dir;
-        File.WriteAllText(path, JsonSerializer.Serialize(this, Json));
+        catch
+        {
+            TryDelete(temp);
+            foreach (var f in created) TryDelete(f);
+            if (!assetsExisted) try { Directory.Delete(assets); } catch { /* not empty or gone: leave it */ }
+            throw;
+        }
     }
+
+    private static void TryDelete(string file) { try { File.Delete(file); } catch { /* best effort while undoing a failed save */ } }
 
     private static bool SameFolder(string a, string b)
     {
         static string Norm(string p) => Path.GetFullPath(p).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         return string.Equals(Norm(a), Norm(b), StringComparison.OrdinalIgnoreCase);   // Windows paths are case-insensitive
+    }
+
+    /// <summary>True when both paths are the same file or hold exactly the same bytes.</summary>
+    private static bool SameContent(string a, string b)
+    {
+        if (string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase)) return true;
+        if (new FileInfo(a).Length != new FileInfo(b).Length) return false;
+        using var fa = File.OpenRead(a);
+        using var fb = File.OpenRead(b);
+        var ba = new byte[81920]; var bb = new byte[81920];
+        while (true)
+        {
+            var na = fa.ReadAtLeast(ba, ba.Length, throwOnEndOfStream: false);
+            var nb = fb.ReadAtLeast(bb, bb.Length, throwOnEndOfStream: false);
+            if (na != nb || !ba.AsSpan(0, na).SequenceEqual(bb.AsSpan(0, nb))) return false;
+            if (na == 0) return true;
+        }
     }
 
     /// <summary>The whole theme as JSON, used by undo/redo and live preview.</summary>

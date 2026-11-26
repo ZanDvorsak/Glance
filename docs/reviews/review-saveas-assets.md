@@ -216,3 +216,85 @@ dotnet test src/Glance.Tests -c Release --filter "FullyQualifiedName~Save_as|Ful
 | `Save_as_leaves_missing_files_as_they_are` | Passed (regression guard) | Passed |
 
 On `main` the result was `Failed: 2, Passed: 2, Total: 4`; on the branch it was `Passed: 4, Total: 4`, with the full suite at 257/257. The first failure is the reported bug itself: only the one absolute-path asset was copied, and every relative asset was left behind.
+
+---
+
+## Fixes after review
+
+**Added by the fixing session on 2026-11-26.** The reviewer's findings above are unchanged. Fixed: M1, M2, L1, N6, N7. Also covered: N3 and N2
+(doc comment and code comment) and N4 (the `Adopt` parameter is now `stored`). Left open on purpose, as tracked separately: L2 (copying on
+the UI thread), L3 (`..` paths) and N1 (Save As flattens subfolders; now stated in the doc comment). N5 and N8 are unchanged.
+
+### How it was proven
+
+The rule was: test first, run it red on the branch's code, fix, run it green, then run the full suite.
+
+1. **Behaviour-preserving refactor (L1 only).** The undo decision lived in `MainWindow`, which has no tests. It moved into Core
+   without changing behaviour: `Theme.Save` now returns `true` when the theme moved from one folder to another, and the new
+   `UndoManager.AfterSave(snapshot, themeMoved)` at first did exactly what the editor did before (`Rebase`). `MainWindow.SaveAsync` calls it.
+2. **Red.** I added the new tests and changed the two existing ones (N6, N7), then ran the whole suite on the branch code
+   (`fbe9400` plus the refactor above, no fix):
+   `Failed: 6, Passed: 258, Total: 264`. Each of the six failures is a finding. The three guard tests passed, as they should.
+3. **Fix**, then **green**: `Passed: 264, Total: 264`. `dotnet build src/Glance.sln -c Release`: 0 errors, 28 warnings (all already on `main`).
+4. **Extra mutation check.** Removing the rollback that deletes the files a failed save copied makes both M1 tests fail. The code was restored afterwards.
+
+### M1: a failed save left the open theme half-changed
+
+**Fix (`Theme.Save`):** the save now runs in three phases.
+- (1) Copy every file and work out the new paths. The theme is not touched.
+- (2) Write the new JSON from a copy of the theme to `theme.json.saving`, then swap it into place with `File.Move(..., overwrite: true)`.
+- (3) Only then set the widget paths and `BaseFolder`.
+
+If any step throws, the temporary file and every file this call copied are deleted, and an `assets` folder this call created is removed
+if it is empty. The previous `theme.json` stays as it was, and the exception goes to the caller as before (`SaveAsync` shows "Save failed").
+The temporary name does not end in `.json`, so the runner's `*.json` watcher ignores it. The runner already reloads on `Renamed`
+(`RunnerContext.cs:132`), so the swap still triggers a reload.
+
+| Test | Before (branch code) | After |
+|---|---|---|
+| `A_save_that_fails_while_copying_leaves_the_open_theme_and_the_target_unchanged` (the reviewer's probe: `locked.png` held with `FileShare.None`, and B already has a different `a.png`) | **Failed:** `Assert.Equal() Failure: Strings differ` at `"ImagePath": "assets/a.png"`; the actual value was `"assets/a_1.png"`, so the open theme was half-rewritten | Passed |
+| `A_save_that_fails_while_writing_the_theme_file_leaves_the_open_theme_unchanged` (the target `theme.json` is read-only, so the copies succeed and the write fails) | **Failed:** `BaseFolder` expected `...\A`, actual `...\B` | Passed |
+
+### M2: same name and same size counted as the same file
+
+**Fix:** an existing file in `assets` is reused only when it is the same file or has the same bytes (the sizes are compared first, then the
+content, in 80 KB chunks). Otherwise the next `_n` name is used. Within one save, a `source -> stored path` map copies each source once.
+
+| Test | Before | After |
+|---|---|---|
+| `Save_as_does_not_reuse_a_different_file_of_the_same_name_and_size_in_the_target` (`bg.bmp` = `[1,1,1]` in A, `[2,2,2]` already in B) | **Failed:** expected `[1, 1, 1]`, actual `[2, 2, 2]` (A's background showed B's picture) | Passed |
+| `Save_as_keeps_same_named_files_from_different_subfolders_apart` (`assets/x/p.png` = `[3,3]`, `assets/y/p.png` = `[4,4]`) | **Failed:** expected `[4, 4]`, actual `[3, 3]` | Passed |
+| `Save_as_keeps_two_different_files_with_the_same_name_apart` (N7: now one byte each, so the sizes match) | **Failed:** `Assert.NotEqual() Failure: Strings are equal`, both `"assets/pic.png"` | Passed |
+| `Save_as_reuses_an_identical_file_already_in_the_target` (guard: identical bytes are still reused, so no `bg_1.bmp`) | Passed | Passed |
+
+### L1: undo after Save As could bring back paths the new folder lacks
+
+**Decision: clear the undo history when the save moves the theme to another folder.** A plain save to the same folder keeps the history,
+as before.
+- **Why not keep the history?** Old snapshots hold paths relative to the old folder. Keeping them valid would mean copying every file
+  that any snapshot refers to (including deleted widgets' files) and rewriting every snapshot after any renames. That is complex and
+  copies files the user removed.
+- **Why clearing is safe:** it is what many editors do on Save As, and the old theme is still on disk in its old folder.
+
+The status bar now says `Saved <path> (undo history cleared: the theme now lives in a new folder)`, and the undo/redo buttons are refreshed.
+A theme that was never saved (`BaseFolder == null`) does not count as moved: its relative paths could not be resolved before either, and its
+absolute paths still work, so its history is kept.
+
+| Test | Before | After |
+|---|---|---|
+| `After_save_as_to_another_folder_undo_cannot_bring_back_files_the_new_folder_lacks` (delete a widget, Save As to B, undo) | **Failed:** `undo brought back assets/old.png, which is not in the new folder` | Passed |
+| `Saving_to_the_same_folder_keeps_the_undo_history` (guard) | Passed | Passed |
+
+### Test nits
+
+- **N6:** `Saving_again_to_the_same_folder_copies_nothing_extra` now also reloads `theme.json` after the second save and checks the paths that were written to disk.
+  It passed before and after; it is a regression guard, not a bug.
+- **N7:** covered in the M2 table above.
+
+### Not verified
+
+- The editor itself was not run. The status-bar text and the undo buttons after Save As are untested UI code. They are a few lines in
+  `MainWindow.SaveAsync`; the decision itself is tested in Core.
+- `File.Move` replacing `theme.json` was checked against the runner's watcher code by reading it, not by running the runner.
+- M4 in the full-codebase review (atomic writes) partly overlaps: `Theme.Save` now writes through a temporary file. If another branch
+  changes `Theme.Save` for M4, expect a conflict in this method.

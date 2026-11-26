@@ -175,7 +175,7 @@ public class ThemeModelTests
         File.WriteAllBytes(Path.Combine(a, "assets", "pic.png"), new byte[] { 1 });
         var other = dir.Combine("elsewhere", "pic.png");
         Directory.CreateDirectory(Path.GetDirectoryName(other)!);
-        File.WriteAllBytes(other, new byte[] { 2, 2 });
+        File.WriteAllBytes(other, new byte[] { 2 });   // same name and same size, different content
 
         var t = new Theme { BaseFolder = a };
         t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/pic.png" });
@@ -184,7 +184,163 @@ public class ThemeModelTests
 
         Assert.NotEqual(t.Widgets[0].ImagePath, t.Widgets[1].ImagePath);
         Assert.Equal(new byte[] { 1 }, File.ReadAllBytes(t.ResolveAsset(t.Widgets[0].ImagePath)!));
-        Assert.Equal(new byte[] { 2, 2 }, File.ReadAllBytes(t.ResolveAsset(t.Widgets[1].ImagePath)!));
+        Assert.Equal(new byte[] { 2 }, File.ReadAllBytes(t.ResolveAsset(t.Widgets[1].ImagePath)!));
+    }
+
+    [Fact]
+    public void Save_as_does_not_reuse_a_different_file_of_the_same_name_and_size_in_the_target()
+    {
+        using var dir = new TempDir();
+        var a = dir.Combine("A");
+        Directory.CreateDirectory(Path.Combine(a, "assets"));
+        File.WriteAllBytes(Path.Combine(a, "assets", "bg.bmp"), new byte[] { 1, 1, 1 });
+        Directory.CreateDirectory(dir.Combine("B", "assets"));
+        File.WriteAllBytes(dir.Combine("B", "assets", "bg.bmp"), new byte[] { 2, 2, 2 });   // another theme's picture
+
+        var t = new Theme { BaseFolder = a };
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/bg.bmp" });
+        t.Save(dir.Combine("B", "theme.json"));
+
+        Assert.Equal(new byte[] { 1, 1, 1 }, File.ReadAllBytes(t.ResolveAsset(t.Widgets[0].ImagePath)!));
+        Assert.Equal(new byte[] { 2, 2, 2 }, File.ReadAllBytes(dir.Combine("B", "assets", "bg.bmp")));   // the other theme keeps its picture
+    }
+
+    [Fact]
+    public void Save_as_keeps_same_named_files_from_different_subfolders_apart()
+    {
+        using var dir = new TempDir();
+        var a = dir.Combine("A");
+        Directory.CreateDirectory(Path.Combine(a, "assets", "x"));
+        Directory.CreateDirectory(Path.Combine(a, "assets", "y"));
+        File.WriteAllBytes(Path.Combine(a, "assets", "x", "p.png"), new byte[] { 3, 3 });
+        File.WriteAllBytes(Path.Combine(a, "assets", "y", "p.png"), new byte[] { 4, 4 });
+
+        var t = new Theme { BaseFolder = a };
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/x/p.png" });
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/y/p.png" });
+        t.Save(dir.Combine("B", "theme.json"));
+
+        Assert.Equal(new byte[] { 3, 3 }, File.ReadAllBytes(t.ResolveAsset(t.Widgets[0].ImagePath)!));
+        Assert.Equal(new byte[] { 4, 4 }, File.ReadAllBytes(t.ResolveAsset(t.Widgets[1].ImagePath)!));
+    }
+
+    [Fact]
+    public void Save_as_reuses_an_identical_file_already_in_the_target()
+    {
+        using var dir = new TempDir();
+        var a = dir.Combine("A");
+        Directory.CreateDirectory(Path.Combine(a, "assets"));
+        File.WriteAllBytes(Path.Combine(a, "assets", "bg.bmp"), new byte[] { 7, 7, 7 });
+        Directory.CreateDirectory(dir.Combine("B", "assets"));
+        File.WriteAllBytes(dir.Combine("B", "assets", "bg.bmp"), new byte[] { 7, 7, 7 });
+
+        var t = new Theme { BaseFolder = a };
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/bg.bmp" });
+        t.Save(dir.Combine("B", "theme.json"));
+
+        Assert.Equal("assets/bg.bmp", t.Widgets[0].ImagePath);
+        Assert.Equal(new[] { "bg.bmp" }, FilesIn(dir.Combine("B", "assets")));
+    }
+
+    [Fact]
+    public void A_save_that_fails_while_copying_leaves_the_open_theme_and_the_target_unchanged()
+    {
+        using var dir = new TempDir();
+        var a = dir.Combine("A");
+        Directory.CreateDirectory(Path.Combine(a, "assets"));
+        File.WriteAllBytes(Path.Combine(a, "assets", "a.png"), new byte[] { 1, 2 });
+        File.WriteAllBytes(Path.Combine(a, "assets", "locked.png"), new byte[] { 5 });
+        Directory.CreateDirectory(dir.Combine("B", "assets"));
+        File.WriteAllBytes(dir.Combine("B", "assets", "a.png"), new byte[] { 9 });   // forces a new name for A's a.png
+        var target = dir.Combine("B", "theme.json");
+        File.WriteAllText(target, "previous theme");
+
+        var t = new Theme { BaseFolder = a };
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/a.png" });
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/locked.png" });
+        var before = t.ToSnapshot();
+
+        using (new FileStream(Path.Combine(a, "assets", "locked.png"), FileMode.Open, FileAccess.Read, FileShare.None))
+            Assert.ThrowsAny<IOException>(() => t.Save(target));
+
+        Assert.Equal(before, t.ToSnapshot());   // every widget path is as it was
+        Assert.Equal(a, t.BaseFolder);
+        Assert.Equal("previous theme", File.ReadAllText(target));
+        Assert.Equal(new[] { "a.png" }, FilesIn(dir.Combine("B", "assets")));   // the copies made before the failure are gone
+        Assert.Equal(new[] { "theme.json" }, FilesIn(dir.Combine("B")));
+    }
+
+    [Fact]
+    public void A_save_that_fails_while_writing_the_theme_file_leaves_the_open_theme_unchanged()
+    {
+        using var dir = new TempDir();
+        var a = dir.Combine("A");
+        Directory.CreateDirectory(Path.Combine(a, "assets"));
+        File.WriteAllBytes(Path.Combine(a, "assets", "bg.png"), new byte[] { 1, 2 });
+        Directory.CreateDirectory(dir.Combine("B"));
+        var target = dir.Combine("B", "theme.json");
+        File.WriteAllText(target, "previous theme");
+        File.SetAttributes(target, FileAttributes.ReadOnly);
+        try
+        {
+            var t = new Theme { BaseFolder = a };
+            t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/bg.png" });
+            var before = t.ToSnapshot();
+
+            Assert.ThrowsAny<Exception>(() => t.Save(target));
+
+            Assert.Equal(before, t.ToSnapshot());
+            Assert.Equal(a, t.BaseFolder);
+            Assert.Equal("previous theme", File.ReadAllText(target));
+            Assert.Empty(FilesIn(dir.Combine("B", "assets")));
+            Assert.Equal(new[] { "theme.json" }, FilesIn(dir.Combine("B")));   // no temporary file left behind
+        }
+        finally { File.SetAttributes(target, FileAttributes.Normal); }
+    }
+
+    [Fact]
+    public void After_save_as_to_another_folder_undo_cannot_bring_back_files_the_new_folder_lacks()
+    {
+        using var dir = new TempDir();
+        var a = dir.Combine("A");
+        Directory.CreateDirectory(Path.Combine(a, "assets"));
+        File.WriteAllBytes(Path.Combine(a, "assets", "bg.png"), new byte[] { 1 });
+        File.WriteAllBytes(Path.Combine(a, "assets", "old.png"), new byte[] { 2 });
+        var t = new Theme { BaseFolder = a };
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/bg.png" });
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/old.png" });
+        var undo = new Glance.Core.Editing.UndoManager(t.ToSnapshot());
+        t.Widgets.RemoveAt(1);                 // the user deletes a picture...
+        undo.Commit(t.ToSnapshot());
+
+        var moved = t.Save(dir.Combine("B", "theme.json"));   // ...then saves the theme somewhere else
+        undo.AfterSave(t.ToSnapshot(), moved);
+
+        Assert.True(moved);
+        for (var s = undo.Undo(); s is not null; s = undo.Undo())
+        {
+            var back = new Theme { BaseFolder = t.BaseFolder };
+            back.ApplySnapshot(s);
+            Assert.All(back.Pages.SelectMany(p => p.Widgets).Select(w => w.ImagePath).Where(p => p != ""),
+                p => Assert.True(File.Exists(back.ResolveAsset(p)), "undo brought back " + p + ", which is not in the new folder"));
+        }
+    }
+
+    [Fact]
+    public void Saving_to_the_same_folder_keeps_the_undo_history()
+    {
+        using var dir = new TempDir();
+        var t = new Theme { BaseFolder = dir.Path };
+        t.Widgets.Add(Widget.Create(WidgetKind.Text));
+        var undo = new Glance.Core.Editing.UndoManager(t.ToSnapshot());
+        t.Widgets.Add(Widget.Create(WidgetKind.Clock));
+        undo.Commit(t.ToSnapshot());
+
+        var moved = t.Save(dir.Combine("theme.json"));
+        undo.AfterSave(t.ToSnapshot(), moved);
+
+        Assert.False(moved);
+        Assert.True(undo.CanUndo);
     }
 
     [Fact]
@@ -209,6 +365,9 @@ public class ThemeModelTests
         Assert.Equal(new[] { "theme.json" }, FilesIn(a));
         Assert.Equal("assets/bg.png", t.Widgets[0].ImagePath);
         Assert.Equal("assets/fonts/digits.ttf", t.Widgets[1].FontFile);
+        var reloaded = Theme.Load(themeFile);   // what the second save actually wrote
+        Assert.Equal("assets/bg.png", reloaded.Widgets[0].ImagePath);
+        Assert.Equal("assets/fonts/digits.ttf", reloaded.Widgets[1].FontFile);
     }
 
     [Fact]
