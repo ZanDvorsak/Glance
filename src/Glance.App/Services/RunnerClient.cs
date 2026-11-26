@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.IO.Pipes;
 using System.Text;
-using Glance.Core.Themes;
+using Glance.Core.Control;
 
 namespace Glance.App.Services;
 
@@ -28,13 +28,12 @@ public static class RunnerClient
         catch { return null; }
     }
 
-    /// <summary>Shows the editor's current (possibly unsaved) theme on the display via the runner.</summary>
-    public static bool SendLive(string snapshotJson, string? baseFolder)
-    {
-        var folder = Convert.ToBase64String(Encoding.UTF8.GetBytes(baseFolder ?? ""));
-        var json = Convert.ToBase64String(Encoding.UTF8.GetBytes(snapshotJson));
-        return Send($"LIVE {folder} {json}", 2000) is { } r && r.StartsWith("OK");
-    }
+    /// <summary>Sends one command built with <see cref="ControlCommand"/>; returns the reply, or null if the runner could not be reached.</summary>
+    public static string? Send(ControlCommand command, int timeoutMs = 800) => Send(command.Encode(), timeoutMs);
+
+    /// <summary>Shows the editor's current (possibly unsaved) theme on the display via the runner. A null folder is fine (a new theme).</summary>
+    public static bool SendLive(string snapshotJson, string? baseFolder) =>
+        Send(ControlCommand.Live(snapshotJson, baseFolder), 2000) is { } r && r.StartsWith("OK");
 
     /// <summary>Starts the runner; Windows shows a UAC prompt because it needs administrator rights.</summary>
     public static bool Launch()

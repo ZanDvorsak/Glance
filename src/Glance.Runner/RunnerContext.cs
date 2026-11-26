@@ -4,6 +4,7 @@ using System.IO.Pipes;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
+using Glance.Core.Control;
 using Glance.Core.Display;
 using Glance.Core.Sensors;
 using Glance.Core.Settings;
@@ -215,38 +216,37 @@ internal sealed class RunnerContext : ApplicationContext
 
     private string Execute(string line)
     {
-        var parts = line.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
-        switch (parts.Length > 0 ? parts[0].ToUpperInvariant() : "")
+        // parsing and the wire format live in Glance.Core (ControlCommand) so the editor and tests share them
+        if (!ControlCommand.TryParse(line, out var cmd, out var error)) return "ERR " + error;
+        switch (cmd.Verb)
         {
-            case "STATUS":
+            case ControlVerb.Status:
             {
                 string pg;
                 lock (_gate) pg = _pusher is null ? "no display" : $"page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count}, pinned={(_pusher.PinnedPage is { } p ? (p + 1).ToString() : "no")}, autoRotate={Current.AutoRotate}, live={_live is not null}";
                 return "OK " + _statusItem.Text + " | " + pg;
             }
-            case "RELOAD": _ui.BeginInvoke(Reload); return "OK";
-            case "NEXT": lock (_gate) _pusher?.NextPage(); return "OK";
-            case "PREV": lock (_gate) _pusher?.PrevPage(); return "OK";
-            case "PAGE" when parts.Length > 1 && int.TryParse(parts[1], out var pg):   // PAGE <n> pins the display to page n (1-based); PAGE 0 releases it
-                lock (_gate) { _pinPage = pg > 0 ? pg - 1 : null; if (_pusher is not null) _pusher.PinnedPage = _pinPage; }
+            case ControlVerb.Reload: _ui.BeginInvoke(Reload); return "OK";
+            case ControlVerb.Next: lock (_gate) _pusher?.NextPage(); return "OK";
+            case ControlVerb.Prev: lock (_gate) _pusher?.PrevPage(); return "OK";
+            case ControlVerb.Page:   // PAGE <n> pins the display to page n (1-based); PAGE 0 releases it
+                lock (_gate) { _pinPage = cmd.Number > 0 ? cmd.Number - 1 : null; if (_pusher is not null) _pusher.PinnedPage = _pinPage; }
                 return "OK";
-            case "PAUSE": _ui.BeginInvoke(() => SetPaused(true)); return "OK";
-            case "RESUME": _ui.BeginInvoke(() => SetPaused(false)); return "OK";
-            case "EXIT": _ui.BeginInvoke(Quit); return "OK";
-            case "BRIGHTNESS" when parts.Length > 1 && int.TryParse(parts[1], out var b):
-                lock (_gate) { _brightness = Math.Clamp(b, 0, 7); _pusher?.SetBrightness(_brightness); }
+            case ControlVerb.Pause: _ui.BeginInvoke(() => SetPaused(true)); return "OK";
+            case ControlVerb.Resume: _ui.BeginInvoke(() => SetPaused(false)); return "OK";
+            case ControlVerb.Exit: _ui.BeginInvoke(Quit); return "OK";
+            case ControlVerb.Brightness:
+                lock (_gate) { _brightness = Math.Clamp(cmd.Number, 0, 7); _pusher?.SetBrightness(_brightness); }
                 return "OK";
-            case "LIVE" when parts.Length == 3:
+            case ControlVerb.Live:
             {
                 // LIVE <base64 folder> <base64 theme json>: show the editor's unsaved theme until LIVE_CLEAR
-                var folder = Encoding.UTF8.GetString(Convert.FromBase64String(parts[1]));
-                var json = Encoding.UTF8.GetString(Convert.FromBase64String(parts[2]));
-                var t = new Theme { BaseFolder = string.IsNullOrEmpty(folder) ? null : folder };
-                t.ApplySnapshot(json);
+                var t = new Theme { BaseFolder = cmd.Folder };
+                t.ApplySnapshot(cmd.ThemeJson!);
                 lock (_gate) _live = t;
                 return "OK";
             }
-            case "LIVE_CLEAR": lock (_gate) { _live = null; _pinPage = null; if (_pusher is not null) _pusher.PinnedPage = null; } return "OK";
+            case ControlVerb.LiveClear: lock (_gate) { _live = null; _pinPage = null; if (_pusher is not null) _pusher.PinnedPage = null; } return "OK";
             default: return "ERR unknown command";
         }
     }

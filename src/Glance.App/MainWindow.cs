@@ -1335,7 +1335,15 @@ public sealed class MainWindow : Window
         if (snap == _lastLive) return;
         _lastLive = snap;
         var folder = _theme.BaseFolder;
-        Task.Run(() => RunnerClient.SendLive(snap, folder));
+        Task.Run(() => RunnerClient.SendLive(snap, folder)).ContinueWith(t =>
+        {
+            if (t.IsCompletedSuccessfully && t.Result) return;
+            Dispatcher.UIThread.Post(() =>
+            {
+                if (_liveToRunner && _lastLive == snap)   // only for the latest edit, and only while still sending
+                    _status.Text = "The background runner did not accept your edits, so the display may still show the old theme.";
+            });
+        });
     }
 
     private void ToggleSend(bool on)
