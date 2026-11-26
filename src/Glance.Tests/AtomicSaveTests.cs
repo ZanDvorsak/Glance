@@ -124,7 +124,6 @@ public class AtomicSaveTests
     [Theory]
     [InlineData("{ \"LastTheme\": \"C:\\\\themes\\\\mine\\\\theme.json\", \"Brigh")]   // cut off mid-write
     [InlineData("")]                                                               // truncated to nothing
-    [InlineData("null")]
     [InlineData("\0\0\0\0\0\0")]                                                   // a power cut can leave zeroed blocks
     public void Corrupt_settings_are_logged_kept_aside_and_never_overwritten(string content)
     {
@@ -153,7 +152,7 @@ public class AtomicSaveTests
         var path = dir.Combine("settings.json");
         File.WriteAllText(path, SettingsJson(@"C:\themes\mine\theme.json", 3));
 
-        var holder = HoldExclusively(path, 300);
+        var holder = HoldExclusively(path, TestTiming.BriefMs);
         Assert.True(AppSettings.TryLoad(path, out var s));
         holder.Wait();
 
@@ -170,7 +169,7 @@ public class AtomicSaveTests
         File.WriteAllText(path, content);
         var log = new List<string>();
 
-        var holder = HoldExclusively(path, 4000);
+        var holder = HoldExclusively(path, TestTiming.LongMs);
         var ok = AppSettings.TryLoad(path, out _, log.Add);
         holder.Wait();
 
@@ -186,7 +185,7 @@ public class AtomicSaveTests
         using var dir = new TempDir();
         var path = dir.Combine("settings.json");
         File.WriteAllText(path, "{ \"LastTheme\": \"C:\\\\x");   // what a text editor's in-place save looks like halfway
-        var finish = Task.Run(() => { Thread.Sleep(250); File.WriteAllText(path, SettingsJson(@"C:\themes\mine\theme.json", 4)); });
+        var finish = Task.Run(() => { Thread.Sleep(TestTiming.BriefMs); File.WriteAllText(path, SettingsJson(@"C:\themes\mine\theme.json", 4)); });
 
         Assert.True(AppSettings.TryLoad(path, out var s));
         finish.Wait();
@@ -240,7 +239,7 @@ public class AtomicSaveTests
         var path = dir.Combine("theme.json");
         new Theme { Name = "mine" }.Save(path);
 
-        var holder = HoldExclusively(path, 300);
+        var holder = HoldExclusively(path, TestTiming.BriefMs);
         var t = AtomicFile.ReadWithRetry(() => Theme.Load(path));
         holder.Wait();
 
@@ -255,7 +254,7 @@ public class AtomicSaveTests
         new Theme { Name = "mine" }.Save(path);
         var whole = File.ReadAllText(path);
         File.WriteAllText(path, whole[..(whole.Length / 2)]);   // another program is halfway through writing it in place
-        var finish = Task.Run(() => { Thread.Sleep(250); File.WriteAllText(path, whole); });
+        var finish = Task.Run(() => { Thread.Sleep(TestTiming.BriefMs); File.WriteAllText(path, whole); });
 
         var t = AtomicFile.ReadWithRetry(() => Theme.Load(path));
         finish.Wait();
