@@ -205,10 +205,9 @@ public class FfmpegTrustTests
 
     // ---- the real reader, against folders every Windows PC has --------------------------------------------------
 
-    [Fact]
+    [StockSystemDriveFact]
     public void A_system_exe_is_trusted_on_this_pc()
     {
-        if (!OperatingSystem.IsWindows()) return;
         var cmd = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe");
         var v = FfmpegTrust.Check(cmd);
         Assert.True(v.Trusted, v.Reason);
@@ -264,12 +263,14 @@ public class FfmpegSetupCheckTests
     [Fact]
     public void Machine_scope_install_runs_winget_elevated_for_all_users()
     {
+        // the script itself is checked in FfmpegReviewSetupTests
         var psi = SetupChecks.WingetInstallStartInfo(SetupChecks.FfmpegId, machineScope: true);
-        Assert.Equal("winget", psi.FileName);
-        Assert.Contains("--id Gyan.FFmpeg", psi.Arguments);
-        Assert.Contains("--scope machine", psi.Arguments);
+        Assert.EndsWith(@"\powershell.exe", psi.FileName, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("-EncodedCommand", psi.Arguments);
         Assert.Equal("runas", psi.Verb);
         Assert.True(psi.UseShellExecute); // runas only works through the shell
+        Assert.Contains("--scope machine", SetupChecks.MachineInstallScript(SetupChecks.FfmpegId));
+        Assert.Throws<ArgumentException>(() => SetupChecks.MachineInstallScript("x'; Remove-Item C:\\ #"));
     }
 
     [Fact]
@@ -280,4 +281,65 @@ public class FfmpegSetupCheckTests
         Assert.False(psi.UseShellExecute);
         Assert.True(string.IsNullOrEmpty(psi.Verb));
     }
+}
+
+/// <summary>
+/// A fact that reads real permissions under the system drive. It is skipped, with the reason, on a machine whose drive
+/// root is set up unusually (for example a build image that lets ordinary users change C:\), because then "a system exe
+/// is trusted" is not expected to hold and a failure would say nothing about Glance.
+/// </summary>
+public sealed class StockSystemDriveFactAttribute : FactAttribute
+{
+    public StockSystemDriveFactAttribute()
+    {
+        if (RealAcl.SkipReason() is { } why) Skip = why;
+    }
+}
+
+internal static class RealAcl
+{
+    public static string? SkipReason()
+    {
+        if (!OperatingSystem.IsWindows()) return "Needs Windows: it reads NTFS permissions.";
+        string root = Path.GetPathRoot(Environment.GetFolderPath(Environment.SpecialFolder.System)) ?? @"C:\";
+        try { return SkipReason(FfmpegTrust.ReadFact(root, directory: true)); }
+        catch (Exception ex) { return $"Could not read the permissions of {root}: {ex.Message}"; }
+    }
+
+    /// <summary>Null when the drive root only lets administrators replace what is under it (stock Windows), else why not.</summary>
+    public static string? SkipReason(PathFact root)
+    {
+        // judge the root the way the trust rule judges a folder further up the path, under two admin-only levels
+        var admin = new List<AceFact> { new(FfmpegTrust.AdministratorsSid, true, 0x1F01FF) };
+        var probe = Path.Combine(root.Path, "glance-probe", "probe.exe");
+        var chain = new List<PathFact> { new(probe, FfmpegTrust.AdministratorsSid, admin), new(Path.GetDirectoryName(probe)!, FfmpegTrust.AdministratorsSid, admin), root };
+        var v = FfmpegTrust.Evaluate(probe, chain);
+        return v.Trusted ? null : $"The drive root {root.Path} is set up unusually ({v.Reason}), so system files are not expected to be admin-only here.";
+    }
+}
+
+public class RealAclSkipTests
+{
+    private static PathFact Root(params AceFact[] extra) => new(@"C:\", FfmpegTrust.TrustedInstallerSid, new List<AceFact>
+    {
+        new("S-1-5-11", true, 0x4),                                   // Authenticated Users: create folders (stock)
+        new("S-1-5-11", true, unchecked((int)0xE0010000), true),       // inherit-only modify (stock)
+        new(FfmpegTrust.SystemSid, true, 0x1F01FF), new(FfmpegTrust.AdministratorsSid, true, 0x1F01FF),
+        new("S-1-5-32-545", true, 0x1200A9),
+    }.Concat(extra).ToList());
+
+    [Fact]
+    public void A_stock_drive_root_runs_the_real_acl_tests() => Assert.Null(RealAcl.SkipReason(Root()));
+
+    [Fact]
+    public void A_drive_root_users_can_change_skips_them_with_a_reason()
+    {
+        var why = RealAcl.SkipReason(Root(new AceFact("S-1-5-11", true, 0x1301BF))); // Authenticated Users: Modify
+        Assert.NotNull(why);
+        Assert.Contains("unusual", why);
+    }
+
+    [Fact]
+    public void The_default_finder_follows_this_process_elevation() =>
+        Assert.Equal(Environment.IsPrivilegedProcess, Ffmpeg.Default.IsElevated);
 }

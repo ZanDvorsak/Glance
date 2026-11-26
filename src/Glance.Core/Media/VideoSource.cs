@@ -22,7 +22,7 @@ public sealed class VideoSource : IDisposable
     public bool FfmpegMissing { get; }
 
     /// <summary>When the renderer created this source (its own clock), to pace retries.</summary>
-    public long CreatedTicks { get; init; }
+    public long CreatedTicks { get; internal set; }
 
     public VideoSource(string path, int width, int height, ImageFit fit, int fps = 15)
         : this(path, width, height, fit, fps, Ffmpeg.Find, () => Ffmpeg.LastRejection) { }

@@ -69,9 +69,11 @@ public static class SetupChecks
             return new CheckResult(id, title, CheckStatus.Ok, "Found. Video backgrounds are ready, in the editor and in the background runner.");
         if (found is not null)
             return new CheckResult(id, title, CheckStatus.Warning,
-                $"Found at {found}, but that folder can be changed without administrator rights. The background runner runs as " +
-                "administrator and will not start FFmpeg from there, so video backgrounds only play while the editor is sending. " +
-                "Install FFmpeg for all users to fix this (Windows asks for permission).",
+                $"Found at {found}, but that folder can be changed without administrator rights (FFmpeg is installed for your " +
+                "user only). The background runner runs as administrator and only starts FFmpeg from a folder that only " +
+                "administrators can change, so it will not play video backgrounds until FFmpeg is installed for all users. " +
+                "Until then, videos play in the editor's preview, and on the display only while the editor drives it without " +
+                "the background runner. Click Install for all users (Windows asks for permission).",
                 "Install for all users", FixKind.WingetInstallMachine, FfmpegId);
         return new CheckResult(id, title, CheckStatus.Info,
             "Optional. Only needed for video backgrounds; images and GIFs work without it. It is installed for all users " +
@@ -80,32 +82,75 @@ public static class SetupChecks
     }
 
     /// <summary>
-    /// How to start winget for a fix. A machine-scope install starts winget elevated (Windows shows a UAC prompt), so
-    /// portable packages land under Program Files where only administrators can change them.
+    /// How to start winget for a fix. A machine-scope install runs elevated (Windows shows a UAC prompt); see
+    /// <see cref="MachineInstallScript"/> for what it does.
     /// </summary>
     public static ProcessStartInfo WingetInstallStartInfo(string packageId, bool machineScope)
     {
-        var args = $"install --id {packageId} --exact --accept-package-agreements --accept-source-agreements --disable-interactivity";
         if (!machineScope)
-            return new ProcessStartInfo("winget", args)
+            return new ProcessStartInfo("winget", $"install --id {packageId} --exact --accept-package-agreements --accept-source-agreements --disable-interactivity")
                 { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
-        // runas needs the shell, which rules out redirecting output; the exit code still comes back
-        return new ProcessStartInfo("winget", args + " --scope machine")
+        // runas needs the shell, which rules out redirecting output; the script's exit code (winget's) still comes back
+        var powershell = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe");
+        var encoded = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(MachineInstallScript(packageId)));
+        return new ProcessStartInfo(powershell, "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand " + encoded)
             { UseShellExecute = true, Verb = "runas", WindowStyle = ProcessWindowStyle.Hidden };
     }
 
-    /// <summary>What to tell the user when a machine-scope FFmpeg install did not end with a usable copy.</summary>
+    /// <summary>Exit code of the install script when winget itself could not be found.</summary>
+    public const int WingetNotFound = 9009;
+
+    /// <summary>
+    /// The elevated script behind "Install for all users". winget does not elevate itself for a machine-scope portable
+    /// install, and it extracts the zip into the user's own %TEMP%\WinGet (whose permissions give that user Full Control)
+    /// and then <i>moves</i> the folder to Program Files\WinGet\Packages, so the moved files keep the user's access and
+    /// the runner rightly refuses them. The script therefore resets that package's folders to the permissions they inherit
+    /// from Program Files and makes Administrators the owner. It runs even when winget reports an error, so clicking
+    /// again repairs an earlier install. Nothing it runs comes from the user's PATH or module folders: winget is the
+    /// packaged App Installer exe, icacls comes from System32, and modules load only from the system folder.
+    /// </summary>
+    public static string MachineInstallScript(string packageId)
+    {
+        if (packageId.Any(c => !(char.IsAsciiLetterOrDigit(c) || c is '.' or '-' or '_')))
+            throw new ArgumentException("Unexpected characters in a winget package id: " + packageId, nameof(packageId));
+        return $$"""
+            $ErrorActionPreference = 'Stop'
+            $sys = [Environment]::GetFolderPath('System')
+            $env:PSModulePath = [IO.Path]::Combine($sys, 'WindowsPowerShell\v1.0\Modules')
+            try {
+                $pkg = Get-AppxPackage -Name Microsoft.DesktopAppInstaller | Sort-Object Version -Descending | Select-Object -First 1
+                $winget = Join-Path $pkg.InstallLocation 'winget.exe'
+                if (-not (Test-Path -LiteralPath $winget)) { exit {{WingetNotFound}} }
+            } catch { exit {{WingetNotFound}} }
+            $ErrorActionPreference = 'Continue'
+            & $winget install --id {{packageId}} --exact --scope machine --accept-package-agreements --accept-source-agreements --disable-interactivity
+            $code = $LASTEXITCODE
+            $icacls = Join-Path $sys 'icacls.exe'
+            $root = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'WinGet\Packages'
+            if (Test-Path -LiteralPath $root) {
+                Get-ChildItem -LiteralPath $root -Directory -Filter '{{packageId}}_*' | ForEach-Object {
+                    & $icacls $_.FullName /reset /T /C /Q | Out-Null
+                    & $icacls $_.FullName /setowner *S-1-5-32-544 /T /C /Q | Out-Null
+                }
+            }
+            exit $code
+            """;
+    }
+
+    /// <summary>What to tell the user when the all-users FFmpeg install did not end with a copy the runner can use.</summary>
     public const string FfmpegMachineInstallHelp =
-        "If FFmpeg is already installed for your user only, winget may not add a second copy. Remove it first with " +
-        "\"winget uninstall --id Gyan.FFmpeg --scope user\", then click Install again, or run " +
-        "\"winget install --id Gyan.FFmpeg --scope machine\" in a terminal opened as administrator.";
+        "Video backgrounds will not play in the background runner until FFmpeg is installed for all users. Open Setup check " +
+        "and click Install for all users again: it also repairs the permissions of an earlier all-users install. " +
+        "The details are in runner.log.";
 
     /// <summary>The editor's status line after the FFmpeg install button finished.</summary>
     /// <param name="usableByRunner">What the elevated runner would use (<c>Ffmpeg.FindForElevated()</c>).</param>
     /// <param name="usableByEditor">What the editor itself would use (<c>Ffmpeg.Find()</c>).</param>
     public static string FfmpegInstallOutcome(string? usableByRunner, string? usableByEditor, int exitCode) =>
-        usableByEditor is not null ? "FFmpeg installed. Video backgrounds are ready."
-            : $"FFmpeg install finished with code {exitCode}. " + FfmpegMachineInstallHelp;
+        usableByRunner is not null ? "FFmpeg is installed for all users. Video backgrounds are ready, also in the background runner."
+        : exitCode == WingetNotFound ? "winget (App Installer) was not found, so FFmpeg could not be installed. " + FfmpegMachineInstallHelp
+        : usableByEditor is not null ? $"The editor can use FFmpeg, but the background runner cannot use it yet (winget code {exitCode}). " + FfmpegMachineInstallHelp
+        : $"FFmpeg install finished with code {exitCode}. " + FfmpegMachineInstallHelp;
 
     /// <summary>Win32 error code when the user says No to the UAC prompt.</summary>
     public const int UacCancelled = 1223;

@@ -61,6 +61,12 @@ public static class FfmpegTrust
         SystemSid, AdministratorsSid, TrustedInstallerSid, CreatorOwnerSid, OwnerRightsSid,
     };
 
+    /// <summary>Real owners only: CREATOR OWNER and OWNER RIGHTS are placeholders in access entries, never owners.</summary>
+    private static readonly HashSet<string> AdminOwners = new(StringComparer.OrdinalIgnoreCase)
+    {
+        SystemSid, AdministratorsSid, TrustedInstallerSid,
+    };
+
     /// <summary>
     /// The trust rule. <paramref name="chain"/> is the file followed by every folder above it, up to and including the
     /// drive root (for example <c>C:\a\ffmpeg.exe</c>, <c>C:\a</c>, <c>C:\</c>).
@@ -79,7 +85,7 @@ public static class FfmpegTrust
 
             if (fact.IsReparsePoint)
                 return new(false, $"{what} is a link or junction, which could be pointed somewhere else");
-            if (fact.OwnerSid is null || !AdminPrincipals.Contains(fact.OwnerSid))
+            if (fact.OwnerSid is null || !AdminOwners.Contains(fact.OwnerSid))
                 return new(false, $"{what} is owned by {Describe(fact.OwnerSid)}, not by an administrator");
 
             int mask = i == 0 ? FileMask : i == 1 ? ParentMask : AncestorMask;
@@ -141,7 +147,7 @@ public static class FfmpegTrust
     }
 
     [SupportedOSPlatform("windows")]
-    private static PathFact ReadFact(string path, bool directory)
+    internal static PathFact ReadFact(string path, bool directory)
     {
         const AccessControlSections sections = AccessControlSections.Owner | AccessControlSections.Access;
         FileSystemSecurity sec = directory ? new DirectoryInfo(path).GetAccessControl(sections) : new FileInfo(path).GetAccessControl(sections);

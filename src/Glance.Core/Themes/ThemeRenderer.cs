@@ -15,6 +15,9 @@ public sealed class ThemeRenderer : IDisposable
 
     /// <summary>The clock used to pace video retries (milliseconds); tests swap it.</summary>
     internal Func<long> Now { get; set; } = () => Environment.TickCount64;
+
+    /// <summary>How long a video that had no usable FFmpeg waits before it is tried again.</summary>
+    internal const long VideoRetryMs = 5000;
     private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
     private readonly Dictionary<(string, bool, bool), SKTypeface> _faces = new();
     private readonly Dictionary<string, SKTypeface?> _fileFaces = new();
@@ -355,7 +358,19 @@ public sealed class ThemeRenderer : IDisposable
     private VideoSource GetVideo(string path, int w, int h, ImageFit fit)
     {
         var key = $"{path}|{w}x{h}|{fit}";
-        if (!_videos.TryGetValue(key, out var v)) _videos[key] = v = VideoFactory(path, w, h, fit);
+        var now = Now();
+        if (_videos.TryGetValue(key, out var v) && v.FfmpegMissing && now - v.CreatedTicks >= VideoRetryMs)
+        {
+            // FFmpeg was missing (or not trusted by the elevated runner) when this source was made: try again, so a
+            // fresh install shows up without reloading the theme. Ffmpeg.Find paces its own disk search too.
+            v.Dispose();
+            _videos.Remove(key);
+        }
+        if (!_videos.TryGetValue(key, out v))
+        {
+            _videos[key] = v = VideoFactory(path, w, h, fit);
+            v.CreatedTicks = now;
+        }
         v.LastUsedTicks = Environment.TickCount64;
         return v;
     }

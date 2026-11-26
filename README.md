@@ -23,7 +23,10 @@ and keep them on the display from a small background app.
 - Windows 10/11, .NET 8 SDK
 - The display must use the **libusb-win32** driver (install it with [Zadig](https://zadig.akeo.ie/), choose `libusb-win32`)
 - [PawnIO](https://pawnio.eu/) for CPU and motherboard sensors (LibreHardwareMonitor needs it)
-- Optional: FFmpeg for video backgrounds
+- Optional: FFmpeg for video backgrounds. The background runner runs as administrator, so it only uses an FFmpeg that
+  only administrators can change: install it for all users with **Install for all users** in Setup check. A per-user
+  install (for example plain `winget install Gyan.FFmpeg`) works in the editor but not in the runner; the reason is
+  written to `runner.log`.
 
 ## Install
 

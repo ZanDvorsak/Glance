@@ -111,7 +111,11 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
 - **`AidaImporter`** reads `.axlcd` (text, one item per line, BGR colour ints) and maps AIDA item codes to sensors. Pages become pages.
 - **`ThemePackage`** reads/writes `.glance` (zip with `theme.json` + `assets/`). Import is defensive on purpose (path traversal, drive letters, size/entry caps, only `theme.json` and `assets/*`). Keep it that way.
 - **Undo/redo** is snapshot based (`Theme.ToSnapshot/ApplySnapshot`), debounced; all pages and widgets are hooked (`HookAll`).
-- **Video** is decoded by an `ffmpeg` child process (`-re` is required or it plays several times too fast); FFmpeg is optional and found automatically (PATH, winget, app folder).
+- **Video** is decoded by an `ffmpeg` child process (`-re` is required or it plays several times too fast); FFmpeg is optional and found automatically (app folder, PATH, winget machine and user folders).
+  In an elevated process (the runner) `Ffmpeg.Find` only accepts a copy that only administrators can change
+  (`FfmpegTrust`: file, folder and every folder above it, no links); rejections go to `runner.log`. The editor's
+  "Install for all users" runs winget with `--scope machine` elevated and then resets the package folder's permissions,
+  because winget moves the files there from the user's temp folder with the user's access still on them.
 
 ## Conventions and gotchas
 

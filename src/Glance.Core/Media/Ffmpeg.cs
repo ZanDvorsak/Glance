@@ -36,8 +36,9 @@ public static class Ffmpeg
     public static void Reset() => Default.Reset();
 
     internal static string RejectionMessage(string path, string reason) =>
-        $"FFmpeg at {path} is not used: {reason}. The runner runs as administrator, so it only starts FFmpeg " +
-        "from a folder that only administrators can change (install it for all users).";
+        $"FFmpeg at {path} is not used: {reason}. The runner runs as administrator, so it only starts FFmpeg from a " +
+        "folder that only administrators can change. Video backgrounds will not play on the display until FFmpeg is " +
+        "installed for all users: in the Glance editor, open Setup check and click \"Install for all users\".";
 
     /// <summary>Every place ffmpeg.exe is looked for, in order (existing or not).</summary>
     public static IEnumerable<string> Candidates()
@@ -101,26 +102,38 @@ internal sealed class FfmpegFinder
 
     public event Action<string>? Rejected;
 
+    /// <summary>Why the last search found nothing usable (elevated only), or null when it found a copy.</summary>
     public string? LastRejection { get; private set; }
+
+    /// <summary>Whether this finder applies the admin-only rule (the process is elevated).</summary>
+    public bool IsElevated => _isElevated();
 
     public string? Find()
     {
+        var toReport = new List<string>();
+        string? found;
         lock (_gate)
         {
             if (_cached is not null && _exists(_cached)) return _cached;
             if (_cached is null && DateTime.UtcNow - _checked < TimeSpan.FromSeconds(5)) return null; // don't hammer the disk
             _checked = DateTime.UtcNow;
-            LastRejection = null;
             var result = Search(_isElevated());
-            foreach (var (path, reason) in result.Rejections)
-            {
-                var message = Ffmpeg.RejectionMessage(path, reason);
-                LastRejection = message;
-                if (_reported.Add(path + "|" + reason))
-                    try { Rejected?.Invoke(message); } catch { /* logging must never break the search */ }
-            }
-            return _cached = result.Path;
+            found = _cached = result.Path;
+            LastRejection = null;
+            // Rejections only matter when nothing usable was found. Otherwise the usual "Links\ffmpeg.exe is a symlink"
+            // before the real file under Packages would tell a correctly set-up user to install FFmpeg again.
+            if (found is null)
+                foreach (var (path, reason) in result.Rejections)
+                {
+                    var message = Ffmpeg.RejectionMessage(path, reason);
+                    LastRejection ??= message;
+                    if (_reported.Add(path + "|" + reason)) toReport.Add(message);
+                }
         }
+        // raised outside the lock: a handler that waits for another thread calling Find/Reset must not deadlock
+        foreach (var message in toReport)
+            try { Rejected?.Invoke(message); } catch { /* logging must never break the search */ }
+        return found;
     }
 
     public FfmpegSearchResult Search(bool requireAdminOnly)
@@ -128,11 +141,24 @@ internal sealed class FfmpegFinder
         var rejections = new List<(string, string)>();
         foreach (var candidate in _candidates().Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            if (!_exists(candidate)) continue;
-            if (!requireAdminOnly) return new(candidate, rejections);
-            var verdict = _check(candidate);
-            if (verdict.Trusted) return new(candidate, rejections);
-            rejections.Add((candidate, verdict.Reason));
+            if (!requireAdminOnly)
+            {
+                if (_exists(candidate)) return new(candidate, rejections);
+                continue;
+            }
+            // A relative PATH entry ("tools", ".", "C:tools") resolves against the current directory at start time, so
+            // it is never used. Otherwise the full path is checked and exactly that string is returned and started.
+            if (!Path.IsPathFullyQualified(candidate))
+            {
+                if (_exists(candidate)) rejections.Add((candidate, "it comes from a relative PATH entry"));
+                continue;
+            }
+            string full;
+            try { full = Path.GetFullPath(candidate); } catch { continue; }
+            if (!_exists(full)) continue;
+            var verdict = _check(full);
+            if (verdict.Trusted) return new(full, rejections);
+            rejections.Add((full, verdict.Reason));
         }
         return new(null, rejections);
     }

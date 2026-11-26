@@ -309,3 +309,178 @@ The scenario was run on both versions with the same throwaway test:
 | Branch (`e5cd903`) | `Ffmpeg.FindForElevated()` (`Search(requireAdminOnly: true)`) | Passed: the planted file is refused. `Ffmpeg.Find()` in the non-elevated editor still returns it, so the editor's behaviour is unchanged. |
 
 **Limit:** M2 above still applies. This proof calls `FindForElevated()` directly. It does not exercise the line that chooses elevated or non-elevated mode at run time (`Environment.IsPrivilegedProcess`). A mutation of that line went unnoticed, so add a test for the switch before merging.
+
+---
+
+## Fixes after review
+
+Phase 1, written by the session that owns the branch. The findings above are unchanged. M3 (one trust engine, through
+the autostart branch's `FolderTrust`) and M4 (decoding without admin rights) are deferred by agreement, so they are not
+covered here.
+
+**Method.** Commit `2fe3a8d` only adds test seams and changes no behaviour (298/298 still passed): `FfmpegFinder` takes
+the elevation flag, candidates, file check and trust check; `ThemeRenderer` takes a video factory and clock; the editor's
+install message moved to `SetupChecks.FfmpegInstallOutcome`; `InternalsVisibleTo("Glance.Tests")`. The new tests were
+written against that commit and run once (**18 tests: 12 failed, 6 passed**). Then the fixes went in and the same tests
+were run again (**18/18 passed**). The 6 that passed before are the M2 coverage tests plus two baselines
+(`Install_outcome_is_ready_when_the_runner_can_use_the_copy`, `A_video_without_ffmpeg_is_not_retried_every_frame`); for
+M2 the proof is a mutation run instead (below). Tests are in `src/Glance.Tests/FfmpegReviewFixTests.cs` and
+`FfmpegTrustTests.cs`.
+
+**Final result:** `dotnet build src/Glance.sln -c Release` succeeded with 0 errors, and `dotnet test src/Glance.Tests -c Release`
+gave **319/319 passed, 0 skipped** on this PC (298 before plus 21 new).
+
+### M1. The "install for all users" path
+
+**What was checked, without installing anything.**
+- `winget show --id Gyan.FFmpeg`: version 9.1, `Installer Type: portable (zip)`.
+- Manifest `manifests/g/Gyan/FFmpeg/9.1/Gyan.FFmpeg.installer.yaml` in winget-pkgs: `InstallerType: zip`,
+  `NestedInstallerType: portable`, `NestedInstallerFiles` = `ffmpeg-9.1-full_build\bin\{ffmpeg,ffplay,ffprobe}.exe`
+  with aliases, no `Scope` and no `ArchiveBinariesDependOnPath`, x64 only.
+- winget-cli source (master):
+  - `Runtime.cpp`: the machine root is `%ProgramFiles%\WinGet\Packages` and the machine links folder is `%ProgramFiles%\WinGet\Links`.
+    `PortableInstaller.cpp` adds the links folder to PATH. The package folder is `<PackageId>_<SourceId>`.
+  - `InstallFlow.cpp` (`EnsureRunningAsAdminForMachineScopeInstall`): a machine-scope portable install **requires an
+    elevated winget**. It fails otherwise; it does not elevate itself. So starting it with `runas` is necessary.
+  - `DownloadFlow.cpp` / `ArchiveFlow.cpp`: the zip is downloaded and extracted under `%TEMP%\WinGet\...\extracted`.
+    `Runtime.cpp` gives that temp tree a **protected DACL: owner = the current user, Full Control for the current
+    user, SYSTEM and Administrators**.
+  - `PortableInstaller.cpp` (`InstallFile`): on the same volume the extracted folder is **moved with
+    `std::filesystem::rename`**; it is copied only across volumes. No code sets ACLs on the portable install folder.
+- Inference (code reading plus how NTFS works; not observed): a move keeps the security descriptor, so in the normal
+  case (`%TEMP%` and Program Files on C:) the installed `ffmpeg.exe` keeps **Full Control for the installing user**. The
+  trust check would reject it, correctly, because that user's non-elevated programs could replace it. The plain
+  `--scope machine` install was therefore not enough, and in fact it is itself a weak spot for any elevated consumer.
+- Already installed for the user: the code that was read never looks across scopes, so a machine install most likely
+  goes in side by side (a second folder and a second links folder). Not observed.
+
+**Fix.** "Install for all users" now starts an elevated script (`SetupChecks.MachineInstallScript`, run by
+`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe` with `runas`). The script:
+1. runs the packaged App Installer `winget.exe`, not `winget` from PATH (checked here: running it directly works for
+   `--version` and `show`);
+2. runs `winget install --id Gyan.FFmpeg --exact --scope machine ...`;
+3. whatever winget returned, runs `System32\icacls.exe <folder> /reset /T` and `/setowner *S-1-5-32-544 /T` on each
+   `%ProgramFiles%\WinGet\Packages\Gyan.FFmpeg_*` folder. The files then inherit Program Files' permissions and are owned
+   by Administrators. Clicking again repairs an earlier all-users install;
+4. returns winget's exit code.
+
+The script limits module loading to the system folder before it runs any cmdlet, and the package id is checked against
+`[A-Za-z0-9._-]`. Clarity for per-user installs:
+- The setup row says "installed for your user only", that the runner will not play video until FFmpeg is installed for
+  all users, and where video still plays.
+- The runner's log line says that video will not play on the display until FFmpeg is installed for all users, and how
+  to do that.
+
+| Test | Before (`2fe3a8d`) | After |
+|---|---|---|
+| `All_users_install_resets_the_package_folder_to_admin_only_permissions` | **Failed**: `Assert.Equal() Failure: Strings differ` / `Expected: "C:\\WINDOWS\\system32\\WindowsPowerShell\\v1."···` / `Actual: "winget"` | Passed |
+| same test, extra assertion "no cmdlet before the module path is reset" (found while checking the script; the first draft used `Join-Path` there) | **Failed** with that line put back: `a cmdlet runs before PSModulePath is reset` | Passed |
+
+The script was also parsed with PowerShell's parser (0 errors). **It was not run.**
+
+**Conclusion and open question.** By code reading, a plain machine-scope install would be rejected, and the
+install-plus-reset path should produce a copy the runner accepts: it has the same ACL shape as `C:\Program Files\dotnet`,
+which the trust check accepts on this PC. **Only a real install can confirm this.** That means one click on "Install for all
+users" (UAC), then the setup row should turn green and `FindForElevated()` should return
+`C:\Program Files\WinGet\Packages\Gyan.FFmpeg_...\bin\ffmpeg.exe`. The user decides whether to do it. Until then, on this
+PC (per-user install only) video backgrounds do not play in the runner.
+
+### M2. The switch that turns the check on is now tested
+
+`Ffmpeg.Find()` is `FfmpegFinder.Find()`, and its line `Search(_isElevated())` is what the tests drive (`FfmpegLookupTests`):
+`Elevated_lookup_skips_a_user_writable_copy_and_uses_the_admin_only_one`,
+`Elevated_lookup_finds_nothing_when_no_copy_is_admin_only_and_reports_each`,
+`Normal_lookup_returns_the_first_copy_without_reading_permissions`, `Winget_package_folders_are_searched_for_ffmpeg`;
+and `RealAclSkipTests.The_default_finder_follows_this_process_elevation`.
+
+| Mutation | Result |
+|---|---|
+| `Search(_isElevated())` → `Search(false)` (the reviewer's case) | **8 tests fail**, e.g. `Elevated_lookup_skips_a_user_writable_copy_and_uses_the_admin_only_one` |
+| `if (!requireAdminOnly)` → `if (true)` (always return the first existing copy) | **8 tests fail** |
+| real finder's flag `() => Environment.IsPrivilegedProcess` → `() => true` | **1 test fails** (`The_default_finder_follows_this_process_elevation`) |
+| real finder's flag → `() => false` | **not caught**: the tests run without elevation, so `false` is the right answer there. Only an elevated test run could tell. |
+| No mutation | 319/319 |
+
+### L1. No "not used" line when a usable copy is found
+
+The finder collects rejections and reports them only when the search finds nothing. `LastRejection` is cleared when a
+copy is found.
+
+| Test | Before | After |
+|---|---|---|
+| `A_rejected_Links_symlink_before_a_usable_copy_logs_nothing_and_leaves_no_rejection` | **Failed**: `Assert.Empty() Failure: Collection was not empty` | Passed |
+
+### L2. Setup warning wording
+
+The warning now reads: "...Until then, videos play in the editor's preview, and on the display only while the editor
+drives it without the background runner."
+
+| Test | Before | After |
+|---|---|---|
+| `User_folder_warning_says_video_plays_in_the_preview_and_only_without_the_runner` | **Failed**: `Assert.DoesNotContain() Failure: Sub-string found` ("while the editor is sending") | Passed |
+
+### L3. Install result based on what the runner can use
+
+`MainWindow` now calls `Ffmpeg.FindForElevated()` off the UI thread and passes it to `SetupChecks.FfmpegInstallOutcome`.
+That says "ready" only when the runner can use the copy, and otherwise explains what to do (also when winget is not found).
+
+| Test | Before | After |
+|---|---|---|
+| `Install_outcome_is_not_ready_when_only_a_user_writable_copy_exists` | **Failed**: `Assert.DoesNotContain() Failure: Sub-string found` ("FFmpeg installed. Video backgrounds are ready.") | Passed |
+| `Install_outcome_is_ready_when_the_runner_can_use_the_copy` (baseline) | Passed | Passed |
+
+### L4. A video without FFmpeg is tried again
+
+`ThemeRenderer.GetVideo` throws away and recreates a `VideoSource` that had no usable FFmpeg (`FfmpegMissing`) once it is
+5 s old (`VideoRetryMs`). `Ffmpeg.Find` also paces its own disk search to once every 5 s.
+
+| Test | Before | After |
+|---|---|---|
+| `A_video_without_ffmpeg_is_tried_again_after_a_few_seconds` | **Failed**: `Assert.Equal() Failure: Values differ` / `Expected: 2` / `Actual: 1` | Passed |
+| `A_video_without_ffmpeg_is_not_retried_every_frame` (baseline) | Passed | Passed |
+
+### L5. The path that is checked is the path that is started
+
+When elevated, candidates that are not fully qualified are refused ("it comes from a relative PATH entry"). The others
+are normalised with `Path.GetFullPath`, and that exact string is checked and returned.
+
+| Test | Before | After |
+|---|---|---|
+| `Elevated_lookup_never_returns_a_relative_PATH_entry` (`tools\ffmpeg.exe`, `.\ffmpeg.exe`, `C:tools\ffmpeg.exe`) | **Failed** ×3: `Assert.Null() Failure: Value is not null` / `Actual: "tools\\ffmpeg.exe"` (and the other two) | Passed |
+| `Elevated_lookup_returns_the_same_full_path_it_checked` | **Failed**: `Expected: "C:\\Program Files\\WinGet\\ffmpeg.exe"` / `Actual: "C:\\Program Files\\x\\..\\WinGet\\ffmpeg.exe"` | Passed |
+
+### L6. Real-ACL tests on unusual machines
+
+`A_system_exe_is_trusted_on_this_pc` is now a `[StockSystemDriveFact]`. It is skipped, with the reason, when the system
+drive's root lets non-admins replace what is under it (the root is judged by the same rule as any folder further up the
+path). The temp-folder test stays a normal fact: a user's temp folder fails the rule on any machine.
+
+| Test | Result |
+|---|---|
+| `A_stock_drive_root_runs_the_real_acl_tests` | Passed: the stock C:\ ACL gives no skip reason |
+| `A_drive_root_users_can_change_skips_them_with_a_reason` | Passed: Authenticated Users with Modify gives a reason containing "unusual" |
+| On this PC | not skipped (0 skipped in the full run) |
+
+There is no "before" here: this is a robustness change, not a behaviour bug. Without it, a CI image with a writable
+C:\ would make the test fail for reasons unrelated to Glance.
+
+### L7. Docs
+
+`AGENTS.md`, `README.md` (requirements), `docs/TUTORIAL.md` (setup check table) and `docs/WALKTHROUGH.md` 4.14 now say
+that the runner only uses an FFmpeg that only administrators can change, and how to install one. The rejection reason
+goes to `runner.log`. `docs/walkthroughs/ffmpeg-elevation.md` was left alone; it describes the first commit.
+
+### Nits
+
+| Finding | Test | Before | After |
+|---|---|---|---|
+| N2: CREATOR OWNER / OWNER RIGHTS as owner | `Placeholder_principals_are_not_accepted_as_owners` (`S-1-3-0`, `S-1-3-4`) | **Failed** ×2: `Assert.False() Failure` / `Expected: False` / `Actual: True` | Passed (separate owner set: SYSTEM, Administrators, TrustedInstaller) |
+| N5: `Rejected` raised under the lock | `Rejected_handlers_run_outside_the_lookup_lock` | **Failed** after a 2 s wait: `Reset() on another thread was blocked while Rejected was being raised` | Passed (events are raised after the lock is released) |
+
+N1, N3 and N4 were not in scope for this phase and are unchanged.
+
+### Still open
+- **M1** needs one real "Install for all users" click to confirm. The user decides.
+- **M3** (one trust engine) is phase 2, after the autostart branch lands. **M4** (ffmpeg without admin rights) is a later follow-up.
+- The real finder's elevation flag can only be fully mutation-tested by an elevated test run (see M2).
+- Not tested here: anything with the physical display, the runner process, UAC, and the PowerShell script running.
