@@ -104,7 +104,9 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
   the service once it answers (`DisplayPusher.ViaService`).
 - **Sensors:** LibreHardwareMonitor (needs admin + the PawnIO driver for CPU/motherboard data) runs in the service. The sensor pipe is
   created first and serves `[]` until it is ready. `SensorHub` (Core) in the tray and the editor prefers the service's feed and falls back
-  to basic local sensors; the feed counts as gone after 5 s without data. Drive-space sensors come from `DriveSensors`.
+  to basic local sensors; the feed counts as gone when its snapshot is 5 s old, even while the pipe stays connected (each line
+  is `{"Seq","AgeMs","Sensors"}`; NaN/Infinity are sent as no value; one failing device never stops the others; see
+  `docs/design/fix-sensor-feed.md`). Drive-space sensors come from `DriveSensors`.
 - **Tray control pipe commands** (one line each, reply `OK ...`): `STATUS`, `RELOAD`, `PAUSE`, `RESUME`, `EXIT`, `NEXT`, `PREV`, `PAGE <n>`
   (0 releases), `BRIGHTNESS <0-7>`, `LIVE <base64 folder> <base64 theme json>` (show the editor's unsaved theme; `-` for no folder),
   `LIVE_CLEAR`. Build and parse them only with `Glance.Core.Control.ControlCommand` (shared by both sides and tested).

@@ -97,14 +97,20 @@ public sealed class SensorHub : ISensorSource, IDisposable
         }
     }
 
-    /// <summary>Cancels the loops and waits for them (bounded); the local loop closes its sensors on its way out.</summary>
+    /// <summary>
+    /// How long <see cref="Dispose"/> waits for the loops. Short: the editor and the tray app dispose the hub on their UI threads
+    /// (review M7), and safety does not depend on it (the loop closes its own sensors); it only lets the close happen before exit.
+    /// </summary>
+    public static readonly TimeSpan DisposeWait = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>Cancels the loops and waits for them (briefly); the local loop closes its sensors on its way out.</summary>
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _cts.Cancel();
         _pipe.Dispose();
         bool ended = false;
-        try { ended = Task.WaitAll(new[] { _localLoop, _mergeLoop }, SensorService.DisposeWait); } catch { /* best effort */ }
+        try { ended = Task.WaitAll(new[] { _localLoop, _mergeLoop }, DisposeWait); } catch { /* best effort */ }
         // still inside an update or an open: mark it closed without waiting; the update closes it when it ends,
         // and the loop's finally closes sensors that are still being opened
         if (!ended) _local?.Dispose(TimeSpan.Zero);

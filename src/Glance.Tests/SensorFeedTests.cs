@@ -271,6 +271,21 @@ public class SensorFeedTests
         Assert.Contains("repeated", log[1]);
     }
 
+    [Fact]
+    public async Task M8_a_sensor_loop_whose_updates_fail_publishes_nothing_new()
+    {
+        int calls = 0;
+        var hw = Device("cpu", ("/cpu", 1f));
+        var service = new SensorService(() => Interlocked.Increment(ref calls) == 1 ? new[] { hw } : throw new InvalidOperationException("hardware list changed"));
+        using var source = new LocalSensorSource(service, NoDrives);
+        int updated = 0;
+        source.Updated += () => Interlocked.Increment(ref updated);
+
+        Assert.True(await Eventually(() => Volatile.Read(ref calls) >= 3, 5000), "the loop stopped trying");
+        Assert.Equal(0, updated);   // nothing new is published, so the pipe's clients see the snapshot age
+        Assert.Contains(source.HardwareSnapshot, s => s.Id == "/cpu");
+    }
+
     // ---- shutdown order: cancel, wait for the loop, then close ----------------------------------------------------------
 
     /// <summary>A device whose second and later updates block until <c>release</c> is set; closing records whether an update was running.</summary>
@@ -282,6 +297,28 @@ public class SensorFeedTests
         bool during = false; int closes = 0;
         void Close() { if (hw.Inside) during = true; Interlocked.Increment(ref closes); }
         return (hw, release, () => during, () => closes, Close);
+    }
+
+    [Fact]
+    public async Task Nit_the_sensor_service_itself_never_closes_during_an_update()
+    {
+        var (hw, release, closedDuringUpdate, closes, close) = Blocking();
+        hw.OnUpdate = () => release.Wait(10000);
+        var service = new SensorService(() => new[] { hw }, close);
+        var update = Task.Run(service.Update);
+        Assert.True(await Eventually(() => hw.Inside, 4000), "the update never started");
+
+        Assert.False(service.Dispose(TimeSpan.FromMilliseconds(200)));   // busy: not closed now...
+        Assert.Equal(0, closes());
+        release.Set();
+        await update.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, closes());                                       // ...but by the update, as it ended
+        Assert.False(closedDuringUpdate());
+
+        service.Update();   // after Dispose: nothing is read any more
+        Assert.Equal(1, hw.Updates);
+        Assert.True(service.Dispose(TimeSpan.Zero));
+        Assert.Equal(1, closes());
     }
 
     [Fact]
