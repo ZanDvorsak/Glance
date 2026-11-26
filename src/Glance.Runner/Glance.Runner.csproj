@@ -8,6 +8,8 @@
     <Nullable>enable</Nullable>
     <PlatformTarget>x64</PlatformTarget>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Runs elevated with the user's environment: ignore DOTNET_STARTUP_HOOKS (written into runtimeconfig.json, which sits in the admin-only folder). -->
+    <StartupHookSupport>false</StartupHookSupport>
     <ApplicationIcon>..\..\assets\glance.ico</ApplicationIcon>
   </PropertyGroup>
 

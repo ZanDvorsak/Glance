@@ -376,3 +376,290 @@ Steps marked **(UAC)** need the user at the screen. Run on the real PC, or bette
 5. Run the same steps from an extracted zip in Downloads, and confirm the box is refused with a clear message.
 
 Also see finding **H1** above. It is older than this change, but it means H6 should not be called fully closed until it is addressed.
+
+---
+
+## Fixes after review
+
+Written by the session that made the change, after the review. The findings above are unchanged.
+
+### Method
+
+The bug-proving rule was followed for every finding:
+1. **Prove the bug.** The tests were written first, in `src/Glance.Tests/AutostartReviewFixTests.cs`, one group per finding.
+   - Some tests needed an entry point that did not exist yet, for example `AutostartTask.Assess` or `FolderTrust.Evaluate`. For
+     those, a shim with **today's behaviour** was added first. Examples: `Evaluate` just called the old `Decide`, `Assess` said
+     "Ok" for any existing task, and `ClassifyRemoveError` kept the old `COMException`-only rule.
+   - The tests were then run against the branch.
+   - **Result: 35 of the 54 new tests failed.** Full log kept outside the repo.
+2. **Fix.** The shims were replaced by the real rules.
+3. **Prove the fix.** The same tests pass, and the whole suite is green: **369 / 369** (315 before, 54 new).
+   - `dotnet build src/Glance.sln -c Release -p:SkipHost=true` succeeded with 0 errors and no warnings in the changed files.
+
+For H1, a real-process reproduction was used as well (below).
+
+The 19 tests that passed before the fix are coverage for the test gaps, not bugs:
+- the real-reader tests, the SDDL reader tests, the command-line round trip, the window rule and the Task Scheduler format fixture;
+- the guards that must keep holding: an incomplete-chain guard, the "L3 exception is narrow" test, and the M1 "this install is
+  fine" case.
+
+One test was adjusted between the runs. The L2 test called the shim `RemoveStartInfo(runnerExe)` before the fix and
+`RemoveStartInfo()` after it, because the fixed method takes no runner path at all.
+
+### H1. The user's environment reaches the elevated runner
+
+**Reproduction before the fix (real process, not elevated).**
+- I built a harmless startup hook. It writes one marker file.
+- I ran the branch's runner as `dotnet Glance.Runner.dll --install-autostart` with `DOTNET_STARTUP_HOOKS` pointing at the hook.
+  Without `--user`, `ParseArgs` returns "invalid" and `Main` exits with 10 before the mutex, the tray or the display. The
+  manifest's UAC prompt does not apply under `dotnet.exe`, so nothing ran elevated.
+- Result: `exit=10`, and the marker file said `startup hook ran in C:\Program Files\dotnet\dotnet.exe`. **The hook ran inside the
+  runner process.**
+
+**Fix 1: startup hooks off.**
+- `<StartupHookSupport>false</StartupHookSupport>` is now set in `Glance.Runner.csproj` and `Glance.SensorHost.csproj`. The
+  built `Glance.Runner.runtimeconfig.json` now contains `"System.StartupHookProvider.IsSupported": false`.
+- Same command after the fix: `exit=10`, **no marker file**, and no crash.
+- Test: `H1_elevated_programs_turn_startup_hooks_off` (both projects).
+  - Before: `Assert.Contains() Failure: Filter not matched in collection`.
+  - After: passes.
+
+**Fix 2: warning at start-up.**
+- `RunnerEnvironment.FindRiskyVariables` reports `CORECLR_*`, `COR_ENABLE_PROFILING`, `COR_PROFILER*`, `COMPlus_*` and
+  `DOTNET_*`. It leaves out the SDK-only `DOTNET_CLI_*`, `DOTNET_NOLOGO` and similar.
+- `Program.Main` writes the warning to `runner.log` before anything else, in every mode.
+- Proof: the same run with `COMPlus_GlanceProbe=1` set added this line to `%AppData%\Glance\runner.log`:
+  `WARNING: these environment variables can make .NET load code into this elevated process before it starts: COMPlus_GlanceProbe, DOTNET_STARTUP_HOOKS. ...`
+  (This test run wrote two lines to the real log.)
+- The Background service window shows the same warning when auto-start is on.
+- Test: `H1_profiler_startup_hook_and_diagnostics_variables_are_reported`.
+  - Before: `Item not found in collection ... Not found: "CORECLR_ENABLE_PROFILING"`.
+  - After: passes.
+
+**Investigation: profiler and diagnostics variables.** Everything ran without elevation, using small console probes built in a
+scratch folder.
+
+| Question | Result |
+|---|---|
+| Can I show a profiler DLL being loaded? | No native compiler is installed on this PC, so I could not build a real profiler. With copies of `version.dll` and `msxml6.dll` as the "profiler", the runtime unloads the DLL after it fails to start, and nothing shows in the event log. So this is not directly observable here. The documented behaviour stands: the runtime reads `CORECLR_ENABLE_PROFILING` and `CORECLR_PROFILER_PATH` from the environment and loads that DLL before `Main`. |
+| Does a **self-contained** app or the apphost ignore runtime environment variables? | **No.** As an observable sibling of the profiler route, I set `DOTNET_DiagnosticPorts=<pipe>,nosuspend` for a self-contained .NET 8.0.34 probe. The probe **connected to a pipe I owned** and sent `ADVR_V1`, the diagnostics handshake. Over that channel a client can attach a profiler (`AttachProfiler`), so it leads to the same code execution. Self-contained only ignores `DOTNET_ROOT`. |
+| Can `runtimeconfig.json` (admin-only folder) switch diagnostics off despite the environment? | **No.** I tried `EnableDiagnostics`, `System.Runtime.EnableDiagnostics` and `EnableDiagnostics_IPC` set to 0 in `configProperties`. The probe still connected in all three cases, with or without `DOTNET_EnableDiagnostics=1` in the environment. The knob only works as an environment variable (`DOTNET_EnableDiagnostics=0` did stop the connection), and the attacker controls the environment. |
+| A clean-environment launch through the task? | Task Scheduler cannot set the environment of an `Exec` action. A launcher would have to be native: a .NET launcher has the same problem. `cmd.exe /d /c "set X= & ... & runner.exe"` is possible but I did not use it: (1) a console window would flash at every sign-in; (2) it can only clear a fixed list of names, while any `DOTNET_`/`COMPlus_` knob can be abused (for example an EventPipe output path, which makes the elevated process write a file where the user chooses); (3) clearing by prefix needs `for /f`, which starts a child `cmd` that runs the user's `HKCU\...\Command Processor\AutoRun` elevated. VBScript launchers are being removed from Windows. |
+| Running as a LocalSystem service? | It works by design: a service gets its environment from the service control manager, not from `HKCU`. But it is a redesign (session 0 cannot show a tray icon, and the pipes' access rules change). It was not done in this change and cannot be tested here without installing a service. |
+
+**H1 conclusion.**
+- Closed now: startup hooks (proven) and visibility of the rest (warning in `runner.log` and in the window).
+- **Still open:** `CORECLR_ENABLE_PROFILING`/`CORECLR_PROFILER_PATH`, `DOTNET_DiagnosticPorts` and other `DOTNET_`/`COMPlus_`
+  knobs set in `HKCU\Environment` still reach the elevated runner at the next sign-in. The runner cannot block them.
+- So **H6 is fixed for file swaps and writable folders, but not for the environment route.**
+- **Recommendation:** do the review's step 3 as its own change. Move sensors and USB into a Windows service running as
+  LocalSystem, and make the tray app non-elevated. That removes the user's environment, the scheduled task and the UAC prompt in
+  one go.
+  - A smaller alternative: the task runs as SYSTEM, and a SYSTEM launcher starts the runner in the user's session with a
+    sanitised environment block. It needs a lot of P/Invoke (`WTSQueryUserToken`, `CreateProcessAsUser`) and cannot be tested
+    without creating tasks, so I did not attempt it here.
+
+### M1. Existing tasks are now checked
+
+- **What changed:**
+  - `AutostartTask.Assess(exists, taskXml, currentExe, trustOfExe)` judges an existing task. A task that is not a plain runner
+    start is `NotGlance`, one whose command is untrusted is `Untrusted`, one for a different trusted copy is `OtherCopy`, and
+    the rest are `Ok`.
+  - When the window opens, `ServiceWindow` reads the task off the UI thread (`schtasks /Query /XML ONE`, both pipes drained)
+    and shows the message. It offers a button: "Point auto-start at this copy" from a trusted copy, otherwise "Turn auto-start
+    off".
+  - The button is not offered when the task points at another, trusted copy and this copy is untrusted.
+- **Tests:**
+  - `M1_a_task_pointing_at_a_writable_copy_is_flagged`. Before: `Expected: Untrusted, Actual: Ok`. After: passes.
+  - `M1_a_task_pointing_at_another_trusted_copy_is_flagged`. Before: `Expected: OtherCopy, Actual: Ok`. After: passes.
+  - `M1_a_task_that_is_not_a_plain_runner_start_is_flagged`. Before: `Expected: NotGlance, Actual: Ok`. After: passes.
+  - `M1_this_install_in_Task_Scheduler_format_is_fine_and_no_task_is_not_installed` is a guard. It passes before and after.
+- **Real PC (read-only):** the existing task from version 0.1.1 is judged **`Ok`** against `C:\Program Files\Glance`. From a zip
+  copy it is judged `OtherCopy`.
+
+### M2. A standard user is refused instead of getting a task that never starts
+
+- **What changed:**
+  - **Editor (before any prompt):** `AutostartTask.UserCanAutostart(TokenElevation, inAdministratorsRole)` reads the editor's
+    own `TokenElevationType`. `Limited` or `Full` means an admin. `Default` falls back to Administrators membership, which
+    covers UAC being turned off.
+  - **Runner (backstop):** `AutostartTask.CheckInstallUser(requestedSid, sessionSid, elevatedSid, requestedIsAdmin)`. When the
+    account that approved the prompt is not the signed-in user, that user must be in local Administrators
+    (`NetUserGetLocalGroups` with `LG_INCLUDE_INDIRECT`, loaded from System32). "Unknown" counts as no.
+  - New exit code `20 UserNotAdmin`, with the message "Auto-start needs your Windows account to be an administrator ...".
+- **Tests:**
+  - `M2_a_standard_user_elevated_by_another_admin_is_refused`. Before: `Expected: 20, Actual: 0`. After: passes.
+  - `M2_only_an_administrator_can_use_autostart`. Before: `Assert.False() Failure, Actual: True`. After: passes.
+- **Read-only check on this PC:** the same `NetUserGetLocalGroups` call returns `[Administrators]` for the user. The editor's
+  token type is `3` (Limited).
+- **Not tested:** the real flow for a standard user (a UAC prompt with an admin password).
+
+### M3. One trust engine
+
+`Glance.Core.Security.FolderTrust` now has all of FfmpegTrust's rules, as listed in the "Final FolderTrust API" section below.
+`ObjectSecurity` was renamed to `PathSecurity`, because it clashed with `System.Security.AccessControl.ObjectSecurity` (CS0104 in
+any file that imports both). There is still only one `TrustVerdict`, in `Glance.Core.Security`.
+
+| Test | Before | After |
+|---|---|---|
+| `M3_links_and_junctions_anywhere_are_refused` (exe, its folder, `C:\Program Files`) | 3 × `Assert.False() Failure, Actual: True` | pass |
+| `M3_a_link_inside_the_program_folder_is_refused` | `Actual: True` | pass |
+| `M3_a_network_or_removable_drive_is_refused` | `Actual: True` | pass |
+| `M3_network_relative_and_dot_dot_paths_are_refused` (UNC, relative, `\\?\`, `..`, `C:x`) | 5 × `Actual: True` | pass |
+| `M3_an_incomplete_chain_is_refused` (no root, no middle folder, no file, facts for another file) | `Actual: True` | pass |
+| `M3_a_folder_target_needs_its_own_facts_and_every_ancestor` | `Actual: True` | pass |
+| `Reader_marks_a_junction_as_a_link` (a real `mklink /J` junction, read-only otherwise) | `Assert.True() Failure, Actual: False` | pass |
+| `Reader_trusts_a_system_exe_on_this_pc` (`System32\cmd.exe`, `ExecutableOnly`) | `NT AUTHORITY\LOCAL SERVICE can add or change files in C:\WINDOWS\system32\AppLocker.` (the old code scanned all of System32) | pass |
+
+Measured on this PC, read-only:
+
+| Check | Result | Time |
+|---|---|---|
+| `CheckExecutable("C:\Program Files\Glance\Glance.Runner.exe")` | trusted | 62 ms |
+| `CheckExecutable(cmd.exe, ExecutableOnly)` | trusted | 0 ms |
+| `CheckExecutable(cmd.exe, FolderFiles)` | trusted | 0.9 s |
+| `CheckFolder("C:\Program Files\dotnet")` | trusted | 1.2 s |
+| `D:\` and `E:\` checked as program folders themselves | refused, correctly | |
+| `F:\` (removable) | refused | |
+| `G:\` (owned by the user) | refused | |
+
+### L1. "Not found" counts as removed
+
+- **What changed:** `AutostartTask.ClassifyRemoveError(Exception)` looks at the HRESULT only (`0x80070002` or `0x80070003`).
+  The runner's `--remove-autostart` uses it.
+- **Tests:**
+  - `L1_task_not_found_counts_as_removed`. Before: `Expected: 0, Actual: 16`. After: passes.
+  - `L1_what_Task_Scheduler_really_throws_for_a_missing_task_counts_as_removed`. This test asks the real Task Scheduler for a
+    task that does not exist (read-only). Before: `Expected: 0, Actual: 16`. After: passes.
+
+### L2. Turning auto-start off never elevates the runner
+
+- **What changed:**
+  - `Autostart.Remove()` now runs `AutostartTask.RemoveStartInfo()`: `%SystemRoot%\System32\schtasks.exe` with the fixed
+    arguments `/Delete /TN "Glance Runner" /F`, through `runas`.
+  - Success is judged by querying afterwards, so a task that was already gone counts as success (this covers L1 in the editor).
+  - The runner's `--remove-autostart` stays for scripts and a future uninstaller.
+- **Test:** `L2_removal_runs_schtasks_with_a_fixed_command_line`.
+  - Before (old behaviour in the shim): `Expected: "C:\WINDOWS\system32\schtasks.exe", Actual: "C:\Users\Ana\Downloads\Glance\Glance.Runn..."`.
+  - After: passes.
+
+### L3. Data drive roots
+
+- **Decision:** DELETE on a drive root cannot delete or rename the root. Replacing `D:\Program Files` needs DELETE on that
+  folder itself or delete-children (`FILE_DELETE_CHILD`) on `D:\`. Windows' default Modify ACE does not include
+  delete-children.
+- **So the rule is:** only the `Delete` bit is ignored, and only when the ancestor is a drive root. Delete-children,
+  change-permissions and take-ownership on the root still refuse. `D:\Program Files` holding Modify for Authenticated Users
+  still refuses.
+- **Tests:**
+  - `L3_a_locked_down_folder_on_a_data_drive_is_trusted`, using the `icacls D:\` ACL from the review.
+    - Before: `S-1-5-11 can move or replace folders in D:\.`
+    - After: passes.
+  - `L3_the_root_exception_is_only_for_delete_on_the_root_itself` is a guard. It passes before and after. Mutation-checked
+    both ways: removing the exception, or widening it to delete-children, each makes a test fail.
+- **Not checked on a real drive:** a locked-down folder on `D:\`. That needs an administrator to create it.
+
+### L5. A fuller read-back
+
+- **What changed:**
+  - `AutostartTask.VerifyRegistered(xml, exe, expectedUserSid, toSid)` now also checks:
+    - the working folder;
+    - exactly one enabled `LogonTrigger`, with a user, and no other trigger;
+    - exactly one principal, with `InteractiveToken` and `HighestAvailable`;
+    - that the principal and trigger users resolve to the requested SID.
+  - Task Scheduler stores the principal as a SID and the trigger's user as a name. Both are compared as SIDs.
+- **Tests:**
+  - `L5_a_changed_working_folder_principal_or_trigger_is_rejected` (7 cases: working folder, principal SID, trigger user,
+    `LogonType`, `RunLevel`, an extra `TimeTrigger`, an extra `BootTrigger`). Before: 7 × `Assert.NotNull() Failure: Value is null`.
+    After: pass.
+  - `L5_the_Task_Scheduler_format_is_accepted` uses a fixture copied from `schtasks /Query /XML ONE` on this PC, with the
+    account anonymised. It passes before and after; it pins the format.
+
+### Nits
+
+| Nit | Fix | Test (before → after) |
+|---|---|---|
+| N1 `wtsapi32` search path | `[DefaultDllImportSearchPaths(System32)]` on every new P/Invoke (`wtsapi32`, `netapi32`, `kernel32`, `advapi32`) | not unit-testable |
+| N2 distinct codes and logging | `12 InvalidUser` (bad shape), `18 UserLookupFailed`, `19 NotSessionUser`, `20 UserNotAdmin`, each with its own message. Install and remove modes write their outcome, plus exception type and HRESULT, to `runner.log` | `N2_each_user_problem_has_its_own_exit_code_and_message`: `3 out of 4 items ... "The runner exited with code 18."` → pass |
+| N3 `--user --install-autostart` | `--user` refuses a value that starts with `--` | `N3_a_switch_is_not_taken_as_the_user_name`: `Expected: Invalid, Actual: Install` → pass |
+| N4 old runner found in dev setups | not changed (dev only) | none |
+| N5 disposal | `WindowsIdentity` (editor and runner) and `Process.GetCurrentProcess()` are disposed | none |
+| N6 `AGENTS.md` | the runner modes, exit codes, `FolderTrust` as the only engine, and the H1 state are documented | none |
+
+### Test gaps closed
+
+| Gap | Test |
+|---|---|
+| 1. Positive case of the real reader | `Reader_trusts_an_admin_only_folder_on_this_pc` (`Program Files\dotnet\host`) and `Reader_trusts_a_system_exe_on_this_pc`. Both are skipped with a reason when the path is missing or the OS is not Windows. `Reader_turns_a_security_descriptor_into_the_right_facts` (5 SDDL cases through the now public `FromDescriptor`) and `Reader_marks_a_junction_as_a_link` also cover the reader. **The review's mutation check 2 is now caught:** skipping all ancestors fails 2 tests. |
+| 2. `AutostartInstaller` | Its decisions moved to Core: `CheckInstallUser`, `ClassifyRemoveError`, `VerifyRegistered`. They are tested above, including the real Task Scheduler exception. |
+| 3. Real command-line splitting | `Install_arguments_survive_Windows_argument_splitting` uses `CommandLineToArgvW` with spaces, `&`, `'`, `%`, `@`, `Ž`/`Č`, a bare name and `AzureAD\`. Passes. |
+| 4. Task Scheduler's read-back format | the `RealFormat` fixture in the L5 and M1 tests |
+| 6. The window rule | `AutostartTask.CheckboxEnabled`, with 6 cases in `Window_rule_for_the_checkbox` |
+
+### Mutation check after the fixes
+
+I made 15 single-line breaks, one at a time. **Every one made at least one test fail**, and the code was restored each time
+(`cmp` against a backup):
+- the link rule;
+- the drive rule;
+- the `..` rule;
+- chain completeness;
+- the reader skipping all ancestors;
+- the reader never reporting links;
+- the L3 exception widened, and removed;
+- L1 back to the `COMException`-only rule;
+- the M2 admin check;
+- the L5 working-folder check, and the principal check;
+- M1 ignoring trust;
+- N3;
+- H1 no longer reporting `CORECLR_`.
+
+### Not done here
+
+- **L4 (one task name for every user)** and **L6 (`schtasks` every second on the UI thread)** were not part of this request.
+  The new checks run in `Task.Run`, but `Sync()` still calls `IsInstalled()` every second.
+- **Needs the user at the screen (UAC):**
+  - turning auto-start on from the installed copy (the read-back now checks everything);
+  - turning it off (now through `schtasks`);
+  - the M1 repair button;
+  - a standard account (M2).
+
+### Final `FolderTrust` API (for the H3 branch)
+
+Namespace `Glance.Core.Security`:
+- **Types:**
+  - `enum TrustRole { Folder, File, Ancestor }`
+  - `enum TrustScope { ExecutableOnly, FolderFiles, FolderTree }`
+  - `record AclEntry(string Sid, bool Allow, int Rights, bool InheritOnly = false, string? Name = null)`
+  - `record PathSecurity(string Path, TrustRole Role, string? OwnerSid, IReadOnlyList<AclEntry>? Entries, string? OwnerName = null, bool IsLink = false)`
+  - `record TrustVerdict(bool Trusted, string? Reason, string? PrincipalSid = null)`, with `TrustVerdict.Yes` and `TrustVerdict.No(reason, sid)`
+- **Reading the file system (Windows):**
+  - `FolderTrust.CheckExecutable(string exe, TrustScope scope = TrustScope.FolderTree)`
+  - `FolderTrust.CheckFolder(string folder)`
+  - `FolderTrust.ReadObject(string path, TrustRole role)`
+  - `FolderTrust.FromDescriptor(string path, TrustRole role, RawSecurityDescriptor sd, bool isLink = false)`
+- **Pure:**
+  - `FolderTrust.Evaluate(string target, bool targetIsFile, bool onFixedDrive, IEnumerable<PathSecurity> objects)`
+  - `FolderTrust.Decide(IEnumerable<PathSecurity>)`
+  - `FolderTrust.PathProblem(string?)`
+  - `FolderTrust.IsDriveRoot(string)`
+  - `FolderTrust.DangerousRights(TrustRole)` and `DangerousRights(PathSecurity)`
+  - `FolderTrust.IsTrustedSid(string?)`
+  - SID constants: `LocalSystem`, `Administrators`, `TrustedInstaller`, `CreatorOwner`, `OwnerRights`
+  - access-mask constants: `WriteData`, `AppendData`, `WriteExtendedAttributes`, `DeleteChild`, `Delete`, `WriteDac`, `WriteOwner`, `GenericAll`, `GenericWrite`
+
+**Porting FfmpegTrust:**
+- `FfmpegTrust.Evaluate(exe, chain)` becomes `FolderTrust.Evaluate(exe, targetIsFile: true, onFixedDrive, facts)`, with the
+  facts mapped like this:
+  - `chain[0]` → `TrustRole.File`
+  - `chain[1]` → `TrustRole.Folder`
+  - the rest → `TrustRole.Ancestor`
+  - `IsReparsePoint` → `IsLink`
+- `FfmpegTrust.Check(path)` becomes `FolderTrust.CheckExecutable(path, TrustScope.FolderFiles)`. That is the recommended scope
+  for ffmpeg: it also catches a writable DLL next to a "shared" build. It takes 0.9 s on System32 and much less in a normal
+  folder. `ExecutableOnly` gives exactly FfmpegTrust's old coverage.
+- **Behaviour differences to expect in the ported tests:**
+  - FolderTrust also refuses unknown ACE types and a NULL DACL.
+  - On a drive root, FolderTrust ignores `Delete` (L3).
+  - The `Reason` texts differ: "is a link or junction" and "owns ..., so it can change its permissions", where FfmpegTrust
+    said "link or junction" and "owned".

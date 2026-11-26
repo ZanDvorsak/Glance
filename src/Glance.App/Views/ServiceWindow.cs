@@ -4,6 +4,8 @@ using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Threading;
 using Glance.App.Services;
+using Glance.Core.Security;
+using Glance.Core.Setup;
 
 namespace Glance.App.Views;
 
@@ -17,7 +19,9 @@ public sealed class ServiceWindow : Window
     private readonly CheckBox _auto = new() { Content = "Start automatically when I sign in to Windows" };
     private readonly Ellipse_ _dot = new();
     private bool _busy, _syncing;
-    private Glance.Core.Security.TrustVerdict? _trust; // null until the folder check has finished
+    private TrustVerdict? _trust; // null until the folder check has finished
+    private readonly Button _fix = new() { IsVisible = false };
+    private bool _fixInstall;
 
     private sealed class Ellipse_ : Border
     {
@@ -46,11 +50,12 @@ public sealed class ServiceWindow : Window
         };
 
         _startStop.Click += async (_, _) => await ToggleRunning();
+        _fix.Click += async (_, _) => await FixAutostart();
         _auto.IsCheckedChanged += async (_, _) => { if (!_syncing) await ToggleAutostart(); };
         var close = new Button { Content = "Close", HorizontalAlignment = HorizontalAlignment.Right };
         close.Click += (_, _) => Close();
 
-        var stack = new StackPanel { Spacing = 14, Margin = new Thickness(22), Children = { header, _detail, info, _startStop, new Border { Height = 1, Background = new SolidColorBrush(Color.Parse("#232A37")) }, _auto, autoNote, _message, close } };
+        var stack = new StackPanel { Spacing = 14, Margin = new Thickness(22), Children = { header, _detail, info, _startStop, new Border { Height = 1, Background = new SolidColorBrush(Color.Parse("#232A37")) }, _auto, autoNote, _message, _fix, close } };
         Content = stack;
 
         var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
@@ -58,23 +63,50 @@ public sealed class ServiceWindow : Window
         timer.Start();
         Closed += (_, _) => timer.Stop();
         Sync();
-        _ = CheckFolderTrust();
+        _ = CheckAutostart();
     }
 
     /// <summary>
-    /// Auto-start runs the runner as administrator at every sign-in, so it is only offered when the runner's folder can
-    /// only be changed by administrators (an installed copy, not a zip under Downloads or a dev build).
+    /// Checks, off the UI thread, whether this copy may use auto-start (its folder must be admin-only) and what an existing
+    /// task points at (M1). Shows any problem with a button that fixes it.
     /// </summary>
-    private async Task CheckFolderTrust()
+    private async Task CheckAutostart()
     {
         if (SensorHub.FindRunnerExe() is not { } exe) return;
-        var verdict = await Task.Run(() => Autostart.CheckRunnerFolder(exe));
+        var (verdict, status) = await Task.Run(() => (Autostart.CheckRunner(exe), Autostart.Status(exe)));
         _trust = verdict;
-        if (!verdict.Trusted)
-            Say(Autostart.IsInstalled()
-                ? Autostart.UntrustedMessage(verdict) + " Auto-start is still turned on from before; turning it off is recommended."
-                : Autostart.UntrustedMessage(verdict));
+        _fix.IsVisible = false;
+
+        if (status.State is not (AutostartState.Ok or AutostartState.NotInstalled))
+        {
+            // An existing task that is unsafe, foreign or for another copy: repair it from a trusted copy, else turn it off.
+            // A task for another, trusted copy is fine to leave alone when this copy could not replace it anyway.
+            Say(status.Message!);
+            _fixInstall = verdict.Trusted;
+            _fix.Content = verdict.Trusted ? "Point auto-start at this copy" : "Turn auto-start off";
+            _fix.IsVisible = verdict.Trusted || status.State != AutostartState.OtherCopy;
+        }
+        else if (!verdict.Trusted)
+            Say(Autostart.UntrustedMessage(verdict) + (status.State == AutostartState.Ok ? " Auto-start is still turned on from before; turning it off is recommended." : ""));
+
+        // H1: variables that make .NET load code into the elevated runner. The runner logs them too.
+        if (status.State != AutostartState.NotInstalled && RunnerEnvironment.Warning(Environment.GetEnvironmentVariables()) is { } env)
+            Say((_message.IsVisible ? _message.Text + "\n\n" : "") + env);
         Sync();
+    }
+
+    private async Task FixAutostart()
+    {
+        if (SensorHub.FindRunnerExe() is not { } exe) return;
+        _busy = true; _message.IsVisible = false; _fix.IsVisible = false;
+        try
+        {
+            var install = _fixInstall;
+            var err = await Task.Run(() => install ? Autostart.Install(exe) : Autostart.Remove());
+            if (err is not null) Say(err);
+        }
+        finally { _busy = false; Sync(); }
+        if (!_message.IsVisible) await CheckAutostart();
     }
 
     private void Sync()
@@ -89,8 +121,9 @@ public sealed class ServiceWindow : Window
         _syncing = true;
         bool installed = Autostart.IsInstalled();
         try { _auto.IsChecked = installed; } finally { _syncing = false; }
-        // An untrusted folder can still turn auto-start off, but not on.
-        _auto.IsEnabled = !_busy && SensorHub.FindRunnerExe() is not null && (installed || _trust?.Trusted != false);
+        // An untrusted copy can still turn auto-start off, but not on.
+        _auto.IsEnabled = AutostartTask.CheckboxEnabled(SensorHub.FindRunnerExe() is not null, _busy, installed, _trust?.Trusted);
+        _fix.IsEnabled = !_busy;
     }
 
     private async Task ToggleRunning()
@@ -112,10 +145,11 @@ public sealed class ServiceWindow : Window
         try
         {
             var exe = SensorHub.FindRunnerExe();
-            var err = exe is null ? "Runner not found." : await Task.Run(() => want ? Autostart.Install(exe) : Autostart.Remove(exe));
+            var err = exe is null ? "Runner not found." : await Task.Run(() => want ? Autostart.Install(exe) : Autostart.Remove());
             if (err is not null) Say(err);
         }
         finally { _busy = false; Sync(); }
+        if (!_message.IsVisible) await CheckAutostart();
     }
 
     private void Say(string text) { _message.Text = text; _message.IsVisible = true; }

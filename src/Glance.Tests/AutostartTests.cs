@@ -189,10 +189,10 @@ public class FolderTrustTests
         Allow(FolderTrust.CreatorOwner, unchecked((int)0x10000000), inheritOnly: true),
     };
 
-    private static ObjectSecurity Obj(TrustRole role, IReadOnlyList<AclEntry>? entries, string owner = FolderTrust.Administrators, string path = @"C:\Program Files\Glance") =>
+    private static PathSecurity Obj(TrustRole role, IReadOnlyList<AclEntry>? entries, string owner = FolderTrust.Administrators, string path = @"C:\Program Files\Glance") =>
         new(path, role, owner, entries);
 
-    private static TrustVerdict Decide(params ObjectSecurity[] objects) => FolderTrust.Decide(objects);
+    private static TrustVerdict Decide(params PathSecurity[] objects) => FolderTrust.Decide(objects);
 
     [Fact]
     public void An_installed_folder_under_Program_Files_is_trusted()
@@ -320,13 +320,13 @@ public class FolderTrustTests
     }
 
     [Fact]
-    public void Nothing_to_check_is_not_trusted() => Assert.False(FolderTrust.Decide(Array.Empty<ObjectSecurity>()).Trusted);
+    public void Nothing_to_check_is_not_trusted() => Assert.False(FolderTrust.Decide(Array.Empty<PathSecurity>()).Trusted);
 
     [Fact]
     public void A_missing_folder_is_not_trusted()
     {
         if (!OperatingSystem.IsWindows()) return;
-        var v = FolderTrust.Check(Path.Combine(Path.GetTempPath(), "glance-missing-" + Guid.NewGuid().ToString("N")));
+        var v = FolderTrust.CheckFolder(Path.Combine(Path.GetTempPath(), "glance-missing-" + Guid.NewGuid().ToString("N")));
         Assert.False(v.Trusted);
     }
 
@@ -338,7 +338,7 @@ public class FolderTrustTests
         try
         {
             File.WriteAllText(Path.Combine(dir, "Glance.Runner.exe"), "x");
-            var v = FolderTrust.Check(dir);
+            var v = FolderTrust.CheckFolder(dir);
             Assert.False(v.Trusted); // owned by (and writable for) the current user
             Assert.NotNull(v.Reason);
         }
