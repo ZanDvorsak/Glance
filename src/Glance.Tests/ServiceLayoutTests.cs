@@ -20,6 +20,21 @@ public class ServiceLayoutTests
 
     private static string Read(string relative) => File.ReadAllText(Path.Combine(Root, relative));
 
+    private static bool IsBuildOutput(string path) =>
+        path.Contains(Path.DirectorySeparatorChar + "bin" + Path.DirectorySeparatorChar) || path.Contains(Path.DirectorySeparatorChar + "obj" + Path.DirectorySeparatorChar);
+
+    /// <summary>
+    /// The project's own files in a folder (project file, sources, manifest), ignoring build output. A checkout that once built a
+    /// removed project keeps its untracked, git-ignored bin\ and obj\ folders, so "the folder exists" says nothing about the project.
+    /// </summary>
+    private static List<string> ProjectFiles(string folder) =>
+        !Directory.Exists(folder) ? new List<string>()
+        : Directory.EnumerateFiles(folder, "*", SearchOption.AllDirectories)
+            .Where(f => !IsBuildOutput(f))
+            .Where(f => f.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)
+                     || f.EndsWith(".manifest", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
     [Fact]
     public void No_Glance_program_asks_for_administrator_rights()
     {
@@ -40,7 +55,7 @@ public class ServiceLayoutTests
     {
         var sln = Read(Path.Combine("src", "Glance.sln"));
         Assert.DoesNotContain("Glance.SensorHost", sln);
-        Assert.False(Directory.Exists(Path.Combine(Root, "src", "Glance.SensorHost")));
+        Assert.Empty(ProjectFiles(Path.Combine(Root, "src", "Glance.SensorHost")));
         Assert.Contains("Glance.Service", sln);
         Assert.False(File.Exists(Path.Combine(Root, "src", "Glance.Runner", "AutostartInstaller.cs")));
         Assert.DoesNotContain("AutostartTask", Read(Path.Combine("src", "Glance.Runner", "Program.cs")));

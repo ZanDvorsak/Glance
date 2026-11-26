@@ -881,6 +881,25 @@ Each new rule was broken on purpose and the service test classes (154 tests at t
 
 After the new test and the new case: 608 / 608.
 
+### Fragile layout test (found in a trial merge into `main`)
+
+`ServiceLayoutTests.The_elevated_helpers_are_gone_and_the_service_is_built` asserted that the folder `src/Glance.SensorHost` does
+not exist. A checkout that ever built the old project keeps that folder with its untracked, git-ignored `bin/` and `obj/` output
+(the user's own `main` checkout has it), so the test failed there although git tracks no file in it.
+
+| Step | Result |
+|---|---|
+| Before: an untracked `src/Glance.SensorHost/bin/Release/Glance.SensorHost.dll` created in this worktree (`git status` shows nothing) | `Assert.False() Failure` |
+| After: the test checks for the project's own files (`*.csproj`, `*.cs`, `*.manifest`) outside `bin/` and `obj/` | passes with the same folder present |
+| Guard: a `Glance.SensorHost.csproj` added next to it | fails, as it should |
+| Clean-up | the folder was removed again; full suite **608 / 608** |
+
+The test's other on-disk checks were reviewed for the same problem:
+- `AutostartInstaller.cs` must not exist. That is a source file, which a build never recreates, so the check is fine.
+- `No_Glance_program_asks_for_administrator_rights` already skips `bin/` and `obj/`.
+
+The fix does not ask git (`git ls-files`), because CI and source zips are not guaranteed to be a git checkout.
+
 ### Not done here
 
 - **Nothing was installed, started, stopped or registered.** The installer was compiled (`ISCC`, placeholder package, "Successful
