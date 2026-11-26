@@ -18,4 +18,9 @@
     <PackageReference Include="SkiaSharp" Version="4.157.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- lets the tests drive DisplayPusher with a fake display -->
+    <InternalsVisibleTo Include="Glance.Tests" />
+  </ItemGroup>
+
 </Project>

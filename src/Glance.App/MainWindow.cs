@@ -81,7 +81,8 @@ public sealed class MainWindow : Window
     private WriteableBitmap? _wb;
     private SKBitmap? _bmp;
     private SKCanvas? _canvas;
-    private DisplayPusher? _pusher;
+    private readonly PusherSlot _display;          // the editor's own display, when no runner owns it
+    private DisplayPusher? _pusher => _display.Current;
     private bool _installingFfmpeg;
 
     // drag / resize state
@@ -121,6 +122,7 @@ public sealed class MainWindow : Window
         Title = "Glance";
         try { Icon = new WindowIcon(AssetLoader.Open(new Uri("avares://Glance.App/Assets/glance.ico"))); } catch { /* cosmetic */ }
         Width = 1440; Height = 880; MinWidth = 1280; MinHeight = 680;
+        _display = new PusherSlot(_power, OpenPusher);
         _theme = LoadInitialTheme();
         _undo = new UndoManager(_theme.ToSnapshot());
         HookTheme();
@@ -156,7 +158,17 @@ public sealed class MainWindow : Window
             try { await MaybeShowSetupOnFirstRunAsync(); } catch { /* never block startup */ }
         };
 
-        Closing += (_, _) => { StopLive(); _pusher?.Dispose(); _renderer.Dispose(); _hub.Dispose(); _settings.Save(); };
+        Closing += (_, _) =>
+        {
+            StopLive();
+            _power.Handle(PowerEvent.Quit);   // nothing may reopen the display from here on
+            // Avalonia also closes the window this way when Windows shuts down (WM_QUERYENDSESSION), so this is usually where the
+            // session-end blank happens. It runs off the UI thread so the window closes at once; Program.Main waits for it (bounded).
+            if (_display.Current is not null) PendingExitBlank = Task.Run(() => _display.Release(blank: true, DisplayPusher.QuickStopTimeout));
+            if (OperatingSystem.IsWindows()) _powerWatcher?.Dispose();
+            _renderer.Dispose(); _hub.Dispose(); _settings.Save();
+        };
+        StartPowerWatcher();   // blank the display at shutdown, sign-out and sleep while the editor drives it
     }
 
     // ---- layout -------------------------------------------------------------------------------------------------
@@ -422,7 +434,7 @@ public sealed class MainWindow : Window
 
     private void ApplyPins()
     {
-        if (_pusher is not null) _pusher.PinnedPage = DesiredPin;
+        if (_pusher is { } pusher) pusher.PinnedPage = DesiredPin;   // read once: a Windows sleep event can clear it from another thread
         if (_liveToRunner) { var n = (DesiredPin ?? -1) + 1; Task.Run(() => RunnerClient.Send(ControlCommand.Page(n))); }   // PAGE 0 releases the pin
     }
 
@@ -1245,11 +1257,13 @@ public sealed class MainWindow : Window
         _ffmpegBtn.IsEnabled = !_installingFfmpeg;
         _ffmpegBtn.Content = _installingFfmpeg ? "Installing FFmpeg..." : "Install FFmpeg for video";
 
+        if (_pusher is { IsAlive: false }) RestartDeadPusher();
         if (_pusher is { } p)
         {
-            _displayDot.Fill = p.LastError is null ? Brush("#34D399") : Brush("#FF6B6B");
-            _displayText.Text = p.LastError is { } err ? "Display error" : $"Display {p.Fps:0.0} fps";
+            _displayDot.Fill = p.LastError is not null ? Brush("#FF6B6B") : p.LastRenderError is not null ? Brush("#FF9F43") : Brush("#34D399");
+            _displayText.Text = p.LastError is not null ? "Display error" : p.LastRenderError is not null ? "Theme error" : $"Display {p.Fps:0.0} fps";
             if (p.LastError is { } e2) _status.Text = "Display error: " + e2;
+            else if (p.LastRenderError is { } re) _status.Text = "Could not draw the theme: " + re;   // USB is fine; reopening would not help
         }
         else if (_liveToRunner)
         {
@@ -1313,13 +1327,16 @@ public sealed class MainWindow : Window
     {
         bool runner = RunnerClient.IsRunning;
         StopLive();
-        _pusher?.Dispose();               // blanks the screen as it closes
-        _pusher = null;
+        _display.Release(blank: true, DisplayPusher.StopTimeout);   // blanks the screen as it closes
         _send.IsChecked = false;
         if (runner)
         {
             Task.Run(() => RunnerClient.Send(ControlCommand.Pause));   // the runner blanks it and stops drawing
             _status.Text = "Display off (the background runner is paused). Click Send to display to turn it back on.";
+        }
+        else if (_display.StillClosing() is { } busy)
+        {
+            _status.Text = busy;          // the old loop blanks and closes it when its stuck transfer gives up
         }
         else
         {
@@ -1346,21 +1363,113 @@ public sealed class MainWindow : Window
         });
     }
 
+    /// <summary>
+    /// The pusher's loop ended without being stopped (it should not, but it must never freeze the display silently): reopen it,
+    /// through the same power and "still closing" checks as any other open. While Windows sleeps it stays closed and the wake-up
+    /// path reopens it; after a session end it stays closed.
+    /// </summary>
+    private void RestartDeadPusher()
+    {
+        switch (_display.RestartIfDead(out var why, out var error))
+        {
+            case PusherSlot.RestartResult.Reopened:
+                _status.Text = "The display stopped (" + why + "); reopened it.";
+                break;
+            case PusherSlot.RestartResult.NotNow:
+                if (_display.Power.Suspended) _resumeAfterSleep = true;
+                break;
+            case PusherSlot.RestartResult.Failed:
+                _send.IsChecked = false;   // runs ToggleSend(false), which sets its own status; ours goes after it
+                _status.Text = "The display stopped (" + why + ") and could not be reopened: " + error;
+                break;
+        }
+    }
+
+    private DisplayPusher OpenPusher() => new(() => _theme, _hub, _settings.Brightness) { PinnedPage = DesiredPin };
+
+    /// <summary>Opens the display; on failure unticks Send to display and says why.</summary>
+    private bool StartSending()
+    {
+        if (_display.TryOpen(out var error)) { _status.Text = "Sending to the display..."; return true; }
+        bool deviceProblem = _display.PowerReason is null && _display.StillClosing() is null;
+        _send.IsChecked = false;   // runs ToggleSend(false), which sets its own status; ours goes after it
+        _status.Text = error + (deviceProblem ? "  (No display? Use Virtual display to preview and demo your theme on screen.)" : "");
+        return false;
+    }
+
     private void ToggleSend(bool on)
     {
-        _pusher?.Dispose(); _pusher = null;
+        _display.Release(blank: true, DisplayPusher.StopTimeout);
         StopLive();
         if (!on) { _status.Text = "Stopped sending."; return; }
         if (RunnerClient.IsRunning) { StartLive(); return; }
-        try
-        {
-            _pusher = new DisplayPusher(() => _theme, _hub, _settings.Brightness) { PinnedPage = DesiredPin };
-            _status.Text = "Sending to the display...";
-        }
+        StartSending();
+    }
+
+    // ---- shutdown, sign-out, sleep and wake while the editor itself drives the display ------------------------------
+
+    private readonly DisplayPowerPolicy _power = new();
+    private SessionPowerWatcher? _powerWatcher;
+    private volatile bool _resumeAfterSleep;
+
+    /// <summary>The blank started while the window closed. <see cref="Program"/> waits for it (bounded) before the process exits.</summary>
+    internal static Task? PendingExitBlank { get; private set; }
+
+    internal static void WaitForExitBlank()
+    {
+        try { PendingExitBlank?.Wait(PowerBlank.SessionEndBudget); } catch { /* best effort */ }
+    }
+
+    private void StartPowerWatcher()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        try { _powerWatcher = new SessionPowerWatcher(OnPowerEvent, log: m => Trace.WriteLine("Glance power: " + m)); }
         catch (Exception ex)
         {
-            _status.Text = ex.Message + "  (No display? Use Virtual display to preview and demo your theme on screen.)";
-            _send.IsChecked = false;
+            Trace.WriteLine("Glance power watcher failed: " + ex);
+            _status.Text = "Could not watch for shutdown and sleep, so the display will not be turned off then: " + ex.Message;
         }
+    }
+
+    /// <summary>
+    /// Runs on a watcher thread while Windows waits for the answer, so the blank happens here and never needs the UI thread.
+    /// It is bounded (<see cref="PusherSlot.BlankForPowerEvent"/>). For sleep this is the only path; for a shutdown Avalonia
+    /// usually closes the window first (see <c>Closing</c>), and this is the backup, for example when an installer closes the app.
+    /// </summary>
+    private void OnPowerEvent(PowerEvent e)
+    {
+        var action = _power.Handle(e);   // the policy has its own lock: from now on the slot refuses to open
+        if (action is PowerAction.BlankAndStop or PowerAction.BlankAndHold)
+        {
+            var result = _display.BlankForPowerEvent(e, out bool hadOne);
+            Trace.WriteLine($"Glance power: {e} -> {action}, blank {result}");
+            if (action == PowerAction.BlankAndHold)
+            {
+                _resumeAfterSleep = hadOne;
+                if (hadOne) Dispatcher.UIThread.Post(() => _status.Text = "Display off while Windows sleeps.");
+            }
+        }
+        if (e == PowerEvent.SessionEnding)
+            Dispatcher.UIThread.Post(() => { try { Close(); } catch { /* already closing */ } }); // an installer asked the app to close
+        else if (action == PowerAction.Reopen && _resumeAfterSleep)
+        {
+            _resumeAfterSleep = false;
+            Dispatcher.UIThread.Post(ResumeSendingAfterSleep);
+        }
+    }
+
+    /// <summary>After wake, reopen the display if the editor was sending to it. USB can take a while to come back (hibernate, hubs).</summary>
+    private async void ResumeSendingAfterSleep()
+    {
+        string? error = null;
+        _status.Text = "Waiting for the display after wake...";
+        foreach (var delay in ResumeRetry.Delays())
+        {
+            await Task.Delay(delay);
+            if (_send.IsChecked != true || _pusher is not null || _liveToRunner || !_power.MayDrive) return; // the user (or Windows) moved on
+            if (_display.TryOpen(out error)) { _status.Text = "Sending to the display..."; return; }
+        }
+        _send.IsChecked = false;   // runs ToggleSend(false), which sets its own status; ours goes after it
+        _status.Text = "Could not reopen the display after waking up: " + error;
     }
 }

@@ -9,6 +9,7 @@ using Glance.Core.Display;
 using Glance.Core.Sensors;
 using Glance.Core.Settings;
 using Glance.Core.Themes;
+using Glance.Core.Usb;
 
 namespace Glance.Runner;
 
@@ -31,11 +32,17 @@ internal sealed class RunnerContext : ApplicationContext
     private readonly System.Windows.Forms.Timer _supervisor = new() { Interval = 2000 };
     private readonly System.Windows.Forms.Timer _reloadDebounce = new() { Interval = 700 };
     private readonly List<FileSystemWatcher> _watchers = new();
+    private readonly DisplayPowerPolicy _power = new();
+    private SessionPowerWatcher? _powerWatcher;
+    private bool _quitting;
+    private volatile bool _blankOwed;     // a power event found the display busy; blank it when the UI thread lets go
 
     private AppSettings _settings = AppSettings.Load();
     private Theme _theme = Theme.CreateDefault(null);
     private Theme? _live;                 // unsaved theme streamed from the editor
     private DisplayPusher? _pusher;
+    private DisplayPusher? _closingPusher;  // stopped, but a stuck transfer still holds the device
+    private string? _loggedRenderError;     // each distinct theme error is logged once, not every frame
     private DateTime? _failingSince;
     private string? _lastError;
     private bool _paused;
@@ -66,7 +73,7 @@ internal sealed class RunnerContext : ApplicationContext
         menu.Items.Add(_pauseItem);
         menu.Items.Add("Next page", null, (_, _) => { lock (_gate) _pusher?.NextPage(); });
         menu.Items.Add("Previous page", null, (_, _) => { lock (_gate) _pusher?.PrevPage(); });
-        menu.Items.Add("Reload theme", null, (_, _) => Reload());
+        menu.Items.Add("Reload theme", null, (_, _) => { ClearStaleSleep(); Reload(); });
         menu.Items.Add("Open editor", null, (_, _) => OpenEditor());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => Quit());
@@ -80,6 +87,8 @@ internal sealed class RunnerContext : ApplicationContext
 
         WatchFiles();
         _ = Task.Run(ControlLoop);
+        _powerWatcher = StartPowerWatcher();
+        _supervisor.Tick += (_, _) => HealStuckSleep();
     }
 
     // ---- theme / settings ---------------------------------------------------------------------------------------
@@ -144,30 +153,134 @@ internal sealed class RunnerContext : ApplicationContext
     {
         lock (_gate)
         {
+            // checked before the dead-loop restart below: a dead pusher is never replaced while asleep or after a session end (M2)
+            if (!_power.MayDrive) { PayOwedBlank(); DisposePusher(blank: true, DisplayPusher.QuickStopTimeout); SetStatus(_power.Ended ? "Display off: Windows is ending the session" : "Display off while Windows sleeps"); return; }
             if (_paused) { DisposePusher(); SetStatus("Display paused"); return; }
             if (_pusher is null)
             {
-                try { _pusher = new DisplayPusher(() => Current, _sensors, _brightness) { PinnedPage = _pinPage }; _failingSince = null; _lastError = null; Log("Display opened"); }
-                catch (Exception ex) { _lastError = ex.Message; }
+                if (_closingPusher is { IsClosed: false })
+                    _lastError = "the display is finishing its last transfer";   // still claimed; opening now would fail with "busy"
+                else
+                {
+                    _closingPusher = null;
+                    try { _pusher = new DisplayPusher(() => Current, _sensors, _brightness) { PinnedPage = _pinPage }; _failingSince = null; _lastError = null; Log("Display opened"); }
+                    catch (Exception ex) { _lastError = ex.Message; }
+                    // Windows may have started a shutdown or sleep while it opened (the power event does not wait behind this lock)
+                    if (_pusher is not null && !_power.MayDrive)
+                    {
+                        Log("Windows is ending the session or sleeping; closing the display just opened");
+                        _blankOwed = false;
+                        DisposePusher(blank: true, DisplayPusher.QuickStopTimeout);
+                    }
+                }
             }
-            else if (_pusher.LastError is not null)
+            else
             {
-                _failingSince ??= DateTime.UtcNow;
-                if (DateTime.UtcNow - _failingSince > TimeSpan.FromSeconds(6)) { Log("Display kept failing; reopening: " + _pusher.LastError); DisposePusher(blank: false); }
+                // reopen only for USB trouble or a dead loop; a theme that fails to draw is shown and logged once instead
+                bool alive = _pusher.IsAlive;
+                if (DisplayPusher.ShouldReopen(alive, _pusher.LastError, ref _failingSince, DateTime.UtcNow, TimeSpan.FromSeconds(6)))
+                {
+                    _lastError = _pusher.LastError ?? (_pusher.Faulted ? "the display loop failed" : "the display loop stopped");
+                    Log((alive ? "Display kept failing; reopening: " : "Display loop stopped; reopening: ") + _lastError);
+                    DisposePusher(blank: false);
+                }
+                else if (_pusher.LastRenderError is { } renderError && renderError != _loggedRenderError)
+                {
+                    Log("Could not draw the theme: " + renderError);
+                    _loggedRenderError = renderError;
+                }
             }
-            else _failingSince = null;
 
             SetStatus(_pusher is null
                 ? "Waiting for the display: " + (_lastError ?? "not found")
+                : _pusher.LastRenderError is { } drawError ? "Could not draw the theme: " + drawError
                 : _live is not null ? $"Live preview from the editor, {_pusher.Fps:0.0} fps" : $"Showing \"{_theme.Name}\"{(Current.Pages.Count > 1 ? $" (page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count})" : "")}, {_pusher.Fps:0.0} fps");
         }
     }
 
     /// <param name="blank">Turn the screen black as it closes. Not wanted when it is reopened immediately (reload, error recovery).</param>
-    private void DisposePusher(bool blank = true) { _pusher?.Stop(blank); _pusher = null; _failingSince = null; }
+    /// <param name="timeout">How long to wait for the loop; the default is <see cref="DisplayPusher.StopTimeout"/>.</param>
+    private void DisposePusher(bool blank = true, TimeSpan? timeout = null)
+    {
+        if (_pusher is { } p && !p.Stop(blank, timeout ?? DisplayPusher.StopTimeout)) RememberClosing(p);
+        _pusher = null; _failingSince = null;
+    }
+
+    /// <summary>A transfer is still stuck; the loop closes the display when it gives up. Supervise waits for that before reopening.</summary>
+    private void RememberClosing(DisplayPusher p)
+    {
+        _closingPusher = p;
+        Log("The display did not stop in time; it will close when its last transfer gives up");
+    }
+
+    // ---- shutdown, sign-out, sleep and wake ---------------------------------------------------------------------
+
+    private SessionPowerWatcher? StartPowerWatcher()
+    {
+        try { return new SessionPowerWatcher(OnPowerEvent, "Turning off the Glance display", Log); }
+        catch (Exception ex) { Log("Could not watch for shutdown and sleep: " + ex.Message); return null; }
+    }
+
+    /// <summary>
+    /// Runs on a watcher thread while Windows waits for the answer: at a session end the process is killed soon after, so the
+    /// display is blanked here, not later on the UI thread. It never waits on the UI thread (BeginInvoke only), and the blank is
+    /// bounded: if the UI thread holds <see cref="_gate"/> for long (opening or reloading the display), it gives up and leaves
+    /// the blank to the UI thread, which sees the policy and pays the owed blank when it lets go.
+    /// </summary>
+    private void OnPowerEvent(PowerEvent e)
+    {
+        var action = _power.Handle(e);       // the policy has its own lock: from now on Supervise will not open the display
+        Log($"Windows {e}: {action}");      // before blanking, in case Windows ends the process during it
+        if (action is PowerAction.BlankAndStop or PowerAction.BlankAndHold)
+        {
+            // the display loop's own bounded stop; if a transfer is stuck, Supervise waits for the loop to let go before reopening
+            var result = PowerBlank.Run(_gate, TakePusher, PowerBlank.OwnerBudgetFor(e), RememberClosing);   // a reference write; Supervise reads it under _gate
+            if (result == PowerBlank.Result.Busy) _blankOwed = true;
+            Log($"Windows {e}: blank {result}");
+        }
+        if (e == PowerEvent.SessionEnding) _ui.BeginInvoke(Quit);   // always, even while asleep: also an installer closing the app (Restart Manager)
+        else if (action is PowerAction.BlankAndHold or PowerAction.Reopen) _ui.BeginInvoke(Supervise); // status now; after wake it reopens (and keeps retrying)
+    }
+
+    /// <summary>Runs under <see cref="_gate"/>: detaches the pusher so it can be blanked outside the lock.</summary>
+    private DisplayPusher? TakePusher()
+    {
+        var p = _pusher;
+        _pusher = null; _failingSince = null;
+        return p;
+    }
+
+    /// <summary>Under <see cref="_gate"/>: a power event found the display busy, so blank it now that the lock is free.</summary>
+    private void PayOwedBlank()
+    {
+        if (!_blankOwed) return;
+        _blankOwed = false;
+        if (_pusher is not null) DisposePusher(blank: true, DisplayPusher.QuickStopTimeout);
+        else if (_closingPusher is { IsClosed: false } closing)
+        {
+            closing.Stop(blank: true, TimeSpan.Zero);   // ask its loop to blank as well when it lets go (it may have been stopped without)
+            Log("The display is still finishing its last transfer; its loop blanks it when it lets go");
+        }
+        else if (Ax206Display.TryBlank() is { } err) Log("Could not blank the display after a power event: " + err);
+    }
+
+    /// <summary>Supervisor tick: if Windows never sent the wake-up notice, do not stay dark for good.</summary>
+    private void HealStuckSleep()
+    {
+        if (_power.NoteAwakeTick() != PowerAction.Reopen) return;
+        Log("No wake-up notice from Windows after 30 s awake; reopening the display");
+        Supervise();
+    }
+
+    /// <summary>The user asked for the display (Resume, Reload): that also clears a sleep state Windows never ended.</summary>
+    private void ClearStaleSleep()
+    {
+        if (_power.Handle(PowerEvent.Resume) == PowerAction.Reopen) Log("Cleared a sleep state that Windows never ended");
+    }
 
     private void SetPaused(bool paused)
     {
+        if (!paused) ClearStaleSleep();
         _paused = paused;
         _pauseItem.Text = paused ? "Resume display" : "Pause display";
         Supervise();
@@ -278,11 +391,19 @@ internal sealed class RunnerContext : ApplicationContext
 
     private void Quit()
     {
+        if (_quitting) return;   // a session end and the EXIT command can both ask
+        _quitting = true;
         Log("Runner exiting");
         _cts.Cancel();
         _supervisor.Stop();
         foreach (var w in _watchers) w.Dispose();
-        lock (_gate) DisposePusher();
+        lock (_gate)
+        {
+            _power.Handle(PowerEvent.Quit);   // nothing may reopen the display from here on
+            PayOwedBlank();                   // a session end that found the display busy
+            DisposePusher();                  // blanks it unless a session end already took and blanked it
+        }
+        _powerWatcher?.Dispose();
         _pipeServer.Dispose();
         _sensors.Dispose();
         _tray.Visible = false;
