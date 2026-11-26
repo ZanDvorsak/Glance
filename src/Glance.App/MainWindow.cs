@@ -155,6 +155,7 @@ public sealed class MainWindow : Window
             if (startArgs.Contains("--gallery")) OpenGallery();
             if (startArgs.Contains("--service")) new ServiceWindow().Show(this);
             if (startArgs.Contains("--virtual")) OpenVirtualDisplay();
+            try { await ShowRemovedImportPathsAsync(); } catch { /* a .glance opened from the command line; cosmetic */ }
             try { await MaybeShowSetupOnFirstRunAsync(); } catch { /* never block startup */ }
         };
 
@@ -624,7 +625,7 @@ public sealed class MainWindow : Window
                 _themePath = path;
                 return AppTheme.Load(path);
             }
-            catch { _themePath = null; /* fall through to the usual start-up theme */ }
+            catch { _themePath = null; _importRemoved = Array.Empty<RemovedAssetPath>(); /* fall through to the usual start-up theme */ }
         }
 
         if (_settings.LastTheme is { } p && File.Exists(p))
@@ -767,14 +768,35 @@ public sealed class MainWindow : Window
         catch (Exception ex) { _status.Text = "Export failed: " + ex.Message; }
     }
 
+    /// <summary>Paths the last .glance import removed from the theme; shown once by <see cref="ShowRemovedImportPathsAsync"/>.</summary>
+    private IReadOnlyList<RemovedAssetPath> _importRemoved = Array.Empty<RemovedAssetPath>();
+
     /// <summary>Opens a .glance file by unpacking it into its own folder under the themes folder.</summary>
     private string ImportPackage(string package)
     {
         var baseName = SafeName(Path.GetFileNameWithoutExtension(package));
         var folder = Path.Combine(AppSettings.ThemesFolder, baseName);
         for (int n = 2; Directory.Exists(folder); n++) folder = Path.Combine(AppSettings.ThemesFolder, $"{baseName} {n}");
-        try { return ThemePackage.Import(package, folder); }
+        try
+        {
+            var themeFile = ThemePackage.Import(package, folder, out var removed);
+            _importRemoved = removed;
+            return themeFile;
+        }
         catch { try { if (Directory.Exists(folder)) Directory.Delete(folder, true); } catch { } throw; }   // do not leave a half-imported folder
+    }
+
+    /// <summary>Tells the user which file paths an imported theme pointed outside its own package and were removed.</summary>
+    private async Task ShowRemovedImportPathsAsync()
+    {
+        var removed = _importRemoved;
+        _importRemoved = Array.Empty<RemovedAssetPath>();
+        if (removed.Count == 0) return;
+        _status.Text = $"{removed.Count} file path(s) in the shared theme pointed outside it and were removed; those widgets show nothing.";
+        await new ReportWindow("Shared theme cleaned",
+            "This theme referred to files outside its own package (another computer, a system file, or a folder above the theme). " +
+            "Glance does not open such paths from a shared theme, so they were removed. Pick the pictures or fonts again if you need them.",
+            removed.Select(r => r.ToString())).ShowDialog(this);
     }
 
     private async Task OpenAsync()
@@ -792,7 +814,8 @@ public sealed class MainWindow : Window
             if (path.EndsWith(ThemePackage.Extension, StringComparison.OrdinalIgnoreCase)) path = ImportPackage(path);   // a shared theme: unpack it first
             SetTheme(AppTheme.Load(path), path); _settings.LastTheme = path; _status.Text = "Opened " + path;
         }
-        catch (Exception ex) { _status.Text = "Could not open theme: " + ex.Message; }
+        catch (Exception ex) { _status.Text = "Could not open theme: " + ex.Message; _importRemoved = Array.Empty<RemovedAssetPath>(); return; }
+        await ShowRemovedImportPathsAsync();
     }
 
     private async Task SaveAsync(bool saveAs)
