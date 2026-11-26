@@ -592,3 +592,304 @@ a second, **standard (non-admin)** account available.
   `RunnerClient.IsRunning` and per-session pipe names keep two signed-in users apart.
 - **Docs.** `AGENTS.md`, `README.md` and `TUTORIAL.md` describe the new split, the console-session rule, the 20 s release for AIDA64
   and the log locations accurately, except for the nits in N1.
+
+---
+
+## Fixes after review
+
+Written by the session that made the change, after the review. The findings above are unchanged.
+
+### Method
+
+The user's rule was followed for every finding:
+1. **Prove the bug.** The tests were written first, in `src/Glance.Tests/ReviewFixTests.cs` and `src/Glance.Tests/DisplayServiceReviewTests.cs`
+   (a partial of `DisplayServiceTests`), one or more per finding, named after it. Where a test needed an entry point that did not exist
+   yet (`ServiceStartGuard`, `TrayStart`, `LogLimiter`, `ServicePipeFactory`, `DevPaths`, `LegacyTask`, the connector's service-state
+   argument, `ServiceControl.QueryPreshutdownTimeout`, `ServiceLog.ShouldOpen`), a stub with **today's behaviour** was added first. For
+   example, the guard always allowed, the factory created pipes the old way, the limiter let every line through, and `DevPaths` was the
+   old search. The installer cannot be run here (it would install a service), so for the installer the tests read `installer/Glance.iss`:
+   they are the probe that the script does the right thing.
+2. **Fix.** The stubs were replaced by the real rules, and the service, tray, editor and installer were changed.
+3. **Prove the fix.** The same tests pass and the whole suite is green.
+
+**Result:**
+- 44 new tests. **Before: 34 failed, 10 passed.** The 10 that passed are guards that must hold either way:
+  - the normal cases of the tray's elevation rule (3), of the log rule (2) and of the connector without a service (2);
+  - the three mutation gaps the review found (T1 `CurrentUserOnly`, T4 a refused HELLO closes, R3 brightness clamped), which were
+    correct but untested.
+- **After: 44 / 44**, and the full suite **668 / 668** at commit `3a35e6e`.
+- Removing the dead 0.1 helpers (N3, commit `4e2f119`) removed 61 tests that only covered that code: **607 / 607** after it. The mutation check below added one test and one test case: **608 / 608** at the end.
+- Build: 0 errors.
+
+Two tests were corrected between the runs. In both, the fix changed *how* the right result shows, not *whether* it shows:
+- `L1_a_client_over_the_network_path_is_refused`: after the fix the server closes a network client before it can write its HELLO,
+  so the write itself fails ("Pipe is broken"). That now counts as the refusal it is.
+- `N2_the_console_mode_is_only_in_debug_builds` looked for the first `--console`. After the fix that is in the doc comment above
+  `#if DEBUG`, so the test now looks for the code (`args.Contains("--console")`). Before the fix there was no `#if DEBUG` at all.
+
+### H1. The service binary could be installed into a user-writable folder
+
+| Test | Before | After |
+|---|---|---|
+| `H1_the_installer_always_installs_into_Program_Files_and_resets_the_folder_rules` | `Assert.Contains() Failure: Sub-string not found` (`DisableDirPage=yes`) | passes |
+| `H1_the_service_refuses_to_run_from_a_folder_users_can_change` (a real folder in the user's temp, real `FolderTrust`) | `Assert.NotNull() Failure: Value is null` | passes |
+| `H1_the_service_runs_from_a_trusted_folder_and_refuses_an_unknown_path` | `Assert.NotNull() Failure: Value is null` | passes |
+| `H1_the_service_checks_its_folder_before_it_does_anything_else` | `Assert.Contains() Failure: Sub-string not found` | passes |
+
+- **Installer folder:** `Glance.iss` sets `DisableDirPage=yes` and `UsePreviousAppDir=no`, so the service always lives in `{autopf}\Glance`.
+- **Folder lock:** after the files are copied, `LockInstallFolder` runs `icacls "{app}" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F
+  *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX *S-1-15-2-1:(OI)(CI)RX` and then `/setowner *S-1-5-32-544`.
+  - It checks the exit codes.
+  - If either fails, it registers **no** service and shows a message.
+- **Self-check:** the service runs `ServiceStartGuard.Refusal(Environment.ProcessPath, FolderTrust.CheckExecutable(exe, TrustScope.FolderTree))`
+  in `ServiceMain`, before anything else. If the folder is not admin-only:
+  - it logs why, in the service log and in the Application event log (source "Glance");
+  - it reports `SERVICE_STOPPED` with `ERROR_ACCESS_DENIED`.
+
+### M1. The service joined a squatter's pipe
+
+| Test | Before | After |
+|---|---|---|
+| `M1_the_display_server_does_not_start_on_a_squatted_name` | `Assert.ThrowsAny() Failure: No exception was thrown` | passes |
+| `M1_the_sensor_server_reports_a_squatted_name_and_serves_once_it_is_gone` | `the squatted sensor pipe was not reported` | passes |
+| `M1_L8_a_pipe_name_someone_else_serves_is_refused_by_every_Glance_server` | `Assert.IsType() Failure: Value is null` (no exception) | passes |
+
+- **New `ServicePipeFactory.Create(..., first)`:**
+  - The first instance a server creates uses `PipeOptions.FirstPipeInstance`. A taken name throws `PipeNameTakenException`.
+  - Every instance, first or later, must be owned by this account (or Administrators). A foreign one is disposed and refused.
+- **Used by** `DisplayServer`, `SensorPipeServer` and the tray's control pipe. Each counts its live instances and claims the name
+  again with the flag when it has none left.
+- **`SensorPipeServer` logs now:** it takes a log callback, and the service passes its log.
+  - It writes "Sensor pipe error: The pipe name ... is taken by another program" (rate-limited).
+  - It retries every 2 s, so it serves as soon as the squatter is gone.
+- These are the reviewer's two tests in substance, kept as permanent regression tests.
+
+### M2. Idle connections and log growth
+
+| Test | Before | After |
+|---|---|---|
+| `M2_idle_connections_from_another_session_do_not_lock_out_the_console_user` (8 idle clients from another session) | `System.TimeoutException : The operation has timed out.` | passes (connects and draws within 2.5 s) |
+| `M2_a_connection_that_sends_nothing_is_closed` | `Assert.Equal() Failure: Values differ, Expected: 0` (still open after 3 s) | passes |
+| `M2_the_display_server_does_not_log_every_busy_second` | `Assert.Equal() Failure: Values differ, Expected: 1` (100 lines written) | passes |
+| `M2_a_repeated_line_is_written_once_per_window_with_a_count` | `Assert.Null() Failure: Value is not null` | passes |
+| `M2_the_service_log_rolls_over_at_its_size_limit` | `the log grew past its limit` | passes |
+
+- **`DisplayServer`:**
+  - at most `PerSessionLimit` (4) connections per Windows session;
+  - a connection that sends no complete request within `IdleTimeout` is closed (30 s; clients send a frame at least every 10 s);
+  - 16 instances.
+- **`LogLimiter`:** a repeated line is written once a minute, then "(repeated N more times before this)". The display server, the sensor
+  server and the tray's control loop use it.
+- **`ServiceLog`** rolls over to `service.old.log` at 1 MiB.
+- **The client side** retries instead of switching to USB (see L3).
+
+### M3. A leftover 0.1 task starts the tray elevated
+
+| Test | Before | After |
+|---|---|---|
+| `M3_the_tray_does_not_run_elevated_when_it_could_run_as_the_user` (5 cases) | 2 failed: `Expected: RelaunchUnelevated` / `Expected: Refuse`, actual `Run` | 5 / 5 |
+| `M3_the_tray_checks_its_token_before_anything_else` | `Assert.Contains() Failure: Sub-string not found` | passes |
+| `M3_the_service_deletes_the_old_task_without_a_prompt` | `Assert.False() Failure` (it used the UAC start info) | passes |
+| `M3_the_installer_checks_that_the_old_task_is_gone` | `Assert.Contains() Failure: Sub-string not found` | passes |
+
+- **`TrayStart.Decide`** (Core, pure):
+  - the elevated half of a split token (`TokenElevationType` Full, and elevated): relaunch with normal rights;
+  - still elevated after the relaunch: refuse;
+  - UAC off (type Default): run, because there is no boundary to protect.
+- **Tray:** `Glance.Runner` `Main` checks this before anything else.
+  - It logs `RunnerEnvironment.Warning(...)` (reused, as suggested).
+  - It starts itself again through `explorer.exe`. A named marker tells the new copy it was relaunched.
+- **Service:** it deletes the task at every start, as SYSTEM, with `{sys}\schtasks.exe` (`LegacyTask`), only if the task exists, and logs it.
+- **Installer:** it runs `schtasks /Query` after the delete and shows a message if the task is still there.
+
+### M4. DLL search order
+
+| Test | Before | After |
+|---|---|---|
+| `M4_the_service_limits_the_dll_search_before_anything_loads` | `Assert.Contains() Failure: Sub-string not found` | passes |
+| `M4_libusb_is_only_loaded_from_System32` | `usb_init may load libusb0.dll from outside System32` | passes |
+
+- **Service:** the first statement of `Glance.Service` `Main` is `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR)`.
+- **Core:** `Glance.Core` has `[assembly: DefaultDllImportSearchPaths(DllImportSearchPath.System32)]`.
+  - The attribute cannot be put on a class.
+  - Every native DLL that Core imports by name is a System32 DLL.
+- **`libusb0.dll` on this PC** is in `C:\Windows\System32` (76 384 bytes; an x86 copy is in SysWOW64). The libusb-win32 driver
+  installs it there, so the editor and the tray still find it.
+- **LibreHardwareMonitor** (0.9.6, x64):
+  - Its strings show `\GLOBALROOT\Device\PawnIO`: the driver is opened as a device, not through a DLL.
+  - The vendor DLLs it names are `nvapi64.dll`, `nvml.dll`, `atiadlxx.dll`, `ControlLib.dll` and `Ftd2xx.dll`. Current NVIDIA, AMD and
+    Intel drivers put these in System32.
+  - **Must be checked by hand:** the GPU sensors in the service (manual test 5).
+
+### L1. Network-path clients
+
+| Test | Before | After |
+|---|---|---|
+| `L1_a_client_over_the_network_path_is_refused` (`\\localhost\pipe\...` through SMB, fake session = console) | `Assert.Equal() Failure: Values differ, Expected: Denied` (HELLO was allowed) | passes (closed before it can write) |
+| `L1_the_tray_control_pipe_denies_the_network` | `Assert.Contains() Failure: Filter not matched in collection` | passes |
+
+- **Redirector check:** `NativeSessions.IsRemoteClient` uses `GetNamedPipeClientComputerNameW`, which only succeeds for clients that
+  came through the redirector. The display server and the tray's control pipe close such a connection at once.
+- **NETWORK deny:** `ServicePipeSecurity.CurrentUserOnly()` (the tray pipe, and the sensor server's default) denies NETWORK.
+- **Design note:** its "unknown session is refused" claim is corrected (§4).
+- **Why not `PIPE_REJECT_REMOTE_CLIENTS`:** I kept the redirector check instead of creating the pipe through `CreateNamedPipeW` with that
+  flag. The check is proven by the test, and it keeps .NET's pipe creation, which the first-instance fix depends on.
+
+### L2. Suspend during a transfer
+
+| Test | Before | After |
+|---|---|---|
+| `L2_a_suspend_during_a_transfer_blanks_as_soon_as_the_transfer_ends_without_a_tick` | `Assert.Equal() Failure: Values differ, Expected: 1` (no blank) | passes |
+
+The frame request that held the device now checks `Power.MayDrive` right after its transfer, still under the lock. If Windows started to
+sleep or shut down during the transfer, the request blanks and closes the device then, inside the budget, and answers "off while
+Windows sleeps".
+
+### L3. Busy or starting service treated as "no service"
+
+| Test | Before | After |
+|---|---|---|
+| `L3_an_installed_service_that_does_not_answer_yet_is_waited_for_not_bypassed` | `Assert.ThrowsAny() Failure: No exception was thrown` (USB was opened) | passes |
+| `L3_without_a_running_service_the_connector_opens_usb` (Stopped, NotInstalled) | passed (guard) | passes |
+
+- **Fallback rule:** `DisplayConnector.Open` falls back to USB only when `ServiceControl.Query()` says the service is not installed or stopped.
+  - If the service is running or starting, `Open` throws "running but did not answer yet; trying again", and the tray's `Supervise` retries.
+  - `DisplayConnector.TryBlank` follows the same rule.
+- **Switching back:** `DisplayPusher.ViaService` is new. When the service answers and the tray's pusher is on USB, the tray hands the
+  display to the service (`MoveToServiceIfOnUsb`).
+
+### L4. Installer robustness
+
+| Test | Before | After |
+|---|---|---|
+| `L4_the_installer_turns_off_the_restart_before_stopping_and_checks_results` | `the recovery restart must be off before the service is stopped` | passes |
+
+- **Stopping (`StopOldService`):** first `sc failure GlanceService reset= 0 actions= ""`, then `net stop`, then `WaitForServiceStopped(20)`,
+  and only then `taskkill`. So no recovery restart follows. The uninstaller turns the restart off first too.
+- **Checked steps (`InstallService`):** it checks the exit codes of `icacls`, `create`/`config`, `sdset`, `sidtype`, `privs`, `failure`
+  and `start`.
+  - Each failure is logged.
+  - Each failure shows `ServiceStepFailed`: a `SuppressibleMsgBox` with the step and the code.
+
+### L5. Pre-shutdown timeout
+
+| Test | Before | After |
+|---|---|---|
+| `L5_the_preshutdown_timeout_is_read_through_the_service_api` (reads `EventLog`'s value as a normal user) | `Assert.NotNull() Failure: Value of type 'Nullable<int>' does not have a value` | passes |
+
+- The service calls `ChangeServiceConfig2W(SERVICE_CONFIG_PRESHUTDOWN_INFO)` at start. SYSTEM holds `SERVICE_CHANGE_CONFIG` through
+  the BA entry.
+- It then logs the effective value read with `QueryServiceConfig2W` ("Pre-shutdown timeout: 5000 ms").
+- The installer no longer writes the registry value.
+
+### L6. Log opened too early
+
+| Test | Before | After |
+|---|---|---|
+| `L6_only_the_service_or_an_elevated_console_opens_the_log` (3 cases) | `(false, false)` failed: `Expected: False` | 3 / 3 |
+
+- **When:** the log is opened inside `ServiceMain`, and only when the process is SYSTEM (or, in a debug build, an elevated console).
+- **If the log folder is not admin-only:** the reason goes to the Application event log (source "Glance") and into `STATUS`.
+
+### L7. Privileges
+
+| Test | Before | After |
+|---|---|---|
+| `L7_the_service_keeps_only_the_privileges_it_needs` | `Assert.Contains() Failure: Item not found in collection, Collection: []` | passes |
+
+- **The change:** `sc sidtype GlanceService unrestricted` and `sc privs GlanceService SeChangeNotifyPrivilege/SeCreateGlobalPrivilege`
+  (`ServiceNames.RequiredPrivileges`). The test also checks that no takeover privilege is in the list.
+- **Why it should work, in principle:**
+  - USB through libusb needs no privilege; the device ACL admits SYSTEM.
+  - LibreHardwareMonitor talks to PawnIO through its device path and names no privilege in its code.
+  - The pipes need no privilege. `SeCreateGlobalPrivilege` is kept for global objects.
+- **The user must verify on the real PC** (manual test 5):
+  - CPU temperatures and clocks (PawnIO);
+  - motherboard fans and voltages (SMBus/LPC through PawnIO);
+  - GPU sensors (NVAPI, NVML, ADLX);
+  - drive sensors;
+  - the display.
+- **If sensors are missing:** run `sc qprivs GlanceService` and check `service.log`. `SeLoadDriverPrivilege` is the first candidate to
+  add, in `ServiceNames.RequiredPrivileges` and in the installer.
+
+### L8. Tray control pipe squatting
+
+| Test | Before | After |
+|---|---|---|
+| `M1_L8_a_pipe_name_someone_else_serves_is_refused_by_every_Glance_server` | see M1 | passes |
+| `L8_the_tray_pipe_name_carries_the_session_and_the_user` | `Assert.Contains() Failure: Sub-string not found, String: "Glance.Runner.Control.3"` | passes |
+
+- The name is now `Glance.Runner.Control.<session>.<user SID>`.
+- The tray claims it with the first-instance flag and checks the owner.
+- "Control pipe error" lines are rate-limited.
+
+### L9. Dev-build fallback
+
+| Test | Before | After |
+|---|---|---|
+| `L9_an_installed_copy_never_searches_other_folders` (planted `C:\Glance.Runner\bin\x\Glance.Runner.exe`) | `Assert.Null() Failure: Value is not null` | passes |
+| `L9_a_development_build_only_searches_inside_its_repository` | `Assert.Null() Failure: Value is not null` | passes |
+
+`DevPaths.FindSibling` (Core, pure) searches only when the program runs from a `\bin\` folder, and never above the folder that holds
+`Glance.sln`. The editor (`AppPaths`) and the tray (`FindEditor`) use it.
+
+### L10. Sensor pipe at once
+
+- The test `M1_the_sensor_server_reports_a_squatted_name_and_serves_once_it_is_gone` covers it: it proves that sensor pipe errors are
+  now logged.
+- `ServiceRuntime.Start` creates the sensor pipe (serving `[]`) right after the display pipe, before LibreHardwareMonitor opens.
+
+### Nits
+
+| Finding | Test | Before | After |
+|---|---|---|---|
+| N1 design-note claims | (documentation) | | corrected in `docs/design/runner-service.md` §4 and §13 |
+| N2 `--console` in release builds | `N2_the_console_mode_is_only_in_debug_builds` | `--console is not inside #if DEBUG` | passes (debug builds only) |
+| N3 dead 0.1 helpers | (removal) | | `AutostartTask` keeps only the task name and its removal; the 61 tests of the removed code are removed |
+| N4 files left from 0.1.1 | `N4_files_from_older_versions_are_removed_on_upgrade` | `Assert.Contains() Failure: Sub-string not found` | `[InstallDelete] {app}\Glance.SensorHost.*` |
+| N5 `STATUS` for other users | `N5_other_sessions_get_a_status_without_the_session_or_error_text` | `Assert.DoesNotContain() Failure: Sub-string found` ("showing session 1") | passes ("display in use; awake") |
+| N6 uninstall delete through a link | `N6_the_uninstaller_does_not_delete_through_a_link` | `Assert.DoesNotContain() Failure: Sub-string found` (`[UninstallDelete]`) | passes: `CurUninstallStepChanged` skips a reparse point |
+
+### Test gaps (surviving mutations R1-R3)
+
+| Gap | Test | Result |
+|---|---|---|
+| T1 / R1 `CurrentUserOnly` on the tray client | `T1_the_editor_only_talks_to_a_tray_app_of_its_own_user` (the options are now `ControlPipeClient.Options`, and the client uses them) | passed before and after (a guard); the mutation now fails it |
+| T4 / R2 a refused HELLO closes | `T4_a_refused_or_wrong_hello_closes_the_connection` | passed before and after (a guard) |
+| R3 brightness clamped | `R3_brightness_out_of_range_is_clamped_by_the_service` | passed before and after (a guard) |
+
+### Mutation check of the fixes
+
+Each new rule was broken on purpose and the service test classes (154 tests at the time) were run. Every file was restored afterwards
+(touched, so the next build really compiled it), and the full suite was green again (607 / 607).
+
+| Mutation | Result |
+|---|---|
+| F1 no first-instance flag (`ServicePipeFactory`) | caught by 2 (display and sensor squatter tests) |
+| F2 no per-session limit | **survived** at first (16 instances hid it); `M2_one_session_cannot_hold_more_than_its_share_of_connections` added, which fails with the mutation and passes without it |
+| F3 no idle timeout | caught by 1 |
+| F4 network clients accepted | caught by 1 |
+| F5 no blank right after a transfer during a suspend | caught by 3 |
+| F6 connector bypasses a running service | caught by 1 |
+| F7 tray runs elevated | caught by 2 |
+| F8 dev-build search outside `\bin\` | **survived** at first (the repository check covered every case); a case inside a repository but outside `\bin\` added to `L9_a_development_build_only_searches_inside_its_repository`, which now fails with the mutation |
+| F9 service folder not checked | caught by 2 |
+| F10 log lines not limited | caught by 2 |
+| F11 log not rolled over | caught by 1 |
+| F12 full status for every session | caught by 1 |
+| F13 owner of later pipe instances not checked | **survives**. With the first-instance flag in place, a later instance can only join a foreign pipe if every instance of ours was gone at that moment *and* another account took the name, and a test cannot create a pipe owned by another account without a second account. It is defence in depth; the squatter tests cover the first instance. |
+
+After the new test and the new case: 608 / 608.
+
+### Not done here
+
+- **Nothing was installed, started, stopped or registered.** The installer was compiled (`ISCC`, placeholder package, "Successful
+  compile", output deleted) but not run.
+- **So these remain manual:**
+  - the folder lock (`icacls`);
+  - the service's refusal from an unsafe folder under the real Service Control Manager;
+  - the privilege list with real sensors;
+  - `ChangeServiceConfig2W` as SYSTEM;
+  - the tray's relaunch from a real 0.1 task;
+  - the event-log entries.
+- **The editor** still has no elevation check of its own (nothing starts it elevated). Only the tray has one, as asked.

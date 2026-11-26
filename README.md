@@ -55,7 +55,7 @@ installer is the normal way to set it up.
 dotnet test src/Glance.Tests -c Release
 ```
 
-About 620 unit tests cover the logic that does not need the display or an installed service. They also run on GitHub for every push.
+About 610 unit tests cover the logic that does not need the display or an installed service. They also run on GitHub for every push.
 
 ## Package and installer
 

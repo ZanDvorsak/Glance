@@ -86,6 +86,34 @@ public sealed partial class DisplayServiceTests
     }
 
     [Fact]
+    public async Task M2_one_session_cannot_hold_more_than_its_share_of_connections()
+    {
+        StartServer();
+        _clientSession = ThisSession + 1;
+        var held = new List<NamedPipeClientStream>();
+        try
+        {
+            for (int i = 0; i < 5; i++)
+            {
+                var c = new NamedPipeClientStream(".", _pipe, PipeDirection.InOut, PipeOptions.Asynchronous);
+                await c.ConnectAsync(3000);
+                held.Add(c);
+                await Task.Delay(50);
+            }
+            async Task<bool> ClosedSoon(NamedPipeClientStream c)
+            {
+                using var cts = new CancellationTokenSource(1500);
+                try { return await c.ReadAsync(new byte[1], cts.Token) == 0; }
+                catch (IOException) { return true; }
+                catch (OperationCanceledException) { return false; }
+            }
+            Assert.True(await ClosedSoon(held[4]), "the fifth connection from one session was kept");
+            Assert.False(await ClosedSoon(held[0]), "the first connection was closed too");
+        }
+        finally { foreach (var c in held) c.Dispose(); }
+    }
+
+    [Fact]
     public async Task M2_a_connection_that_sends_nothing_is_closed()
     {
         StartServer(idleTimeout: TimeSpan.FromMilliseconds(300));

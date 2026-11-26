@@ -95,27 +95,40 @@ again when idle (see 6), so AIDA64 can still use the display when no Glance clie
     no `ChangePermissions`, no `TakeOwnership`, so no user can add an instance of the service's pipe or change its rules.
   - Nobody else (no Everyone, Users, Authenticated Users, Anonymous).
 - **Authorization per request** (`DisplayAccess`, pure and tested): `STATUS` from any connected client; `HELLO`, `FRAME`,
-  `BRIGHTNESS`, `BLANK` only from a client whose session is the active console session. A client whose session cannot be
-  determined (for example a remote one that got past the ACL) is refused. The service has no `EXIT` or file command at all;
-  stopping it goes through the Service Control Manager.
-- **Squatting.** If the service is stopped, a normal user could create a pipe called `Glance.Service.Display` first. Clients
-  therefore check **who owns the server end** right after connecting (`PipeServerCheck`): the owner must be SYSTEM or
-  Administrators, which a non-elevated process cannot set. A squatter can only make the display unavailable (the service fails
-  to create its pipe and logs it); it cannot receive frames or feed fake sensor values to a client.
+  `BRIGHTNESS`, `BLANK` only from a client whose session is the active console session. The service has no `EXIT` or file
+  command at all; stopping it goes through the Service Control Manager.
+- **Remote clients** *(corrected after review, L1)*. The first draft said a remote client "that got past the ACL" would be refused
+  because its session could not be determined. That was wrong: a client that comes through the network redirector (also
+  `\\localhost\pipe\...`) gets a made-up session id from Windows, and its loopback token is the interactive one. The NETWORK deny
+  stops real remote logons; in addition, the display server and the tray's control pipe now ask `GetNamedPipeClientComputerNameW`
+  and close any client that came through the redirector, before reading a byte (tested). The tray pipe denies NETWORK too.
+- **Squatting** *(corrected after review, M1)*. If the service is stopped, a normal user could create a pipe called
+  `Glance.Service.Display` (or `Glance.Sensors`) first. The first draft claimed the service would then fail to create its pipe and
+  log it; it did not: without `FILE_FLAG_FIRST_PIPE_INSTANCE`, SYSTEM silently *joined* the squatter's pipe and served under the
+  squatter's rules. Now every Glance pipe server (`ServicePipeFactory`) claims its name with the first-instance flag and checks that
+  every instance it creates is owned by its own account; a taken name is logged (once a minute) and retried until it is free.
+  Clients still check **who owns the server end** right after connecting (`PipeServerCheck`: SYSTEM or Administrators, which a
+  non-elevated process cannot set), so a squatter never receives frames or feeds fake sensor values.
+- **Connection limits** *(after review, M2)*. At most 4 connections per Windows session and 16 in all; a connection that sends no
+  complete request for 30 s is closed. Repeated log lines are written once a minute, and the log rolls over at 1 MiB.
 - **No impersonation (added during implementation).** .NET pipe clients default to the *Impersonation* level, so whoever serves a
-  pipe name can call `ImpersonateNamedPipeClient` and act as the connecting user, before any owner check runs. A user who squats
-  `Glance.Service.Display` while the service is stopped could then act as another signed-in user. All Glance clients (display,
-  sensors, tray control) therefore connect at `TokenImpersonationLevel.Anonymous`. The service does not need the client's token:
-  it takes the session from `GetNamedPipeClientSessionId`. Proven with two tests that play the squatter (see Proof).
+  pipe name can call `ImpersonateNamedPipeClient`, before any owner check runs. *(Wording corrected after review, N1:)* a normal
+  user has no `SeImpersonatePrivilege`, so impersonating *another* user's connection gives them only an identification-level token
+  (who you are, not acting as you); with the same user, or a squatter running as a service account, it is real impersonation. The
+  tests prove the same-user case. All Glance clients (display, sensors, tray control) therefore connect at
+  `TokenImpersonationLevel.Anonymous`, which closes both. The service does not need the client's token: it takes the session from
+  `GetNamedPipeClientSessionId`. Proven with two tests that play the squatter (see Proof).
 - **Input limits.** The display protocol is binary with a 5-byte header (opcode + length); the length is checked against the
   opcode's exact size before anything is read (a frame must be exactly 307 200 bytes, brightness 1 byte, others 0-4 bytes), so a
   client cannot make the service allocate more than one frame per connection.
 
-### The tray's control pipe (`Glance.Runner.Control.<session id>`)
+### The tray's control pipe (`Glance.Runner.Control.<session id>.<user SID>`)
 
-- Served by the **non-elevated** tray, for the editor of the same user. Named per session so two signed-in users do not collide.
-- DACL: the current user only (as today). Clients connect with `PipeOptions.CurrentUserOnly`, which makes .NET check that the
-  server end belongs to the same user, so another user who squats the name gets no connection.
+- Served by the **non-elevated** tray, for the editor of the same user. Named per session and user, so two signed-in users do not
+  collide and a reused session id never reaches an older user's pipe.
+- DACL: the current user only, NETWORK denied. The tray claims the name with the first-instance flag (after review, L8). Clients
+  connect with `PipeOptions.CurrentUserOnly`, which makes .NET check that the server end belongs to the same user, so another user
+  who squats the name gets no connection.
 - `LIVE <folder> <theme>` keeps its meaning: the tray (same user, same rights) renders the theme from that folder. The folder is
   never sent to the service. This is no privilege boundary any more, so no path checks are needed beyond today's.
 
@@ -155,7 +168,10 @@ The service registers its own control handler (`RegisterServiceCtrlHandlerEx`; .
 | `POWEREVENT` + `PBT_APMRESUMEAUTOMATIC`/`PBT_APMRESUMESUSPEND` | `PowerEvent.Resume` | allow frames again; the clients reopen |
 | `SESSIONCHANGE` + `WTS_SESSION_LOGOFF` / `WTS_CONSOLE_DISCONNECT` | session left the console | blank now if it was the driving session |
 
-- **Pre-shutdown timeout:** 5 000 ms, written by the installer to `HKLM\SYSTEM\CurrentControlSet\Services\GlanceService\PreshutdownTimeout`.
+- **Pre-shutdown timeout:** 5 000 ms, set by the service itself at start with `ChangeServiceConfig2W(SERVICE_CONFIG_PRESHUTDOWN_INFO)`
+  and read back into its log (after review, L5: a direct registry write is only read at the next boot).
+- **A suspend during a transfer** (after review, L2): the frame request that holds the device checks the power policy right after
+  its transfer and blanks then, inside the budget, instead of leaving the blank to the 2 s tick.
   The blank needs about 1 s; the bound inside is still `PowerBlank.SessionEndBudget` (4 s).
 - **Heal a missed wake:** the supervisor tick calls `NoteAwakeTick`, as in the runner.
 - **Second line:** the user-side tray and editor keep `SessionPowerWatcher` + `DisplayPowerPolicy`; on sign-out or sleep they stop
@@ -168,29 +184,37 @@ The service registers its own control handler (`RegisterServiceCtrlHandlerEx`; .
 Service name `GlanceService`, display name "Glance display service", `start= auto`, LocalSystem, binary
 `"{app}\Glance.Service.exe"` (Program Files, admin-only; quoted).
 
-- **Install** (`installer/Glance.iss`, `[Code]` at `ssPostInstall`, every tool hidden):
+- **Install folder** (after review, H1): always `{autopf}\Glance` (`DisableDirPage=yes`, `UsePreviousAppDir=no`). After the files
+  are copied, `icacls "{app}" /inheritance:r` with SYSTEM and Administrators full control, Users and All Application Packages read
+  and execute, and Administrators as owner. If that fails, no service is registered. The service also checks its own folder with
+  `FolderTrust` at every start (`ServiceStartGuard`) and refuses to run, logging why, if anyone else can change it.
+- **Install** (`installer/Glance.iss`, `[Code]` at `ssPostInstall`, every tool hidden, every result that matters checked and shown):
   1. `sc.exe create GlanceService binPath= "\"{app}\Glance.Service.exe\"" start= auto obj= LocalSystem DisplayName= "Glance display service"`
      (on upgrade the service exists already, so `sc.exe config` with the same values runs instead).
-  2. `sc.exe description ...`, `sc.exe failure GlanceService reset= 86400 actions= restart/5000/restart/10000/restart/60000`.
+  2. `sc.exe description ...`.
   3. `sc.exe sdset GlanceService <ServiceNames.ServiceSddl>`: the Windows default plus **start** (`RP`) for interactive users.
-  4. `PreshutdownTimeout` = 5000 in the service's registry key (`RegWriteDWordValue`, after the service exists).
-  5. `sc.exe start GlanceService`.
-  6. The tray app starts as the original (non-elevated) user, and a shortcut in the common Startup folder starts it at every sign-in
+  4. `sc.exe sidtype GlanceService unrestricted` and `sc.exe privs GlanceService <ServiceNames.RequiredPrivileges>` (after review, L7).
+  5. `sc.exe failure GlanceService reset= 86400 actions= restart/5000/restart/10000/restart/60000`.
+  6. `sc.exe start GlanceService`. The service sets its own pre-shutdown timeout (§7).
+  7. The tray app starts as the original (non-elevated) user, and a shortcut in the common Startup folder starts it at every sign-in
      (task "trayatsignin", on by default).
-  Only Windows tools run elevated (`sc.exe`, `net.exe`, `schtasks.exe`, `taskkill.exe`, `cmd.exe /d`): no .NET program is started
-  elevated with the installing user's environment during setup. `ServiceLayoutTests` checks that the script uses the tested SDDL.
+  Only Windows tools run elevated (`sc.exe`, `net.exe`, `schtasks.exe`, `taskkill.exe`, `icacls.exe`, `cmd.exe /d`): no .NET program
+  is started elevated with the installing user's environment during setup. `ServiceLayoutTests` and `ReviewFixTests` check the script.
 - **Upgrade from 0.1.1** (`PrepareToInstall`, before any file is replaced):
   1. Ask the old elevated runner to exit cleanly (it blanks the display): the setup script itself opens
      `\\.\pipe\Glance.Runner.Control` with `CreateFileW` (kernel32, `SECURITY_SQOS_PRESENT` + anonymous, so whoever serves that pipe can
      never act as the elevated installer) and writes `EXIT`, then waits up to 5 s for `Glance.Runner.exe` to end.
      *Changed from the first draft:* the draft used a PowerShell one-liner. PowerShell is a .NET Framework program, and
      `COR_ENABLE_PROFILING`/`COR_PROFILER_PATH` from the user's environment would load a profiler into it while elevated: the H1 hole again.
-  2. `schtasks /Delete /TN "Glance Runner" /F` (the old elevated logon task).
-  3. `net.exe stop GlanceService` (newer upgrades; it waits until the service has stopped and blanked), then `taskkill /F` for trays,
-     editors and the service in every session.
-- **Uninstall** (`[UninstallRun]`): `net stop` and `sc delete` the service, delete the old task, kill trays and editors.
-  `%AppData%\Glance` stays (as today). Only `%ProgramData%\Glance\service.log` and then the folder if empty are removed, never a
-  folder tree (the folder could be a link planted by a user).
+  2. `schtasks /Delete /TN "Glance Runner" /F` (the old elevated logon task), then `/Query` to check; a message if it is still there.
+     The service deletes it too at every start (after review, M3), and the tray app relaunches itself without admin rights if a
+     leftover task starts it elevated.
+  3. Newer upgrades: `sc failure GlanceService reset= 0 actions= ""` (no recovery restart mid-upgrade), `net.exe stop GlanceService`,
+     wait up to 20 s for it to end, only then `taskkill`; then `taskkill /F` for trays and editors in every session (after review, L4).
+  4. `[InstallDelete]` removes `Glance.SensorHost.*` left by older packages.
+- **Uninstall** (`[UninstallRun]`): recovery actions off, `net stop` and `sc delete` the service, delete the old task, kill trays and
+  editors. `%AppData%\Glance` stays (as today). Only `%ProgramData%\Glance\service.log` (and `service.old.log`) and then the folder if
+  empty are removed, never a folder tree, and nothing at all if the folder is a reparse point (it could be a link a user planted).
 - **The editor's "Background service" window** becomes service status (installed? running? device state, driving session) with
   **Start** (no prompt, thanks to the service DACL) and **Stop** (one UAC prompt, `sc.exe stop GlanceService`; `sc.exe` is a
   System32 binary, so nothing of Glance's is elevated). It also shows whether this session's tray runs, starts it, and offers to
@@ -244,14 +268,20 @@ writes there when `FolderTrust.CheckFolder` says only administrators can change 
 6. **Console session wins** (3). Alternative: the first client keeps the display until it lets go.
 7. **Version bumped to 0.2.0** in `src/Directory.Build.props`, so the installer is `Glance-Setup-0.2.0.exe` and upgrades 0.1.1.
 8. **FFmpeg is installed per user** from the editor now (5). The machine-wide script is kept in Core but no longer offered.
-9. **Not removed yet:** the 0.1 install-path helpers in `AutostartTask` and `RunnerEnvironment` (unused, with their tests). Left for a
-   cleanup so this change stays reviewable; only the task-removal parts are still used.
+9. **0.1 helpers removed** (after review, N3): `AutostartTask` keeps only the task name and its removal. `RunnerEnvironment` stays: the
+   tray uses it when a leftover task starts it elevated.
+10. *(added by the reviewer, accepted)* **The install folder is always Program Files**, and its rules are reset by the installer (H1).
+11. *(added by the reviewer, accepted)* **The service keeps only two privileges** and gets its own service SID (L7). Needs one manual
+    sensor check (manual test 7); if a sensor is missing, add the privilege it needs.
+12. *(added by the reviewer, accepted)* **The service deletes a leftover 0.1 "Glance Runner" task** at every start, as SYSTEM (M3).
 
 ## 13. Proof
 
 Method: every new rule got its test first, against a stub with today's behaviour (or `NotImplementedException` for new types),
 the run was kept, then the code was written and the same tests were run again. Logs are kept outside the repo. Commands:
-`dotnet build src/Glance.sln -c Release -p:SkipHost=true` (0 errors; the only warnings are the existing `SKPath` obsolete warnings) and
+`dotnet build src/Glance.sln -c Release -p:SkipHost=true` (0 errors; *corrected after review, N1:* there are about 140 warnings,
+not only the `SKPath` ones: also `CA1416` platform warnings in the new tests, analyzer-version warnings and an existing `CS8602` in
+`MainWindow.cs`; none of them concerns this change) and
 `dotnet test src/Glance.Tests -c Release`.
 
 **Baseline** (`integration/high-fixes`, 9bf03b0): 542 / 542 passed.
@@ -337,7 +367,10 @@ affected: every mutation itself made its file newer than the last build.) After 
 
 ### Final
 
-**624 / 624** (542 before this branch + 82 new). Build of the whole solution: 0 errors (4 existing `SKPath` obsolete warnings).
+**624 / 624** (542 before this branch + 82 new). Build of the whole solution: 0 errors.
+
+After the security review (`docs/reviews/review-runner-service.md`, section "Fixes after review"): 44 more tests, 34 of them failing
+before the fixes; 668 / 668 after the fixes, and 607 / 607 after the dead 0.1 helpers and their 61 tests were removed, and 608 / 608 with one more test from the mutation check.
 
 ### Not verified here (needs the user)
 
@@ -348,37 +381,109 @@ before sign-in, PRESHUTDOWN/POWEREVENT/SESSIONCHANGE delivery and timing, LibreH
 
 ## 14. Manual test plan
 
-Use a PC with the display attached, the libusb-win32 driver and PawnIO. Start with Glance 0.1.1 installed and its "start at sign-in" option on.
+The author's plan, with the reviewer's corrections and seven extra tests merged in (marked *review*). Use a PC with the display
+attached, the libusb-win32 driver and PawnIO. Start with Glance 0.1.1 installed and its "start at sign-in" option on. Keep a second,
+**standard (non-admin)** account available.
 
 1. **Build the installer:** `.\build\publish.ps1`, then `.\build\make-installer.ps1` → `dist\Glance-Setup-0.2.0.exe`.
 2. **Upgrade from 0.1.1:** with the 0.1.1 runner showing your theme, run the setup.
-   - Expect: the display goes black when setup starts (the old runner got `EXIT`), no "Glance Runner" task afterwards
-     (`schtasks /Query /TN "Glance Runner"` → not found), `Glance.Runner.exe` running as you **without** elevation (Task Manager >
-     Details > "Elevated" column = No), your theme back on the display within a few seconds, full CPU sensors in the editor.
-   - `sc qc GlanceService`: `START_TYPE AUTO_START`, `SERVICE_START_NAME LocalSystem`, `BINARY_PATH_NAME` in quotes.
-     `sc qfailure GlanceService`: three restart actions. `sc sdshow GlanceService`: contains `(A;;CCLCSWRPLOCRRC;;;IU)`.
-     `reg query HKLM\SYSTEM\CurrentControlSet\Services\GlanceService /v PreshutdownTimeout` → `0x1388`.
-   - `%ProgramData%\Glance\service.log` exists, starts with "Glance service ... starting as NT AUTHORITY\SYSTEM", "Display pipe ready",
-     "Sensors ready (n)". Its folder: owner SYSTEM or Administrators, Users read only.
-3. **Fresh install** (on a PC or VM without Glance): same checks; the display stays dark until you sign in.
-4. **Before sign-in:** restart the PC and wait at the sign-in screen. Expect: the display is dark; `service.log` shows the service started
-   (after sign-in, check the time stamps). Sign in: the tray app starts and your theme appears.
-5. **Sensors without the editor:** close the editor. The tray menu says "Glance service: running, showing session N ...", the theme
-   shows CPU temperature and fans. Open the editor: the bottom bar says "Sensors: Glance service (n)".
-6. **Editor:** Send to display while the tray app runs → live edits appear (through the tray app). Exit the tray app (Background
-   service > Stop the tray app) and Send again → the editor draws through the service directly. Display off → black.
-7. **Background service window:** Stop the service → one UAC prompt for Windows' `sc.exe`, display goes black, sensors
-   drop to basic. Start the service → no prompt, sensors come back. Setup check rows say the same.
-8. **AIDA64:** pause the tray app (tray menu > Pause display) and stop sending in the editor; after about 20 s AIDA64 can open the display.
-9. **Sleep:** with the theme showing, Start > Power > Sleep. Expect black before the PC sleeps; after wake the theme returns within a few
-   seconds. `service.log`: "Windows Suspend: BlankAndHold", "Windows Resume: Reopen".
-10. **Shutdown and restart:** with the theme showing, shut down (and separately, restart). Expect the display black before the PC turns
-    off. `service.log` after the next start: "Glance service stopping (SessionEnding)", "Display: Blanked". Try once with Fast Startup on
-    (default) and once off.
-11. **Sign-out and fast user switching:** sign out → display black ("Session N left the console"). With two accounts, switch user:
-    the second user's tray app takes over; the first user's tray menu says "Another user is at the console".
-12. **Squatting (optional, as a normal user):** `sc stop GlanceService` (admin), then as a normal user run a small program that creates a
-    pipe named `Glance.Service.Display`; the tray app must not send it frames (its status says it uses USB directly or fails), and
-    `sc start GlanceService` logs that the display pipe could not be created and keeps retrying.
-13. **Uninstall:** Settings > Apps > Glance > Uninstall. Expect: display black, `sc query GlanceService` → 1060 (does not exist), no tray
-    app, no Startup shortcut, `%ProgramData%\Glance` gone (or only other files left), `%AppData%\Glance` kept.
+   - **What you see:**
+     - There is no folder page (Glance always goes to Program Files).
+     - The display goes black when setup starts (the old runner got `EXIT`).
+     - Your theme comes back on the display within a few seconds.
+     - The editor shows the full CPU sensors.
+   - **The old task is gone:** `schtasks /Query /TN "Glance Runner"` says it cannot find it.
+   - **Nothing is elevated:** in Task Manager > Details, the "Elevated" column is **No** for `Glance.Runner.exe` and `Glance.App.exe`.
+   - **The service is registered as designed:**
+     - `sc qc GlanceService`: `START_TYPE AUTO_START`, `SERVICE_START_NAME LocalSystem`, and `BINARY_PATH_NAME` in quotes.
+     - `sc qfailure GlanceService`: three restart actions.
+     - `sc sdshow GlanceService` contains `(A;;CCLCSWRPLOCRRC;;;IU)`.
+     - *review:* `sc qprivs GlanceService` lists only `SeChangeNotifyPrivilege` and `SeCreateGlobalPrivilege`.
+     - *review:* `sc qsidtype GlanceService` says `UNRESTRICTED`.
+     - *review:* `Get-Process Glance.Service -IncludeUserName` (elevated PowerShell) shows `NT AUTHORITY\SYSTEM` and `SessionId` 0.
+   - *review:* **The program folder is locked:** `icacls "C:\Program Files\Glance"` shows only SYSTEM and Administrators with full
+     control, and Users and All Application Packages with read and execute (RX). There is no inherited entry, and the owner is
+     Administrators.
+   - **The service log:** `%ProgramData%\Glance\service.log` exists. It starts with "Glance service ... starting as
+     NT AUTHORITY\SYSTEM", then *review:* "Pre-shutdown timeout: 5000 ms", then "Display pipe ready" and "Sensors ready (n)". Its
+     folder is owned by SYSTEM or Administrators, and Users may only read it.
+3. *review:* **H1 end-to-end (the proof this change exists for).** As the normal user:
+   - Run `setx CORECLR_ENABLE_PROFILING 1`, `setx CORECLR_PROFILER {11111111-1111-1111-1111-111111111111}` and
+     `setx CORECLR_PROFILER_PATH C:\does-not-exist\p.dll`, then sign out and back in.
+   - Expect: the tray app and the editor (user processes) log ".NET Runtime" "profiler failed to load" events in Event Viewer >
+     Application. That is harmless, and it proves the variables reach user processes.
+   - Expect: **no** such event for `Glance.Service.exe`, after `sc stop`/`sc start` from an elevated prompt or after a reboot.
+   - Process Explorer > `Glance.Service.exe` > Environment shows no `CORECLR_` variables.
+   - Afterwards, remove all three with `reg delete HKCU\Environment /v <name> /f`.
+4. *review:* **Install-folder guard:**
+   - Run the setup on a test PC: there is no folder page.
+   - On a 0.1.1 install in a custom folder: the upgrade installs into Program Files, not the old folder.
+   - As an administrator, loosen the rules on purpose, for example
+     `icacls "C:\Program Files\Glance" /grant *S-1-5-32-545:(OI)(CI)M`, then `sc stop GlanceService` and `sc start GlanceService`.
+     Expect the start to fail with "Access is denied" (error 5), and "The Glance service does not run from ..." in `service.log` and in
+     Event Viewer > Application (source "Glance").
+   - Repair the folder by running the setup again.
+5. **Fresh install** (on a PC or VM without Glance): the same checks as in step 2; the display stays dark until you sign in.
+6. **Before sign-in:** restart the PC and wait at the sign-in screen.
+   - The display is dark.
+   - After you sign in, the time stamps in `service.log` show that the service started before you signed in.
+   - When you sign in, the tray app starts and your theme appears.
+7. **Sensors without the editor:** close the editor.
+   - The tray menu says "Glance service: running, showing session N ...".
+   - The theme shows CPU temperature and fans.
+   - Open the editor: the bottom bar says "Sensors: Glance service (n)".
+   - *review (L7, M4):* also check the GPU sensors (NVIDIA/AMD/Intel), motherboard fans and voltages, and the drive sensors. If any are
+     missing with the service, compare with Glance 0.1.1 and report `sc qprivs GlanceService` and `service.log`.
+8. **Editor:**
+   - Send to display while the tray app runs: live edits appear (through the tray app).
+   - Exit the tray app (Background service > Stop the tray app) and Send again: the editor draws through the service directly.
+   - Display off: the display goes black.
+9. **Background service window:**
+   - Stop the service: one UAC prompt for Windows' `sc.exe`, the display goes black and the sensors drop to basic.
+   - Start the service: no prompt, the sensors come back.
+   - The setup check rows say the same.
+10. **AIDA64:** pause the tray app (tray menu > Pause display) and stop sending in the editor. After about 20 s, AIDA64 can open the display.
+11. **Sleep:** with the theme showing, Start > Power > Sleep.
+    - The display is black before the PC sleeps. After wake, the theme returns within a few seconds.
+    - `service.log` shows "Windows Suspend: BlankAndHold" and "Windows Resume: Reopen".
+    - *review:* repeat it 5 times while a video theme plays, so the suspend arrives during a transfer. The display must be black every
+      time before the PC sleeps (`service.log` may say "Blanked the display right after the transfer that held it").
+12. **Shutdown and restart:** with the theme showing, shut down, and separately restart.
+    - The display is black before the PC turns off.
+    - `service.log` after the next start shows "Glance service stopping (SessionEnding)" and "Display: Blanked".
+    - Try once with Fast Startup on (the default) and once with it off.
+13. **Sign-out and fast user switching:**
+    - Sign out: the display goes black ("Session N left the console").
+    - With two accounts, switch user: the second user's tray app takes over, and the first user's tray menu says "Another user is at
+      the console".
+14. *review:* **Standard-user rights.** As the standard account:
+    - `sc stop GlanceService` → "Access is denied".
+    - `sc start GlanceService`, after an admin stopped it → it starts.
+    - `sc config GlanceService binPath= x` → "Access is denied".
+    - `sc sdshow GlanceService` → the SDDL from `ServiceNames.ServiceSddl`.
+15. *review:* **Squatting:**
+    - As an admin, run `sc stop GlanceService`.
+    - As the standard user, in PowerShell:
+      `$p = New-Object System.IO.Pipes.NamedPipeServerStream('Glance.Sensors','InOut',254); $q = New-Object System.IO.Pipes.NamedPipeServerStream('Glance.Service.Display','InOut',254)`
+    - As the admin, run `sc start GlanceService`.
+    - Expect: `service.log` says both names are taken by another program (once a minute at most), and the tray app does not use the
+      squatted pipes. Within about 10 s of closing that PowerShell, the service serves both pipes, the tray app hands the display to
+      the service, and the full sensors come back.
+16. *review:* **Connection exhaustion (M2):**
+    - While the console user's tray app shows the theme, sign in the standard user with fast user switching.
+    - As that user, run a script that opens 8 `NamedPipeClientStream('.', 'Glance.Service.Display')` connections and keeps them open.
+    - Switch back. Expect: the tray app keeps working, the connections beyond 4 are closed at once and the rest after 30 s, and
+      `service.log` does not grow every second.
+17. *review:* **Leftover task (M3):**
+    - As an admin, re-create a 0.1-style task with `RunLevel` Highest pointing at `C:\Program Files\Glance\Glance.Runner.exe`, and sign in
+      again.
+    - Expect: the task is gone after the next service start, with "Removed Glance 0.1's "Glance Runner" sign-in task" in `service.log`.
+    - If the task still starts the tray app first: `runner.log` says it started with administrator rights and starts again with normal
+      rights, and Task Manager shows the running tray app with "Elevated" = No.
+18. *review:* **Pre-shutdown value (L5):** right after install, without a reboot, `service.log` shows "Pre-shutdown timeout: 5000 ms".
+19. **Uninstall:** Settings > Apps > Glance > Uninstall.
+    - The display goes black.
+    - `sc query GlanceService` → 1060 (does not exist).
+    - There is no tray app and no Startup shortcut.
+    - `%ProgramData%\Glance` is gone, or only other files are left.
+    - `%AppData%\Glance` is kept.

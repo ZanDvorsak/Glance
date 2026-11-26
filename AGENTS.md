@@ -74,7 +74,7 @@ Glance.Service (LocalSystem, Windows service, session 0; environment from the Se
   power/session: PRESHUTDOWN, POWEREVENT, SESSIONCHANGE -> ServiceControlMap -> DisplayPowerPolicy
 
 Glance.Runner (tray, normal user, one per session)          Glance.App (editor, normal user)
-  reads %AppData%\Glance, renders the theme (DisplayPusher)    RunnerClient --pipe "Glance.Runner.Control.<session>"--> tray
+  reads %AppData%\Glance, renders the theme (DisplayPusher)    RunnerClient --pipe "Glance.Runner.Control.<session>.<sid>"--> tray
   serves the control pipe for this session's editor           draws itself through DisplayConnector when no tray runs
 ```
 
@@ -83,31 +83,52 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
   `DisplayConnector.Open()` (used by `DisplayPusher`'s public constructor) picks the service, or USB directly when there is no service.
   Keep it that way: anything that makes SYSTEM parse user files brings back the class of bug the service exists to remove.
 - **Who may draw:** only a client in the active console session (`DisplayAccess`, per request; session from `GetNamedPipeClientSessionId`).
-  `STATUS` is open to any connected client. There is no `EXIT` or file command on the service pipe; stopping goes through the SCM.
+  Clients that came through the network redirector (also `\localhost`) are closed before a byte is read (`NativeSessions.IsRemoteClient`).
+  `STATUS` is open to any connected client, but other sessions only learn "display in use/released" and the power state. There is no
+  `EXIT` or file command on the service pipe; stopping goes through the SCM.
 - **Pipe rules** (`ServicePipeSecurity`, tested): deny NETWORK; the server account full control; Administrators and INTERACTIVE read/write
-  only (no `CreateNewInstance`, `ChangePermissions`, `TakeOwnership`). Clients check the server end's owner (`PipeServerCheck`: SYSTEM or
-  Administrators, so a squatter is never sent a frame or believed) and connect at `TokenImpersonationLevel.Anonymous` so no server can act
-  as them. The tray's control pipe is per session, current-user only, and its client uses `PipeOptions.CurrentUserOnly` + Anonymous.
+  only (no `CreateNewInstance`, `ChangePermissions`, `TakeOwnership`). Every server (display, sensors, tray control) creates its pipes
+  through `ServicePipeFactory`: the first instance with `FirstPipeInstance` (a squatter's name is refused, never joined) and every instance
+  checked to be owned by this account. Clients check the server end's owner (`PipeServerCheck`: SYSTEM or Administrators, so a squatter is
+  never sent a frame or believed) and connect at `TokenImpersonationLevel.Anonymous` so no server can act as them. The tray's control pipe
+  is `Glance.Runner.Control.<session>.<user SID>`, current-user only, NETWORK denied; its client uses `ControlPipeClient.Options`
+  (`CurrentUserOnly`) + Anonymous.
 - **Display server behaviour** (`DisplayServer`, tested over real pipes with `FakeDisplay`): opens the device on the first frame and applies
   the last brightness; `BLANK` blanks and releases at once; 20 s without a frame blanks and releases (clients refresh every 10 s), so
   AIDA64 can take the display when no Glance client draws; a USB error is returned to the client and closes the device; sign-out or
-  console disconnect of the drawing session blanks at once; a power event that finds the device busy is paid by the next request or tick.
-- **Sensors:** LibreHardwareMonitor (needs admin + the PawnIO driver for CPU/motherboard data) runs in the service. `SensorHub` (Core) in
-  the tray and the editor prefers the service's feed and falls back to basic local sensors; the feed counts as gone after 5 s without data.
-  Drive-space sensors come from `DriveSensors`.
+  console disconnect of the drawing session blanks at once; a power event that finds the device busy is paid by the transfer holding it,
+  right after it ends. At most 4 connections per session and 16 in all; a connection silent for 30 s is closed. Repeated log lines go
+  through `LogLimiter` (once a minute).
+- **Connector rule** (`DisplayConnector`, tested): the service when it answers; USB directly only when the service is not installed or is
+  stopped. A running or starting service that does not answer yet is retried, never bypassed, and the tray hands a USB display back to
+  the service once it answers (`DisplayPusher.ViaService`).
+- **Sensors:** LibreHardwareMonitor (needs admin + the PawnIO driver for CPU/motherboard data) runs in the service. The sensor pipe is
+  created first and serves `[]` until it is ready. `SensorHub` (Core) in the tray and the editor prefers the service's feed and falls back
+  to basic local sensors; the feed counts as gone after 5 s without data. Drive-space sensors come from `DriveSensors`.
 - **Tray control pipe commands** (one line each, reply `OK ...`): `STATUS`, `RELOAD`, `PAUSE`, `RESUME`, `EXIT`, `NEXT`, `PREV`, `PAGE <n>`
   (0 releases), `BRIGHTNESS <0-7>`, `LIVE <base64 folder> <base64 theme json>` (show the editor's unsaved theme; `-` for no folder),
   `LIVE_CLEAR`. Build and parse them only with `Glance.Core.Control.ControlCommand` (shared by both sides and tested).
 - Single tray app per session (mutex `Local\Glance.Runner`). It starts at sign-in from a shortcut in the common Startup folder (installer
-  option). There is no scheduled task any more; the editor's Background service window only offers to remove Glance 0.1's leftover
-  "Glance Runner" task (`schtasks /Delete` through UAC).
+  option). There is no scheduled task any more. A leftover Glance 0.1 "Glance Runner" task would start the tray elevated: the tray then
+  relaunches itself with normal rights or refuses (`TrayStart`, tested), the service deletes the task at every start (`LegacyTask`), the
+  installer deletes and checks it, and the editor's Background service window offers to remove it.
 - **Service control:** `ServiceControl` (Core) queries and starts the service without elevation (the installer's service DACL,
   `ServiceNames.ServiceSddl`, gives interactive users "start"); stopping runs Windows' `sc.exe stop GlanceService` through one UAC prompt.
 - **Service entry:** `Glance.Service/NativeService.cs` uses `StartServiceCtrlDispatcher`/`RegisterServiceCtrlHandlerEx` directly because
-  `ServiceBase` cannot accept pre-shutdown. Power events are handled synchronously in the handler (bounded); stop and pre-shutdown report
-  stop-pending, blank on a worker and report stopped. `--console` runs the same code in a console (elevated prompt) for development.
-- **Service log:** `%ProgramData%\Glance\service.log`, only written when `FolderTrust.CheckFolder` says the folder is admin-only (the service
-  creates it with a protected DACL). The tray app logs to `%AppData%\Glance\runner.log` as the user.
+  `ServiceBase` cannot accept pre-shutdown. `Main` first calls `SetDefaultDllDirectories(System32 | app dir)`; `ServiceMain` then opens the
+  log, checks its own folder (`ServiceStartGuard` + `FolderTrust.CheckExecutable(..., FolderTree)`) and refuses to run from a folder anyone
+  else can change. Power events are handled synchronously in the handler (bounded); stop and pre-shutdown report stop-pending, blank on a
+  worker and report stopped. It sets its pre-shutdown timeout with `ChangeServiceConfig2W` at start. `--console` exists in debug builds only.
+- **Service privileges:** `sc sidtype unrestricted` and only `ServiceNames.RequiredPrivileges` (`SeChangeNotifyPrivilege`, `SeCreateGlobalPrivilege`).
+  If a sensor needs more, add it there and in the installer, and say which sensor.
+- **Install folder:** always Program Files (`DisableDirPage`), and the installer resets its rules with `icacls` (SYSTEM/Administrators
+  change, users read and run) before it registers the service.
+- **Service log:** `%ProgramData%\Glance\service.log` (rolls to `service.old.log` at 1 MiB), opened only by the service itself and only
+  written when `FolderTrust.CheckFolder` says the folder is admin-only (the service creates it with a protected DACL); otherwise the reason
+  goes to the Application event log (source "Glance"). The tray app logs to `%AppData%\Glance\runner.log` as the user.
+- **Native DLLs:** `Glance.Core` imports by name from System32 only (`[assembly: DefaultDllImportSearchPaths(System32)]`; `libusb0.dll` lives there).
+- **Sibling programs:** `DevPaths.FindSibling` finds the editor or tray next to the running exe; only a development build (running from
+  `\bin\`) also searches the repository's build output, never above the folder with `Glance.sln`.
 - **Trust checks:** `Glance.Core.Security.FolderTrust` is the one engine for "may an elevated process start or trust this?"
   (owner and ACL allow-list, no links, fixed local drive, complete chain to the drive root). Use it, do not add another.
 - **No Glance process runs elevated with a user's environment** (review H6/H1). Nothing has `requireAdministrator` (a test checks every
@@ -183,7 +204,7 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
 ## Verifying changes
 
 ```powershell
-dotnet test src/Glance.Tests -c Release      # ~620 tests, about 10 seconds, no hardware or service needed
+dotnet test src/Glance.Tests -c Release      # ~610 tests, about 15 seconds, no hardware or service needed
 ```
 
 - `src/Glance.Tests` (xUnit) covers the hardware-free logic: page rotation, setup diagnoses, `.glance` import safety, undo,
@@ -215,7 +236,4 @@ dotnet test src/Glance.Tests -c Release      # ~620 tests, about 10 seconds, no 
 - The service has never been installed and run on a real PC by an agent (that needs admin rights and a real install); see the manual
   test plan in `docs/design/runner-service.md`. Before anyone signs in the display stays dark (decision for the user: an admin-chosen
   boot theme would need rendering in SYSTEM again).
-- `AutostartTask` (Core) still holds the 0.1 install-path helpers (`BuildXml`, `ParseArgs`, `VerifyRegistered`, ...) and their tests;
-  only `TaskName`/`RemoveStartInfo` are used now (to remove a leftover task). Delete the rest in a cleanup. `RunnerEnvironment`
-  (the H1 warning) is unused for the same reason.
 - **TODO:** make the live display a widget, so people without the hardware can still see their screen (for example docked in the editor or a small always-on-top window). The virtual display window already renders the theme with live sensors, so reuse that renderer.

@@ -266,6 +266,7 @@ public class ReviewFixTests
     {
         Assert.Equal(FakeFiles[2], Find(@"D:\repo\src\Glance.App\bin\Release\net8.0\"));
         Assert.Null(Find(@"C:\other\Glance.App\bin\Release\net8.0\"));   // a bin folder without a Glance repository above it
+        Assert.Null(Find(@"D:\repo\src\Glance.App\"));                      // inside a repository, but not a build output
     }
 
     // ---- N2, N4, N6, T1 ---------------------------------------------------------------------------------------------------
