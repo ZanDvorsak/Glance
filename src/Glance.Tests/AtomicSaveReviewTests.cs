@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text.Json;
@@ -22,19 +21,9 @@ public class AtomicSaveReviewTests
     private static string SettingsJson(string lastTheme, int brightness) =>
         JsonSerializer.Serialize(new AppSettings { LastTheme = lastTheme, Brightness = brightness });
 
-    /// <summary>Holds the file open on another thread for <paramref name="ms"/> milliseconds with the given sharing.</summary>
-    private static Task Hold(string path, int ms, FileShare share, FileAccess access = FileAccess.Read)
-    {
-        var opened = new ManualResetEventSlim();
-        var task = Task.Run(() =>
-        {
-            using var fs = new FileStream(path, FileMode.Open, access, share);
-            opened.Set();
-            Thread.Sleep(ms);
-        });
-        opened.Wait();
-        return task;
-    }
+    /// <summary>Opens the file as another program might, with the given sharing, until disposed.</summary>
+    private static FileStream Hold(string path, FileShare share, FileAccess access = FileAccess.Read) =>
+        new(path, FileMode.Open, access, share);
 
     private static string Stale(string path)
     {
@@ -54,9 +43,10 @@ public class AtomicSaveReviewTests
         File.WriteAllText(path, original);
         var log = new List<string>();
 
-        var holder = Hold(path, TestTiming.LongMs, FileShare.None, FileAccess.ReadWrite);
-        var read = AppSettings.Read(path, log.Add);
-        holder.Wait();
+        SettingsRead read;
+        using (Hold(path, FileShare.None, FileAccess.ReadWrite))   // locked for the whole read: the budget runs out
+        using (AtomicFile.UseClock(new FakeRetryClock()))
+            read = AppSettings.Read(path, log.Add);
 
         Assert.Equal(SettingsFileState.Unreadable, read.State);
 
@@ -85,8 +75,11 @@ public class AtomicSaveReviewTests
         var acl = info.GetAccessControl(); acl.AddAccessRule(deny); info.SetAccessControl(acl);
         try
         {
-            new Theme { Name = "two" }.Save(path);
+            var fake = new FakeRetryClock();
+            using (AtomicFile.UseClock(fake))
+                new Theme { Name = "two" }.Save(path);
 
+            Assert.Equal(0, fake.Waits);   // the failed copy is not waited for, and the swap works at once
             Assert.Equal("two", Theme.Load(path).Name);
             Assert.Equal(new[] { "theme.json" }, FilesIn(dir.Path));   // no backup, no temporary files
         }
@@ -105,6 +98,7 @@ public class AtomicSaveReviewTests
         var previous = File.ReadAllText(path);
 
         Exception ex;
+        using (AtomicFile.UseClock(new FakeRetryClock()))   // the swap is retried in virtual time
         using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
         {
             fs.Lock(0, 1);
@@ -129,9 +123,10 @@ public class AtomicSaveReviewTests
         File.SetAttributes(path, FileAttributes.ReadOnly);
         try
         {
-            var watch = Stopwatch.StartNew();
-            Assert.ThrowsAny<Exception>(() => new Theme { Name = "two" }.Save(path));
-            Assert.True(watch.ElapsedMilliseconds < TestTiming.AtOnceMs, $"took {watch.ElapsedMilliseconds} ms");
+            var fake = new FakeRetryClock();
+            using (AtomicFile.UseClock(fake))
+                Assert.ThrowsAny<Exception>(() => new Theme { Name = "two" }.Save(path));
+            Assert.Equal(0, fake.Waits);   // a read-only file is not waited for
             Assert.Equal("one", Theme.Load(path).Name);
         }
         finally { File.SetAttributes(path, FileAttributes.Normal); }
@@ -141,20 +136,27 @@ public class AtomicSaveReviewTests
     public void N6_a_read_does_not_wait_on_errors_that_are_not_sharing_or_lock_violations()
     {
         const int diskFull = unchecked((int)0x80070070);
-        var watch = Stopwatch.StartNew();
-        Assert.Throws<IOException>(() => AtomicFile.ReadWithRetry<int>(() => throw new IOException("disk full", diskFull)));
-        Assert.Throws<PathTooLongException>(() => AtomicFile.ReadWithRetry<int>(() => throw new PathTooLongException()));
-        Assert.Throws<UnauthorizedAccessException>(() => AtomicFile.ReadWithRetry<int>(() => throw new UnauthorizedAccessException()));
-        Assert.True(watch.ElapsedMilliseconds < TestTiming.AtOnceMs, $"took {watch.ElapsedMilliseconds} ms");
+        var fake = new FakeRetryClock();
+        using (AtomicFile.UseClock(fake))
+        {
+            Assert.Throws<IOException>(() => AtomicFile.ReadWithRetry<int>(() => throw new IOException("disk full", diskFull)));
+            Assert.Throws<PathTooLongException>(() => AtomicFile.ReadWithRetry<int>(() => throw new PathTooLongException()));
+            Assert.Throws<UnauthorizedAccessException>(() => AtomicFile.ReadWithRetry<int>(() => throw new UnauthorizedAccessException()));
+        }
+        Assert.Equal(0, fake.Waits);
     }
 
     [Fact]
     public void N6_a_read_still_waits_out_a_sharing_violation()
     {
         var calls = 0;
-        var value = AtomicFile.ReadWithRetry(() => ++calls < 3 ? throw new IOException("busy", unchecked((int)0x80070020)) : 42);
+        var fake = new FakeRetryClock();
+        int value;
+        using (AtomicFile.UseClock(fake))
+            value = AtomicFile.ReadWithRetry(() => ++calls < 3 ? throw new IOException("busy", unchecked((int)0x80070020)) : 42);
         Assert.Equal(42, value);
         Assert.Equal(3, calls);
+        Assert.Equal(2, fake.Waits);
     }
 
     // ---- L4: a handle that allows deleting no longer blocks the swap; a blocked settings save is reported ---------
@@ -166,11 +168,14 @@ public class AtomicSaveReviewTests
         var path = dir.Combine("settings.json");
         File.WriteAllText(path, SettingsJson("old", 1));
 
-        var holder = Hold(path, TestTiming.LongMs, FileShare.ReadWrite | FileShare.Delete);
-        var ok = new AppSettings { LastTheme = "new", Brightness = 2 }.TrySave(path);
-        holder.Wait();
+        var fake = new FakeRetryClock();
+        bool ok;
+        using (Hold(path, FileShare.ReadWrite | FileShare.Delete))   // open for the whole save
+        using (AtomicFile.UseClock(fake))
+            ok = new AppSettings { LastTheme = "new", Brightness = 2 }.TrySave(path);
 
         Assert.True(ok);
+        Assert.Equal(0, fake.Waits);   // the rename went through at the first try
         Assert.Equal("new", AppSettings.Load(path).LastTheme);
     }
 
@@ -181,10 +186,12 @@ public class AtomicSaveReviewTests
         var path = dir.Combine("theme.json");
         new Theme { Name = "one" }.Save(path);
 
-        var holder = Hold(path, TestTiming.LongMs, FileShare.ReadWrite | FileShare.Delete);
-        new Theme { Name = "two" }.Save(path);
-        holder.Wait();
+        var fake = new FakeRetryClock();
+        using (Hold(path, FileShare.ReadWrite | FileShare.Delete))   // open for the whole save
+        using (AtomicFile.UseClock(fake))
+            new Theme { Name = "two" }.Save(path);
 
+        Assert.Equal(0, fake.Waits);
         Assert.Equal("two", Theme.Load(path).Name);
         Assert.Equal("one", Theme.Load(path + ".bak").Name);
     }
@@ -198,10 +205,13 @@ public class AtomicSaveReviewTests
         File.WriteAllText(path, original);
         var log = new List<string>();
 
-        var holder = Hold(path, TestTiming.LongMs, FileShare.Read);   // no FILE_SHARE_DELETE: nothing can replace it
-        var ok = new AppSettings { LastTheme = "new" }.TrySave(path, log.Add);
-        holder.Wait();
+        var fake = new FakeRetryClock();
+        bool ok;
+        using (Hold(path, FileShare.Read))   // no FILE_SHARE_DELETE, held for the whole save: nothing can replace it
+        using (AtomicFile.UseClock(fake))
+            ok = new AppSettings { LastTheme = "new" }.TrySave(path, log.Add);
 
+        Assert.True(fake.Waits > 0);   // it waited for the file (in virtual time) before giving up
         Assert.False(ok);
         Assert.Equal(original, File.ReadAllText(path));
         Assert.Contains(log, m => m.Contains("not saved", StringComparison.OrdinalIgnoreCase) && m.Contains("settings.json"));
@@ -250,7 +260,9 @@ public class AtomicSaveReviewTests
         var path = dir.Combine("settings.json");
         File.WriteAllText(path, "{ \"LastTheme\": \"C:\\\\x");
 
-        var read = AppSettings.Read(path);
+        SettingsRead read;
+        using (AtomicFile.UseClock(new FakeRetryClock()))   // a syntax error is retried until the budget runs out
+            read = AppSettings.Read(path);
 
         Assert.Equal(SettingsFileState.Corrupt, read.State);
         Assert.NotNull(read.KeptAs);
@@ -270,15 +282,16 @@ public class AtomicSaveReviewTests
         File.WriteAllText(path, content);
         var log = new List<string>();
 
-        var watch = Stopwatch.StartNew();
-        var read = AppSettings.Read(path, log.Add);
-        watch.Stop();
+        var fake = new FakeRetryClock();
+        SettingsRead read;
+        using (AtomicFile.UseClock(fake))
+            read = AppSettings.Read(path, log.Add);
 
         Assert.Equal(SettingsFileState.WrongContent, read.State);
         Assert.Null(read.Settings.LastTheme);
         Assert.Equal(content, File.ReadAllText(read.KeptAs!));
         Assert.False(File.Exists(path));
-        Assert.True(watch.ElapsedMilliseconds < TestTiming.AtOnceMs, $"took {watch.ElapsedMilliseconds} ms");   // nothing to wait for
+        Assert.Equal(0, fake.Waits);   // nothing to wait for
         Assert.Contains(log, m => m.Contains("not Glance settings", StringComparison.OrdinalIgnoreCase));
     }
 
@@ -292,7 +305,9 @@ public class AtomicSaveReviewTests
         for (var i = 1; i <= 6; i++) File.WriteAllText($"{path}.corrupt-2020010{i}-000000", "old " + i);
         File.WriteAllText(path, "{ broken");
 
-        var read = AppSettings.Read(path);
+        SettingsRead read;
+        using (AtomicFile.UseClock(new FakeRetryClock()))
+            read = AppSettings.Read(path);
 
         var kept = Directory.GetFiles(dir.Path, "settings.json.corrupt-*").Select(f => Path.GetFileName(f)!).OrderBy(n => n, StringComparer.Ordinal).ToArray();
         Assert.Equal(5, kept.Length);
@@ -327,7 +342,9 @@ public class AtomicSaveReviewTests
         File.WriteAllText(path, "{ \"Name\": \"tw");   // damaged, for example by an older version or a hand edit
         var log = new List<string>();
 
-        var read = ThemeFile.Load(path, log.Add);
+        ThemeRead read;
+        using (AtomicFile.UseClock(new FakeRetryClock()))   // the damaged file is retried until the budget runs out
+            read = ThemeFile.Load(path, log.Add);
 
         Assert.True(read.FromBackup);
         Assert.Equal("one", read.Theme.Name);
@@ -342,7 +359,8 @@ public class AtomicSaveReviewTests
         using var dir = new TempDir();
         var path = dir.Combine("theme.json");
         File.WriteAllText(path, "{ \"Name\": \"tw");
-        Assert.ThrowsAny<JsonException>(() => ThemeFile.Load(path));
+        using (AtomicFile.UseClock(new FakeRetryClock()))
+            Assert.ThrowsAny<JsonException>(() => ThemeFile.Load(path));
     }
 
     [Fact]
@@ -368,8 +386,12 @@ public class AtomicSaveReviewTests
         using var dir = new TempDir();
         var path = dir.Combine("theme.json");
         new Theme { Name = "start" }.Save(path);
+        // real threads race here; a long budget (inherited by the reader task) means a busy machine can only slow this
+        // test down, never fail it. The assertions are about content, not timing.
+        using var clock = AtomicFile.UseClock(new LongBudgetClock());
 
         var stop = 0; var reads = 0; Exception? readerError = null;
+        using var firstRead = new ManualResetEventSlim();
         var reader = Task.Run(() =>
         {
             try
@@ -382,11 +404,14 @@ public class AtomicSaveReviewTests
                     Assert.False(read.FromBackup);                    // it never found theme.json damaged
                     Assert.StartsWith("s", read.Theme.Name);          // "start" or "save n": a whole file
                     reads++;
+                    firstRead.Set();
                     Thread.Sleep(2);
                 }
             }
             catch (Exception ex) { readerError = ex; }
+            finally { firstRead.Set(); }
         });
+        firstRead.Wait();   // the saves start only once the reader is running, however busy the machine is
         Exception? writerError = null;
         try
         {

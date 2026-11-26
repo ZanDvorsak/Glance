@@ -44,8 +44,10 @@ review"). The proof below is for the first version; the review fixes have their 
   On any failure before step 4 completes, the target is untouched, the temporary files are deleted, and the error is thrown.
 - With POSIX semantics, a program that holds the old file open **and allows deleting it** (`FILE_SHARE_DELETE`, common
   for indexers, sync and backup tools) no longer blocks the save; it keeps reading the old, now nameless, file. A handle
-  that does not allow deleting (for example `File.ReadAllText`) still blocks the rename.
-- Only errors that can clear by waiting are retried, for `RetryBudget` (one second; tests set 400 ms):
+  that does not allow deleting (for example `File.ReadAllText`, which `Theme.Load` uses) still blocks the rename;
+  `AppSettings.Read` opens settings.json with `FileShare.ReadWrite | FileShare.Delete`, so it never holds up a save.
+- Only errors that can clear by waiting are retried, for `RetryBudget` (one second). The loop asks a `RetryClock` whether
+  the budget is spent and how to wait; tests swap in a fake one for their own thread (`AtomicFile.UseClock`):
   - the rename: sharing and lock violations, and "access denied" unless the target is read-only (a file that another
     program holds open reports "access denied" to a rename; a read-only target says the same and fails at once);
   - `ReadWithRetry(Func<T>)`: sharing and lock violations (`HRESULT` `0x80070020`, `0x80070021`) and `JsonException`

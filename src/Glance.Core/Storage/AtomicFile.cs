@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -142,12 +141,32 @@ public static class AtomicFile
 
     private static T Retry<T>(Func<T> operation, Func<Exception, bool> worthRetrying)
     {
-        var watch = Stopwatch.StartNew();
+        var clock = ClockOverride.Value ?? RealClock;
+        var start = clock.Start();
         while (true)
         {
             try { return operation(); }
-            catch (Exception ex) when (worthRetrying(ex) && watch.Elapsed < RetryBudget) { Thread.Sleep(RetryDelay); }
+            catch (Exception ex) when (worthRetrying(ex) && !clock.Expired(start)) { clock.Wait(RetryDelay); }
         }
+    }
+
+    private static readonly RetryClock RealClock = new();
+    private static readonly AsyncLocal<RetryClock?> ClockOverride = new();
+
+    /// <summary>
+    /// Makes every retry on the calling thread (and tasks it starts) use <paramref name="clock"/> until the result is
+    /// disposed. For tests: a fake clock makes waiting deterministic. Other threads keep the real clock.
+    /// </summary>
+    internal static IDisposable UseClock(RetryClock clock)
+    {
+        var previous = ClockOverride.Value;
+        ClockOverride.Value = clock;
+        return new Restore(() => ClockOverride.Value = previous);
+    }
+
+    private sealed class Restore(Action undo) : IDisposable
+    {
+        public void Dispose() => undo();
     }
 
     private const int ErrorAccessDenied = 5, ErrorSharingViolation = 32, ErrorLockViolation = 33;

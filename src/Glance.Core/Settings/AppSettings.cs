@@ -90,7 +90,7 @@ public sealed class AppSettings
             // a syntax error is retried: another program may be halfway through writing the file in place
             text = AtomicFile.ReadWithRetry(() =>
             {
-                var t = File.ReadAllText(path);
+                var t = ReadSharingDelete(path);
                 using (JsonDocument.Parse(t)) { }
                 return t;
             });
@@ -120,6 +120,19 @@ public sealed class AppSettings
         {
             return Damaged(path, SettingsFileState.WrongContent, "it is valid JSON but not Glance settings: " + ex.Message, log);
         }
+    }
+
+    /// <summary>
+    /// Reads the whole file while allowing others to write, rename and replace it. With <see cref="AtomicFile"/>'s POSIX
+    /// rename, a save can then replace settings.json even while it is being read (the reader finishes the old, whole
+    /// file), so a reader can never hold up a save. <see cref="File.ReadAllText(string)"/> does not allow deleting, and a
+    /// reader that keeps reopening the file that way can starve a save.
+    /// </summary>
+    private static string ReadSharingDelete(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream, detectEncodingFromByteOrderMarks: true);
+        return reader.ReadToEnd();
     }
 
     public static AppSettings Load(Action<string>? log = null) => Read(log).Settings;

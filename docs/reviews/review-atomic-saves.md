@@ -359,3 +359,51 @@ found while writing it, both recorded in the test:
 - **xUnit1031** warnings (`Task.Wait` in tests): the tests wait on helper threads on purpose; left as they are.
 - Not verified: the editor and the runner were not started; nothing was tried with a real crash, a power cut, or a
   FAT/network target (only the `MoveFileEx` fallback path was exercised, by the mutation, on NTFS).
+
+### Flaky timing tests (found in a trial merge)
+
+In a trial merge with three other branches, `AtomicSaveTests.A_theme_read_of_a_half_written_file_waits_for_the_whole_file`
+failed once in 18 runs while the machine was busy. The cause: several of the new tests raced real `Thread.Sleep`
+calls (a writer finishing after 100 ms, a lock released after 100 ms) against the real retry budget (400 ms), or
+checked elapsed time ("fails within 200 ms").
+
+**Before** (commit `66dfde6`; 16 CPU-burning shell loops, then 4 rounds of 8 parallel
+`dotnet test --filter AtomicSave` = 32 runs): **23 of 32 runs failed**, 30 failures in 9 test cases (8 test methods):
+
+| Test | Failures | Message |
+|---|---|---|
+| `A_theme_reader_during_many_saves_never_sees_the_file_missing_or_partial` | 11 | writer: `IOException: Could not replace '...\theme.json': The process cannot access the file because it is being used by another process.` |
+| `A_settings_reader_during_writes_always_sees_a_whole_file_and_no_save_is_lost` | 7 | `Assert.Equal() Failure: Expected: 0, Actual: 1` (a read fell back to the defaults) |
+| `N2_valid_json_that_is_not_settings_...` (2 of the 4 cases) | 6 | `took 317 ms` |
+| `A_theme_read_of_a_half_written_file_waits_for_the_whole_file` | 2 | `JsonException: Expected start of a property name or value, but instead reached end of data` |
+| `Settings_being_rewritten_in_place_by_another_program_are_not_mistaken_for_corrupt` | 2 | `Expected: "C:\\themes\\mine\\theme.json", Actual: null` |
+| `A_theme_read_while_the_file_is_briefly_locked_succeeds` | 1 | `IOException: The process cannot access the file '...\theme.json'` |
+| `N6_a_read_does_not_wait_on_errors_that_are_not_sharing_or_lock_violations` | 1 | `took 230 ms` |
+
+**Fix** (test timing, plus one product change):
+- `AtomicFile`'s retry loop now asks an internal `RetryClock` whether the budget is spent and how to wait
+  (`src/Glance.Core/Storage/RetryClock.cs`; the real one is the system clock and `Thread.Sleep`, unchanged behaviour).
+  `AtomicFile.UseClock(clock)` replaces it for the calling thread and the tasks it starts (an `AsyncLocal`), so tests
+  running in parallel on other threads are not affected.
+- `FakeRetryClock` (in `src/Glance.Tests/TestTiming.cs`) moves virtual time instead of sleeping and calls a gate on
+  each wait. The tests that raced a delayed writer or lock now do the "other program's" step in that gate: the half-written
+  file is completed during the first wait, the exclusive lock (now opened on the test's own thread) is released during
+  the second. They assert the exact number of waits, so they test the same thing without depending on scheduling.
+  Running out the budget costs no real time.
+- Every check of elapsed time ("fails at once", "without waiting") is now `fake.Waits == 0`; holders that used to run
+  on a helper thread for 1.5 s are opened on the test's thread for the whole call.
+- The two tests where real threads must race (a reader during 200-300 saves) use `LongBudgetClock` (real time, 30 s
+  budget), and the saves start only after the reader's first read (a `ManualResetEventSlim` gate). What they assert
+  (never a missing or partial file, no lost save) does not depend on timing; a slow machine only makes them slower.
+- **Product change, found by this load test:** after the first round of fixes, 1 of 32 loaded runs still failed:
+  `A_settings_reader_during_writes_...`, with the save failing after the whole 30 s budget,
+  `UnauthorizedAccessException: Could not replace '...\settings.json': Access is denied.` The reader reopened
+  `settings.json` in a tight loop with `File.ReadAllText`, which does not allow deleting, so on a busy machine the
+  rename never found the file free. `AppSettings.Read` now opens the file with `FileShare.ReadWrite | FileShare.Delete`.
+  The POSIX rename can then replace it while it is being read (the reader finishes the old, whole file), so our own
+  settings reader can no longer starve a save. `Theme.Load` is out of scope for this branch and still uses
+  `File.ReadAllText`, so the theme reader test keeps its 2 ms pause between reads.
+
+**After** (same load harness, same 32 runs): **32 of 32 passed**. Without load: **30 runs in a row passed**.
+Full suite: **581 / 581** in four parallel runs under the same CPU load, and twice more without load (8 s each;
+`AtomicSave*` alone now takes 1-2 s instead of about 9 s).
