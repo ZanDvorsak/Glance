@@ -45,7 +45,7 @@ public sealed class SensorPipeServer : IDisposable
                 {
                     server = ServicePipeFactory.Create(_pipeName, PipeDirection.Out, 16, security, first: Volatile.Read(ref _instances) == 0);
                     Interlocked.Increment(ref _instances);
-                    await server.WaitForConnectionAsync(_cts.Token);
+                    await server.WaitForConnectionAsync(_cts.Token).ConfigureAwait(false);
                     _ = Serve(server);
                     server = null;
                 }
@@ -54,7 +54,7 @@ public sealed class SensorPipeServer : IDisposable
                 {
                     Release(server);
                     Log("Sensor pipe error: " + ex.Message);
-                    try { await Task.Delay(2000, _cts.Token); } catch (OperationCanceledException) { return; }
+                    try { await Task.Delay(2000, _cts.Token).ConfigureAwait(false); } catch (OperationCanceledException) { return; }
                 }
             }
         });
@@ -77,9 +77,9 @@ public sealed class SensorPipeServer : IDisposable
             {
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
                 timeout.CancelAfter(TimeSpan.FromSeconds(5)); // a client that does not read for 5 s is dropped
-                await writer.WriteLineAsync(_latest.AsMemory(), timeout.Token);
-                await writer.FlushAsync(timeout.Token);
-                await Task.Delay(1000, _cts.Token);
+                await writer.WriteLineAsync(_latest.AsMemory(), timeout.Token).ConfigureAwait(false);
+                await writer.FlushAsync(timeout.Token).ConfigureAwait(false);
+                await Task.Delay(1000, _cts.Token).ConfigureAwait(false);
             }
         }
         catch { /* client left or stalled */ }

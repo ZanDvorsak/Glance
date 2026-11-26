@@ -1,0 +1,6 @@
+is_global = true
+
+# Glance.Core is library code that the tray app (WinForms) and the editor (Avalonia) call from their UI threads, often
+# blocking on the result. An await that resumes on the caller's context then deadlocks: that left the display black in
+# Glance 0.2.0 (docs/design/fix-tray-deadlock.md). Every await here must say ConfigureAwait(false).
+dotnet_diagnostic.CA2007.severity = error
