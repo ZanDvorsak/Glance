@@ -120,6 +120,114 @@ public class ThemeModelTests
         Assert.Equal(dir.Combine("out", "assets", "bg.png"), Path.GetFullPath(back.ResolveAsset("assets/bg.png")!));
     }
 
+    private static string[] FilesIn(string folder) =>
+        Directory.Exists(folder) ? Directory.GetFiles(folder).Select(f => Path.GetFileName(f)!).OrderBy(f => f).ToArray() : Array.Empty<string>();
+
+    [Fact]
+    public void Save_as_to_another_folder_takes_every_image_video_and_font_along()
+    {
+        using var dir = new TempDir();
+        var a = dir.Combine("A");
+        Directory.CreateDirectory(Path.Combine(a, "assets"));
+        File.WriteAllBytes(Path.Combine(a, "assets", "bg.png"), new byte[] { 1, 2, 3 });
+        File.WriteAllBytes(Path.Combine(a, "assets", "clip.mp4"), new byte[] { 4, 5, 6, 7 });
+        File.WriteAllBytes(Path.Combine(a, "assets", "digits.ttf"), new byte[] { 8, 9 });
+        var outside = dir.Combine("elsewhere", "photo.jpg");
+        Directory.CreateDirectory(Path.GetDirectoryName(outside)!);
+        File.WriteAllBytes(outside, new byte[] { 10 });
+
+        var t = new Theme { Name = "t", BaseFolder = a };
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/bg.png" });
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Text, FontFile = "assets/digits.ttf" });
+        t.Pages.Add(new ThemePage { Name = "Second" });
+        t.Pages[1].Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/clip.mp4" });
+        t.Pages[1].Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = outside });
+        t.Pages[1].Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/bg.png" });   // used twice
+
+        var themeFile = dir.Combine("B", "theme.json");
+        t.Save(themeFile);
+
+        Assert.Equal(new[] { "bg.png", "clip.mp4", "digits.ttf", "photo.jpg" }, FilesIn(dir.Combine("B", "assets")));
+        var back = Theme.Load(themeFile);
+        var used = back.Pages.SelectMany(p => p.Widgets)
+            .SelectMany(w => new[] { w.ImagePath, w.FontFile }).Where(p => !string.IsNullOrEmpty(p)).ToList();
+        Assert.Equal(5, used.Count);
+        Assert.All(used, p =>
+        {
+            Assert.False(Path.IsPathRooted(p));
+            var file = Path.GetFullPath(back.ResolveAsset(p)!);
+            Assert.StartsWith(dir.Combine("B") + Path.DirectorySeparatorChar, file);   // in the new folder, not the old one
+            Assert.True(File.Exists(file), file);
+        });
+        Assert.Equal(new byte[] { 1, 2, 3 }, File.ReadAllBytes(back.ResolveAsset(back.Pages[0].Widgets[0].ImagePath)!));
+        Assert.Equal(new byte[] { 8, 9 }, File.ReadAllBytes(back.ResolveAsset(back.Pages[0].Widgets[1].FontFile)!));
+        Assert.Equal(new byte[] { 4, 5, 6, 7 }, File.ReadAllBytes(back.ResolveAsset(back.Pages[1].Widgets[0].ImagePath)!));
+        Assert.Equal(new byte[] { 10 }, File.ReadAllBytes(back.ResolveAsset(back.Pages[1].Widgets[1].ImagePath)!));
+        Assert.Equal(new[] { "bg.png", "clip.mp4", "digits.ttf" }, FilesIn(Path.Combine(a, "assets")));   // the old folder is left alone
+    }
+
+    [Fact]
+    public void Save_as_keeps_two_different_files_with_the_same_name_apart()
+    {
+        using var dir = new TempDir();
+        var a = dir.Combine("A");
+        Directory.CreateDirectory(Path.Combine(a, "assets"));
+        File.WriteAllBytes(Path.Combine(a, "assets", "pic.png"), new byte[] { 1 });
+        var other = dir.Combine("elsewhere", "pic.png");
+        Directory.CreateDirectory(Path.GetDirectoryName(other)!);
+        File.WriteAllBytes(other, new byte[] { 2, 2 });
+
+        var t = new Theme { BaseFolder = a };
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/pic.png" });
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = other });
+        t.Save(dir.Combine("B", "theme.json"));
+
+        Assert.NotEqual(t.Widgets[0].ImagePath, t.Widgets[1].ImagePath);
+        Assert.Equal(new byte[] { 1 }, File.ReadAllBytes(t.ResolveAsset(t.Widgets[0].ImagePath)!));
+        Assert.Equal(new byte[] { 2, 2 }, File.ReadAllBytes(t.ResolveAsset(t.Widgets[1].ImagePath)!));
+    }
+
+    [Fact]
+    public void Saving_again_to_the_same_folder_copies_nothing_extra()
+    {
+        using var dir = new TempDir();
+        var a = dir.Combine("A");
+        Directory.CreateDirectory(Path.Combine(a, "assets"));
+        File.WriteAllBytes(Path.Combine(a, "assets", "bg.png"), new byte[] { 1, 2, 3 });
+        Directory.CreateDirectory(Path.Combine(a, "assets", "fonts"));
+        File.WriteAllBytes(Path.Combine(a, "assets", "fonts", "digits.ttf"), new byte[] { 8, 9 });
+
+        var t = new Theme { BaseFolder = a + Path.DirectorySeparatorChar };   // a trailing slash is still the same folder
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/bg.png" });
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Text, FontFile = "assets/fonts/digits.ttf" });   // the theme's own layout is kept
+        var themeFile = Path.Combine(a, "theme.json");
+        t.Save(themeFile);
+        Theme.Load(themeFile).Save(themeFile);
+
+        Assert.Equal(new[] { "bg.png" }, FilesIn(Path.Combine(a, "assets")));
+        Assert.Equal(new[] { "digits.ttf" }, FilesIn(Path.Combine(a, "assets", "fonts")));
+        Assert.Equal(new[] { "theme.json" }, FilesIn(a));
+        Assert.Equal("assets/bg.png", t.Widgets[0].ImagePath);
+        Assert.Equal("assets/fonts/digits.ttf", t.Widgets[1].FontFile);
+    }
+
+    [Fact]
+    public void Save_as_leaves_missing_files_as_they_are()
+    {
+        using var dir = new TempDir();
+        var gone = dir.Combine("elsewhere", "gone.png");
+        var t = new Theme { BaseFolder = dir.Combine("A") };
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = "assets/missing.png" });
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Image, ImagePath = gone });
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Text, FontFile = "assets/missing.ttf" });
+
+        t.Save(dir.Combine("B", "theme.json"));
+
+        Assert.Equal(("assets/missing.png", gone, "assets/missing.ttf"), (t.Widgets[0].ImagePath, t.Widgets[1].ImagePath, t.Widgets[2].FontFile));
+        Assert.False(Directory.Exists(dir.Combine("B", "assets")));
+        Assert.True(File.Exists(dir.Combine("B", "theme.json")));
+    }
+
     [Fact]
     public void Clone_makes_an_independent_widget_with_a_new_id()
     {

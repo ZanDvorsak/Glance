@@ -59,24 +59,33 @@ public partial class Theme : ObservableObject
         return t;
     }
 
-    /// <summary>Saves the theme and copies any absolute-path images into an assets folder next to it.</summary>
+    /// <summary>
+    /// Saves the theme and copies the files it uses (images, videos, fonts) into an assets folder next to it.
+    /// Absolute paths are always copied; relative paths are copied too when the theme moves to another folder
+    /// (Save As), so the new copy never points at files that are only in the old folder.
+    /// </summary>
     public void Save(string path)
     {
         var dir = Path.GetDirectoryName(Path.GetFullPath(path))!;
         Directory.CreateDirectory(dir);
         var assets = Path.Combine(dir, "assets");
+        var sameFolder = BaseFolder is not null && SameFolder(BaseFolder, dir);
 
-        // returns the relative path to store, or the original when it is not an existing absolute file
+        // returns the relative path to store, or the original when the file cannot be found
         string Adopt(string path)
         {
-            if (string.IsNullOrEmpty(path) || !Path.IsPathRooted(path) || !File.Exists(path)) return path;
+            if (string.IsNullOrEmpty(path)) return path;
+            var rooted = Path.IsPathRooted(path);
+            if (!rooted && sameFolder) return path;          // already next to the theme
+            var source = rooted ? path : ResolveAsset(path); // relative paths belong to the old folder
+            if (source is null || !File.Exists(source)) return path;
             Directory.CreateDirectory(assets);
-            var name = Path.GetFileName(path);
+            var name = Path.GetFileName(source);
             var dest = Path.Combine(assets, name);
             var n = 1;
-            while (File.Exists(dest) && new FileInfo(dest).Length != new FileInfo(path).Length)
+            while (File.Exists(dest) && new FileInfo(dest).Length != new FileInfo(source).Length)
                 dest = Path.Combine(assets, $"{Path.GetFileNameWithoutExtension(name)}_{n++}{Path.GetExtension(name)}");
-            if (!File.Exists(dest)) File.Copy(path, dest);
+            if (!File.Exists(dest)) File.Copy(source, dest);
             return "assets/" + Path.GetFileName(dest);
         }
         foreach (var w in Pages.SelectMany(p => p.Widgets))
@@ -86,6 +95,12 @@ public partial class Theme : ObservableObject
         }
         BaseFolder = dir;
         File.WriteAllText(path, JsonSerializer.Serialize(this, Json));
+    }
+
+    private static bool SameFolder(string a, string b)
+    {
+        static string Norm(string p) => Path.GetFullPath(p).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return string.Equals(Norm(a), Norm(b), StringComparison.OrdinalIgnoreCase);   // Windows paths are case-insensitive
     }
 
     /// <summary>The whole theme as JSON, used by undo/redo and live preview.</summary>
