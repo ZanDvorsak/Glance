@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using CommunityToolkit.Mvvm.ComponentModel;
+using Glance.Core.Storage;
 
 namespace Glance.Core.Themes;
 
@@ -83,7 +84,6 @@ public partial class Theme : ObservableObject
         var sameFolder = BaseFolder is not null && SameFolder(BaseFolder, dir);
         var created = new List<string>();
         var adopted = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // source file -> stored path
-        var temp = target + ".saving";   // not *.json, so the runner's watcher ignores it until it is renamed
 
         // returns the relative path to store, or the stored value as it is when the file cannot be found
         string Adopt(string stored)
@@ -115,8 +115,8 @@ public partial class Theme : ObservableObject
             var copy = JsonSerializer.Deserialize<Theme>(ToSnapshot(), Json)!;
             var copyWidgets = copy.Pages.SelectMany(p => p.Widgets).ToList();
             for (var i = 0; i < updates.Count; i++) { copyWidgets[i].ImagePath = updates[i].Image; copyWidgets[i].FontFile = updates[i].Font; }
-            File.WriteAllText(temp, JsonSerializer.Serialize(copy, Json));
-            File.Move(temp, target, overwrite: true);
+            // all or nothing, flushed to disk, and the replaced file is kept as theme.json.bak (see AtomicFile)
+            AtomicFile.WriteAllText(target, JsonSerializer.Serialize(copy, Json), keepBackup: true);
 
             // 3) everything is on disk: now change the open theme
             for (var i = 0; i < updates.Count; i++) { widgets[i].ImagePath = updates[i].Image; widgets[i].FontFile = updates[i].Font; }
@@ -126,7 +126,6 @@ public partial class Theme : ObservableObject
         }
         catch
         {
-            TryDelete(temp);
             foreach (var f in created) TryDelete(f);
             if (!assetsExisted) try { Directory.Delete(assets); } catch { /* not empty or gone: leave it */ }
             throw;

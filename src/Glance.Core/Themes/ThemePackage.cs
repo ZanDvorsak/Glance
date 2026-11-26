@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Text;
+using Glance.Core.Storage;
 
 namespace Glance.Core.Themes;
 
@@ -22,8 +23,15 @@ public static class ThemePackage
         var copy = new Theme { BaseFolder = theme.BaseFolder };
         copy.ApplySnapshot(theme.ToSnapshot());
 
-        if (File.Exists(destination)) File.Delete(destination);
-        using var zip = ZipFile.Open(destination, ZipArchiveMode.Create);
+        AtomicFile.Write(destination, stream =>
+        {
+            using var zip = new ZipArchive(stream, ZipArchiveMode.Create, leaveOpen: true);
+            WriteEntries(copy, zip);
+        });
+    }
+
+    private static void WriteEntries(Theme copy, ZipArchive zip)
+    {
         var used = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // source file -> entry name
         var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
