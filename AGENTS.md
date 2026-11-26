@@ -198,7 +198,12 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
 - PowerShell 5.1 quirks: no `&&`; here-string terminators must start at column 0; avoid nested quotes inside `$(...)` in one-liners.
 - Elevation: only the service has administrator rights (LocalSystem, environment from the SCM). The tray app and the editor are `asInvoker`
   and must never run elevated (the installer starts them with `runasoriginaluser`). Never add a `requireAdministrator` manifest (a test fails).
-- Do not block the UI thread with USB, process or registry work (setup checks run in `Task.Run`).
+- Do not block the UI thread (editor or tray app) with USB, pipe, process, registry or big-file work (review M7,
+  `docs/design/fix-ui-thread.md`). Display open/close goes through a `SerialWork` (Core, ordered, never on the caller's thread);
+  file work through `Task.Run` (Save through `ThemeSaveJob`); slow yes/no checks through `BackgroundProbe`. Mark blocking helpers
+  `[WorkerThread]`. `UiThreadAuditTests` scans `Glance.App` and `Glance.Runner` for known blocking calls on the UI thread: add a
+  rule for a new blocking API, and give any call that must stay synchronous a `// ui-thread-ok: reason` comment. Avalonia
+  controls refuse other threads: read them on the UI thread before handing work over.
 - Rendering races: the editor mutates the theme while a pusher renders it; renderers catch `InvalidOperationException` and retry next frame.
 
 ## Verifying changes

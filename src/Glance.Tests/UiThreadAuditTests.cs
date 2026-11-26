@@ -37,6 +37,8 @@ public class UiThreadAuditTests
         new("image-read", Editor, @"SKData\.Create\(", "reads a whole picture file"),
         new("ffmpeg-search", Editor, @"Ffmpeg\.Find\(", "searches PATH and the winget folders (every 5 s while FFmpeg is missing)"),
         new("folder-delete", Editor, @"Directory\.Delete\(", "deletes a whole folder tree"),
+        // SetupWindow's _context is MainWindow.CurrentSetupContext ([WorkerThread]) handed over as a delegate, which the scanner cannot follow
+        new("setup-context", Editor, @"\b_context\(\)","the setup context asks the Service Control Manager and lists every process"),
 
         new("tray-display-open", Tray, @"new DisplayPusher\(", "opens the service pipe or the USB device"),
         new("tray-display-stop", Tray, @"\.Stop\(\s*blank", "waits for the display loop to stop: up to 18 s with a stuck transfer"),

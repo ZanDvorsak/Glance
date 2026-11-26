@@ -266,8 +266,9 @@ public class UiThreadTests
 
             _out.WriteLine($"direct save: UI held {before.TotalMilliseconds:0} ms; ThemeSaveJob: {after.TotalMilliseconds:0} ms");
             // copying 300 MB takes ~0.1-1 s depending on the disk; the point is that it lands on the UI thread
-            Assert.True(before > after + TimeSpan.FromMilliseconds(50), $"direct {before.TotalMilliseconds:0} ms was not slow; the test proves nothing");
-            Assert.True(after < Responsive, $"the UI thread was held {after.TotalMilliseconds:0} ms");
+            Assert.True(before > TimeSpan.FromMilliseconds(50), $"direct {before.TotalMilliseconds:0} ms was not slow; the test proves nothing");
+            // relative as well as absolute: on a fast disk the whole copy can fit in the 150 ms bound, so also require a small fraction of it
+            Assert.True(after < Responsive && after * 4 < before, $"the UI thread was held {after.TotalMilliseconds:0} ms (direct: {before.TotalMilliseconds:0} ms)");
             // same result as the direct save: the video was adopted into the new folder
             Assert.Equal("assets/big.mp4", live.Widgets.Last().ImagePath);
             Assert.Equal(Path.Combine(root, "b"), live.BaseFolder);
