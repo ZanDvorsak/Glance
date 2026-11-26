@@ -70,7 +70,7 @@ public sealed class ServiceWindow : Window
         timer.Tick += async (_, _) => await Refresh();
         timer.Start();
         Closed += (_, _) => timer.Stop();
-        Show(ServiceState.Unknown, null, RunnerClient.IsRunning);
+        Show(ServiceState.Unknown, null, RunnerClient.Presence == TrayState.Answering);
         _ = Refresh();
         _ = CheckOldTask();
     }
@@ -84,7 +84,7 @@ public sealed class ServiceWindow : Window
             var (state, status, tray) = await Task.Run(() =>
             {
                 var s = ServiceControl.Query();
-                return (s, s == ServiceState.Running ? DisplayConnector.ServiceStatus() : null, RunnerClient.IsRunning);
+                return (s, s == ServiceState.Running ? DisplayConnector.ServiceStatus() : null, RunnerClient.Probe() == TrayState.Answering);   // M13: a round trip, not a process name
             });
             Show(state, status, tray);
         }

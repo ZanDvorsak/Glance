@@ -33,7 +33,6 @@ internal sealed class RunnerContext : ApplicationContext
     private readonly ToolStripMenuItem _serviceItem = new("Glance service: checking...") { Enabled = false };
     private volatile string _serviceText = "checking...";
     private int _serviceCheckRunning;
-    private readonly CancellationTokenSource _cts = new();
     private readonly System.Windows.Forms.Timer _supervisor = new() { Interval = 2000 };
     private readonly System.Windows.Forms.Timer _reloadDebounce = new() { Interval = 700 };
     private readonly List<FileSystemWatcher> _watchers = new();
@@ -45,17 +44,16 @@ internal sealed class RunnerContext : ApplicationContext
     private AppSettings _settings;
     private DateTime? _rereadSettingsAt;  // settings.json was locked when last read: read it again then (review L1)
     private Theme _theme = Theme.CreateDefault(null);
-    private Theme? _live;                 // unsaved theme streamed from the editor
+    private TrayControlServer? _control;    // the editor talks to us here
     private DisplayPusher? _pusher;
     private DisplayPusher? _closingPusher;  // stopped, but a stuck transfer still holds the device
     private string? _loggedRenderError;     // each distinct theme error is logged once, not every frame
     private DateTime? _failingSince;
     private string? _lastError;
     private bool _paused;
-    private int? _pinPage;
     private int _brightness;
 
-    private Theme Current => _live ?? _theme;
+    private Theme Current => _liveState.Live ?? _theme;
 
     public RunnerContext()
     {
@@ -93,7 +91,7 @@ internal sealed class RunnerContext : ApplicationContext
         Supervise();
 
         WatchFiles();
-        _ = Task.Run(ControlLoop);
+        _control = StartControlServer();
         _powerWatcher = StartPowerWatcher();
         _supervisor.Tick += (_, _) => HealStuckSleep();
         _supervisor.Tick += (_, _) => { RereadLockedSettings(); CheckService(); };
@@ -182,6 +180,7 @@ internal sealed class RunnerContext : ApplicationContext
     {
         lock (_gate)
         {
+            ExpireLive();   // M5: an editor that went away without LIVE_CLEAR does not leave its unsaved theme behind
             // checked before the dead-loop restart below: a dead pusher is never replaced while asleep or after a session end (M2)
             if (!_power.MayDrive) { PayOwedBlank(); DisposePusher(blank: true, DisplayPusher.QuickStopTimeout); SetStatus(_power.Ended ? "Display off: Windows is ending the session" : "Display off while Windows sleeps"); return; }
             if (_paused) { DisposePusher(); SetStatus("Display paused"); return; }
@@ -192,7 +191,7 @@ internal sealed class RunnerContext : ApplicationContext
                 else
                 {
                     _closingPusher = null;
-                    try { _pusher = new DisplayPusher(() => Current, _sensors, _brightness) { PinnedPage = _pinPage }; _failingSince = null; _lastError = null; Log("Display opened"); }
+                    try { _pusher = new DisplayPusher(() => Current, _sensors, _brightness) { PinnedPage = _liveState.PinnedPage }; _failingSince = null; _lastError = null; Log("Display opened"); }
                     catch (Exception ex) { _lastError = ex.Message; }
                     // Windows may have started a shutdown or sleep while it opened (the power event does not wait behind this lock)
                     if (_pusher is not null && !_power.MayDrive)
@@ -223,7 +222,7 @@ internal sealed class RunnerContext : ApplicationContext
             SetStatus(_pusher is null
                 ? "Waiting for the display: " + (_lastError ?? "not found")
                 : _pusher.LastRenderError is { } drawError ? "Could not draw the theme: " + drawError
-                : _live is not null ? $"Live preview from the editor, {_pusher.Fps:0.0} fps" : $"Showing \"{_theme.Name}\"{(Current.Pages.Count > 1 ? $" (page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count})" : "")}, {_pusher.Fps:0.0} fps");
+                : _liveState.Live is not null ? $"Live preview from the editor, {_pusher.Fps:0.0} fps" : $"Showing \"{_theme.Name}\"{(Current.Pages.Count > 1 ? $" (page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count})" : "")}, {_pusher.Fps:0.0} fps");
         }
     }
 
@@ -364,61 +363,37 @@ internal sealed class RunnerContext : ApplicationContext
 
     // ---- control pipe (from the editor) -------------------------------------------------------------------------
 
-    private int _controlInstances;   // live instances of our control pipe; 0 means the name must be claimed (first instance) again
-    private readonly LogLimiter _controlLog = new(TimeSpan.FromMinutes(1));
+    /// <summary>
+    /// Under <see cref="_gate"/>: the editor's live theme and page pin. The live theme is leased to the connection that sent it
+    /// (review M5), see <see cref="TrayLiveState"/>.
+    /// </summary>
+    private readonly TrayLiveState _liveState = new();
 
-    private async Task ControlLoop()
+    private TrayControlServer StartControlServer() => new(ControlPipeName, Execute, OnControlClosed, Log);
+
+    /// <summary>Under <see cref="_gate"/>: hands the page pin to the running display loop.</summary>
+    private void ApplyPin()
     {
-        var security = ServicePipeSecurity.CurrentUserOnly();   // the editor runs as the same user; nobody else (and no network logon) may connect
-        while (!_cts.IsCancellationRequested)
-        {
-            NamedPipeServerStream? server = null;
-            try
-            {
-                // L8: claim the name with the first-instance flag, so another user who took it first is refused, not joined
-                server = ServicePipeFactory.Create(ControlPipeName, PipeDirection.InOut, 4, security, first: Volatile.Read(ref _controlInstances) == 0);
-                Interlocked.Increment(ref _controlInstances);
-                await server.WaitForConnectionAsync(_cts.Token);
-                var connected = server;
-                server = null;
-                _ = Task.Run(() => Handle(connected));
-            }
-            catch (OperationCanceledException) { ReleaseControl(server); return; }
-            catch (Exception ex)
-            {
-                ReleaseControl(server);
-                if (_controlLog.Filter("Control pipe error: " + ex.Message) is { } line) Log(line);   // not once a second for ever
-                try { await Task.Delay(2000, _cts.Token); } catch { return; }
-            }
-        }
+        if (_pusher is not null) _pusher.PinnedPage = _liveState.PinnedPage;
     }
 
-    private void ReleaseControl(NamedPipeServerStream? pipe)
+    /// <summary>A control connection ended; if it held the live theme, show the saved theme again.</summary>
+    private void OnControlClosed(long connection)
     {
-        if (pipe is null) return;
-        try { pipe.Dispose(); } catch { /* best effort */ }
-        Interlocked.Decrement(ref _controlInstances);
+        bool ended;
+        lock (_gate) { ended = _liveState.ConnectionClosed(connection); if (ended) ApplyPin(); }
+        if (ended) Log("The editor's live preview ended (its connection closed); showing the saved theme");
     }
 
-    private async Task Handle(NamedPipeServerStream pipe)
+    /// <summary>Supervisor tick, under <see cref="_gate"/>: a live theme nobody keeps alive any more ends.</summary>
+    private void ExpireLive()
     {
-        try
-        {
-            if (NativeSessions.IsRemoteClient(pipe)) return;   // L1: never from another PC, not even through \localhost
-            using var reader = new StreamReader(pipe, Encoding.UTF8, false, 1024, leaveOpen: true);
-            using var writer = new StreamWriter(pipe, new UTF8Encoding(false), 1024, leaveOpen: true) { AutoFlush = true };
-            while (await reader.ReadLineAsync(_cts.Token) is { } line)
-            {
-                string reply;
-                try { reply = Execute(line.Trim()); } catch (Exception ex) { reply = "ERR " + ex.Message; }
-                await writer.WriteLineAsync(reply);
-            }
-        }
-        catch { /* client left */ }
-        finally { ReleaseControl(pipe); }
+        if (!_liveState.Expire()) return;
+        ApplyPin();
+        Log("The editor's live preview ended (no word from the editor); showing the saved theme");
     }
 
-    private string Execute(string line)
+    private string Execute(string line, long connection)
     {
         // parsing and the wire format live in Glance.Core (ControlCommand) so the editor and tests share them
         if (!ControlCommand.TryParse(line, out var cmd, out var error)) return "ERR " + error;
@@ -427,30 +402,32 @@ internal sealed class RunnerContext : ApplicationContext
             case ControlVerb.Status:
             {
                 string pg;
-                lock (_gate) pg = _pusher is null ? "no display" : $"page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count}, pinned={(_pusher.PinnedPage is { } p ? (p + 1).ToString() : "no")}, autoRotate={Current.AutoRotate}, live={_live is not null}";
+                lock (_gate)
+                {
+                    _liveState.Handle(cmd, connection);   // counts as a sign of life from the editor
+                    pg = _pusher is null ? "no display" : $"page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count}, pinned={(_pusher.PinnedPage is { } p ? (p + 1).ToString() : "no")}, autoRotate={Current.AutoRotate}, live={_liveState.Live is not null}";
+                }
                 return "OK " + _statusItem.Text + " | " + pg;
             }
             case ControlVerb.Reload: _ui.BeginInvoke(Reload); return "OK";
             case ControlVerb.Next: lock (_gate) _pusher?.NextPage(); return "OK";
             case ControlVerb.Prev: lock (_gate) _pusher?.PrevPage(); return "OK";
-            case ControlVerb.Page:   // PAGE <n> pins the display to page n (1-based); PAGE 0 releases it
-                lock (_gate) { _pinPage = cmd.Number > 0 ? cmd.Number - 1 : null; if (_pusher is not null) _pusher.PinnedPage = _pinPage; }
-                return "OK";
             case ControlVerb.Pause: _ui.BeginInvoke(() => SetPaused(true)); return "OK";
             case ControlVerb.Resume: _ui.BeginInvoke(() => SetPaused(false)); return "OK";
             case ControlVerb.Exit: _ui.BeginInvoke(Quit); return "OK";
             case ControlVerb.Brightness:
                 lock (_gate) { _brightness = Math.Clamp(cmd.Number, 0, 7); _pusher?.SetBrightness(_brightness); }
                 return "OK";
-            case ControlVerb.Live:
-            {
-                // LIVE <base64 folder> <base64 theme json>: show the editor's unsaved theme until LIVE_CLEAR
-                var t = new Theme { BaseFolder = cmd.Folder };
-                t.ApplySnapshot(cmd.ThemeJson!);
-                lock (_gate) _live = t;
-                return "OK";
-            }
-            case ControlVerb.LiveClear: lock (_gate) { _live = null; _pinPage = null; if (_pusher is not null) _pusher.PinnedPage = null; } return "OK";
+            case ControlVerb.Page:        // PAGE <n> pins the display to page n (1-based); PAGE 0 releases it
+            case ControlVerb.Live:        // LIVE <base64 folder> <base64 theme json>: show the editor's unsaved theme
+            case ControlVerb.LiveKeep:    // the editor is still there
+            case ControlVerb.LiveClear:   // back to the saved theme, pin released
+                lock (_gate)
+                {
+                    var reply = _liveState.Handle(cmd, connection) ?? "ERR unknown command";
+                    ApplyPin();
+                    return reply;
+                }
             default: return "ERR unknown command";
         }
     }
@@ -472,7 +449,7 @@ internal sealed class RunnerContext : ApplicationContext
         if (_quitting) return;   // a session end and the EXIT command can both ask
         _quitting = true;
         Log("Tray app exiting");
-        _cts.Cancel();
+        _control?.Dispose();
         _supervisor.Stop();
         foreach (var w in _watchers) w.Dispose();
         lock (_gate)
