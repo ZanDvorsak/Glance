@@ -6,7 +6,8 @@ namespace Glance.Core.Sensors;
 /// </summary>
 public sealed class LocalSensorSource : ISensorSource, IDisposable
 {
-    private readonly SensorService _service = new();
+    private readonly SensorService _service;
+    private readonly Func<List<SensorInfo>> _readDrives;
     private readonly CancellationTokenSource _cts = new();
     private volatile IReadOnlyList<SensorInfo> _merged = Array.Empty<SensorInfo>();
     private List<SensorInfo> _drives = new();
@@ -20,8 +21,13 @@ public sealed class LocalSensorSource : ISensorSource, IDisposable
 
     public event Action? Updated;
 
-    public LocalSensorSource()
+    public LocalSensorSource() : this(new SensorService(), DriveSensors.Read) { }
+
+    /// <summary>Tests: a fake <paramref name="service"/> and drive list, so no real sensor is read.</summary>
+    internal LocalSensorSource(SensorService service, Func<List<SensorInfo>> readDrives)
     {
+        _service = service;
+        _readDrives = readDrives;
         _service.Update();
         Merge();
         _ = Task.Run(async () =>
@@ -36,7 +42,7 @@ public sealed class LocalSensorSource : ISensorSource, IDisposable
 
     private void Merge()
     {
-        if (Environment.TickCount64 - _drivesAt > 5000) { _drives = DriveSensors.Read(); _drivesAt = Environment.TickCount64; }
+        if (Environment.TickCount64 - _drivesAt > 5000) { _drives = _readDrives(); _drivesAt = Environment.TickCount64; }
         _merged = _service.Snapshot.Concat(_drives).ToList();
     }
 

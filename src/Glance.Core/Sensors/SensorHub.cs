@@ -15,11 +15,20 @@ public sealed class SensorHub : ISensorSource, IDisposable
     private volatile IReadOnlyList<SensorInfo> _merged = Array.Empty<SensorInfo>();
     private List<SensorInfo> _drives = new();
     private long _drivesAt;
+    private readonly Func<SensorService> _openLocal;
+    private readonly Func<List<SensorInfo>> _readDrives;
+    private readonly TimeSpan _firstWait;
 
     /// <param name="pipe">Tests pass their own client; the default reads <see cref="PipeSensorClient.PipeName"/> from the service.</param>
-    public SensorHub(PipeSensorClient? pipe = null)
+    public SensorHub(PipeSensorClient? pipe = null) : this(pipe, () => new SensorService(), DriveSensors.Read, TimeSpan.FromMilliseconds(1500)) { }
+
+    /// <summary>Tests: fake local sensors and drives (no real sensor is read), and a shorter wait for the service's feed.</summary>
+    internal SensorHub(PipeSensorClient? pipe, Func<SensorService> openLocal, Func<List<SensorInfo>> readDrives, TimeSpan firstWait)
     {
         _pipe = pipe ?? new PipeSensorClient();
+        _openLocal = openLocal;
+        _readDrives = readDrives;
+        _firstWait = firstWait;
         Task.Run(LocalLoop);
     }
 
@@ -37,7 +46,7 @@ public sealed class SensorHub : ISensorSource, IDisposable
     private void Merge()
     {
         var baseList = _pipe.HasData ? _pipe.Snapshot : _local?.Snapshot ?? Array.Empty<SensorInfo>();
-        if (Environment.TickCount64 - _drivesAt > 5000) { _drives = DriveSensors.Read(); _drivesAt = Environment.TickCount64; }
+        if (Environment.TickCount64 - _drivesAt > 5000) { _drives = _readDrives(); _drivesAt = Environment.TickCount64; }
         _merged = baseList.Concat(_drives).ToList();
     }
 
@@ -46,7 +55,7 @@ public sealed class SensorHub : ISensorSource, IDisposable
         try
         {
             _ = Task.Run(async () => { while (!_cts.IsCancellationRequested) { Merge(); try { await Task.Delay(500, _cts.Token); } catch { return; } } });
-            await Task.Delay(1500, _cts.Token); // give the service's feed a moment to arrive first
+            await Task.Delay(_firstWait, _cts.Token); // give the service's feed a moment to arrive first
             while (!_cts.IsCancellationRequested)
             {
                 if (_pipe.HasData)
@@ -55,7 +64,7 @@ public sealed class SensorHub : ISensorSource, IDisposable
                 }
                 else
                 {
-                    _local ??= new SensorService();
+                    _local ??= _openLocal();
                     _local.Update();
                 }
                 await Task.Delay(1000, _cts.Token);
