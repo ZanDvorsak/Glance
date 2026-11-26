@@ -13,12 +13,13 @@ namespace Glance.Tests;
 /// <para>A "crash mid-write" is simulated by a byte-range lock on the target file: a write in place truncates the
 /// file and then fails on the lock, exactly what a crash or power cut after the truncation leaves.</para>
 /// </summary>
+[System.Runtime.Versioning.SupportedOSPlatform("windows")]   // file locks and ACLs
 public class AtomicSaveTests
 {
     private static readonly string[] NoFiles = Array.Empty<string>();
 
     private static string[] FilesIn(string folder) =>
-        Directory.Exists(folder) ? Directory.GetFiles(folder).Select(Path.GetFileName).OrderBy(n => n, StringComparer.Ordinal).ToArray()! : NoFiles;
+        Directory.Exists(folder) ? Directory.GetFiles(folder).Select(f => Path.GetFileName(f)!).OrderBy(n => n, StringComparer.Ordinal).ToArray() : NoFiles;
 
     private static string SettingsJson(string lastTheme, int brightness) =>
         JsonSerializer.Serialize(new AppSettings { LastTheme = lastTheme, Brightness = brightness });

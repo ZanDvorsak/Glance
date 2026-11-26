@@ -57,7 +57,10 @@ public sealed class MainWindow : Window
         new("Full HD monitor · 1920 × 1080", 1920, 1080),
     };
 
-    private readonly AppSettings _settings = AppSettings.Load();
+    // What reading settings.json found. Settings that stand in for an unreadable file refuse to be saved (review M1).
+    private readonly SettingsRead _settingsRead = AppSettings.Read();
+    private AppSettings _settings => _settingsRead.Settings;
+    private string? _startupNote;   // shown in the status bar once the window is open (damaged settings or theme)
     private readonly SensorHub _hub = new();
     private readonly ThemeRenderer _renderer = new();
     private readonly PropertiesPanel _props = new();
@@ -155,6 +158,8 @@ public sealed class MainWindow : Window
             if (startArgs.Contains("--gallery")) OpenGallery();
             if (startArgs.Contains("--service")) new ServiceWindow().Show(this);
             if (startArgs.Contains("--virtual")) OpenVirtualDisplay();
+            var note = string.Join("  ", new[] { _settingsRead.Problem, _startupNote }.Where(s => s is not null));
+            if (note.Length > 0) _status.Text = note;
             try { await MaybeShowSetupOnFirstRunAsync(); } catch { /* never block startup */ }
         };
 
@@ -622,17 +627,33 @@ public sealed class MainWindow : Window
             {
                 var path = fileArg.EndsWith(ThemePackage.Extension, StringComparison.OrdinalIgnoreCase) ? ImportPackage(fileArg) : fileArg;
                 _themePath = path;
-                return AppTheme.Load(path);
+                return ReadThemeNoting(path);
             }
             catch { _themePath = null; /* fall through to the usual start-up theme */ }
         }
 
         if (_settings.LastTheme is { } p && File.Exists(p))
         {
-            try { _themePath = p; return AppTheme.Load(p); } catch { _themePath = null; }
+            try { _themePath = p; return ReadThemeNoting(p); } catch { _themePath = null; }
         }
         return AppTheme.CreateDefault(FindStarterBackground());
     }
+
+    /// <summary>
+    /// Reads a theme file; a damaged one falls back to its backup from the save before (review L7). The theme keeps
+    /// the real file's path, so the next save repairs it, and the user is told in the status bar.
+    /// </summary>
+    private AppTheme ReadThemeNoting(string path)
+    {
+        var read = ThemeFile.Load(path);
+        if (read.FromBackup) _startupNote = read.Problem;
+        return read.Theme;
+    }
+
+    /// <summary>Said after a save when the settings (the last theme, brightness) could not be saved with it.</summary>
+    private string SettingsNotSavedNote() => _settingsRead.State == SettingsFileState.Unreadable
+        ? "  Settings were not saved: they could not be read when Glance started, and saving would replace them with the defaults."
+        : "  Settings could not be saved (see glance.log in " + AppSettings.Folder + ").";
 
     private static string? FindStarterBackground()
     {
@@ -790,7 +811,8 @@ public sealed class MainWindow : Window
         try
         {
             if (path.EndsWith(ThemePackage.Extension, StringComparison.OrdinalIgnoreCase)) path = ImportPackage(path);   // a shared theme: unpack it first
-            SetTheme(AppTheme.Load(path), path); _settings.LastTheme = path; _status.Text = "Opened " + path;
+            var read = ThemeFile.Load(path);
+            SetTheme(read.Theme, path); _settings.LastTheme = path; _status.Text = read.Problem ?? "Opened " + path;
         }
         catch (Exception ex) { _status.Text = "Could not open theme: " + ex.Message; }
     }
@@ -815,9 +837,11 @@ public sealed class MainWindow : Window
             var moved = _theme.Save(path);
             _undo.AfterSave(_theme.ToSnapshot(), moved);   // a plain save is not an undo step; a move to another folder clears the history
             UpdateUndoButtons();
-            _themePath = path; _settings.LastTheme = path; _settings.Save();
+            _themePath = path; _settings.LastTheme = path;
+            var settingsSaved = _settings.Save();
             _renderer.ClearImageCache();
-            _status.Text = "Saved " + path + (moved ? " (undo history cleared: the theme now lives in a new folder)" : "");
+            _status.Text = "Saved " + path + (moved ? " (undo history cleared: the theme now lives in a new folder)" : "")
+                           + (settingsSaved ? "" : SettingsNotSavedNote());
         }
         catch (Exception ex) { _status.Text = "Save failed: " + ex.Message; }
     }
@@ -848,8 +872,9 @@ public sealed class MainWindow : Window
             var themeFile = Path.Combine(folder, "theme.json");
             res.Theme.Save(themeFile);
             SetTheme(res.Theme, themeFile);
-            _settings.LastTheme = themeFile; _settings.Save();
-            _status.Text = $"Imported {Path.GetFileName(path)} - saved to {folder}";
+            _settings.LastTheme = themeFile;
+            var settingsSaved = _settings.Save();
+            _status.Text = $"Imported {Path.GetFileName(path)} - saved to {folder}" + (settingsSaved ? "" : SettingsNotSavedNote());
         }
         catch (Exception ex) { _status.Text = "Import failed: " + ex.Message; }
         finally { try { if (Directory.Exists(temp)) Directory.Delete(temp, true); } catch { } }

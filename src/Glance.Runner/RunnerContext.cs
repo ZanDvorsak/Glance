@@ -8,7 +8,6 @@ using Glance.Core.Control;
 using Glance.Core.Display;
 using Glance.Core.Sensors;
 using Glance.Core.Settings;
-using Glance.Core.Storage;
 using Glance.Core.Themes;
 using Glance.Core.Usb;
 
@@ -38,7 +37,8 @@ internal sealed class RunnerContext : ApplicationContext
     private bool _quitting;
     private volatile bool _blankOwed;     // a power event found the display busy; blank it when the UI thread lets go
 
-    private AppSettings _settings = AppSettings.Load(Log);
+    private AppSettings _settings;
+    private DateTime? _rereadSettingsAt;  // settings.json was locked when last read: read it again then (review L1)
     private Theme _theme = Theme.CreateDefault(null);
     private Theme? _live;                 // unsaved theme streamed from the editor
     private DisplayPusher? _pusher;
@@ -63,8 +63,11 @@ internal sealed class RunnerContext : ApplicationContext
         _pipeServer.Publish(_sensors.HardwareSnapshot);
         _sensors.Updated += () => _pipeServer.Publish(_sensors.HardwareSnapshot);
 
+        var read = AppSettings.Read(Log);
+        _settings = read.Settings;
+        NoteSettingsRead(read);
         _brightness = _settings.Brightness;
-        LoadTheme();
+        _theme = ReadTheme(_settings.LastTheme);
 
         _pauseItem.Click += (_, _) => SetPaused(!_paused);
         var menu = new ContextMenuStrip();
@@ -90,33 +93,53 @@ internal sealed class RunnerContext : ApplicationContext
         _ = Task.Run(ControlLoop);
         _powerWatcher = StartPowerWatcher();
         _supervisor.Tick += (_, _) => HealStuckSleep();
+        _supervisor.Tick += (_, _) => RereadLockedSettings();
     }
 
     // ---- theme / settings ---------------------------------------------------------------------------------------
 
-    private void LoadTheme()
+    /// <summary>Reads a theme file (a damaged one falls back to its backup); the starter layout when there is none or it fails.</summary>
+    private static Theme ReadTheme(string? p)
     {
         try
         {
-            var p = _settings.LastTheme;
-            _theme = p is not null && File.Exists(p) ? AtomicFile.ReadWithRetry(() => Theme.Load(p)) : Theme.CreateDefault(null);
-            Log(p is not null && File.Exists(p) ? "Loaded theme " + p : "No saved theme yet; showing the starter layout");
+            if (p is null || !File.Exists(p)) { Log("No saved theme yet; showing the starter layout"); return Theme.CreateDefault(null); }
+            var read = ThemeFile.Load(p, Log);   // logs when it had to use theme.json.bak
+            if (!read.FromBackup) Log("Loaded theme " + p);
+            return read.Theme;
         }
-        catch (Exception ex) { Log("Theme load failed: " + ex.Message); _theme = Theme.CreateDefault(null); }
+        catch (Exception ex) { Log("Theme load failed: " + ex.Message); return Theme.CreateDefault(null); }
+    }
+
+    /// <summary>A locked settings file is read again in 10 s instead of waiting for the next file change (review L1).</summary>
+    private void NoteSettingsRead(SettingsRead read)
+    {
+        _rereadSettingsAt = read.State == SettingsFileState.Unreadable ? DateTime.UtcNow.AddSeconds(10) : null;
+        if (_rereadSettingsAt is not null) Log("Settings could not be read; trying again in 10 s");
+    }
+
+    private void RereadLockedSettings()
+    {
+        if (_rereadSettingsAt is { } at && DateTime.UtcNow >= at) Reload();
     }
 
     /// <summary>Re-read settings and the theme, then restart the display so changed images are picked up.</summary>
     private void Reload()
     {
+        // read the files before taking the lock: a busy file can take up to a second, and a power event must not wait behind it (review L3)
+        var read = AppSettings.Read(Log);
+        // a settings file that cannot be read right now keeps the settings already in use (never the defaults)
+        var settings = read.State == SettingsFileState.Unreadable ? _settings : read.Settings;
+        var theme = ReadTheme(settings.LastTheme);
         lock (_gate)
         {
-            // a settings file that cannot be read right now keeps the settings already in use (never the defaults)
-            if (AppSettings.TryLoad(out var fresh, Log)) _settings = fresh;
+            _settings = settings;
             _brightness = _settings.Brightness;
-            LoadTheme();
+            _theme = theme;
             RewatchThemeFolder();
             DisposePusher(blank: false);
         }
+        NoteSettingsRead(read);
         Supervise();
     }
 

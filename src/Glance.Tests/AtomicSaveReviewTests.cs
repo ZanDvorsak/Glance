@@ -13,6 +13,7 @@ namespace Glance.Tests;
 /// The findings of the independent review of the atomic-saves branch (docs/reviews/review-atomic-saves.md).
 /// Each test names the finding it proves. Waits use <see cref="TestTiming"/> (the retry budget is 400 ms in tests).
 /// </summary>
+[System.Runtime.Versioning.SupportedOSPlatform("windows")]   // file locks and ACLs
 public class AtomicSaveReviewTests
 {
     private static string[] FilesIn(string folder) =>

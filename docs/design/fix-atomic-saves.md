@@ -23,46 +23,77 @@ How it went wrong:
 
 ## The fix
 
+This section describes the code after the review fixes (`docs/reviews/review-atomic-saves.md`, section "Fixes after
+review"). The proof below is for the first version; the review fixes have their own proof in the review file.
+
 ### `Glance.Core.Storage.AtomicFile` (new, the one helper)
 
 - `Write(path, Action<Stream>, keepBackup)` / `WriteAllText(path, text, keepBackup)`:
-  1. write to `<name>.<random>.tmp` in the same folder (`FileMode.CreateNew`), then `Flush(flushToDisk: true)`;
-  2. with `keepBackup` and an existing file: copy it to `<name>.bak.<random>.tmp` (a copy, so the target keeps its
-     whole content until the end);
-  3. `File.Move(temp, target, overwrite: true)`: a rename on the same NTFS volume, all or nothing;
-  4. rename the backup copy to `<name>.bak` (one copy; a failure here does not fail the save, the save already happened).
-  On any failure before step 3 the target is untouched, both temporary files are deleted, and the error is thrown.
-- Temporary names end in `.tmp` and the backup in `.bak`, so the runner's `*.json` watcher only sees the final rename.
-- The rename and the backup copy are retried for about one second while the file is busy (a reader, an indexer or
-  a virus scanner has it open; the rename then reports a sharing violation or "access denied").
-- `ReadWithRetry(Func<T>)`: retries for about one second on busy files (`IOException` other than file/folder not found,
-  `UnauthorizedAccessException`) and on `JsonException` (another program is halfway through writing the file in place).
-  A missing file fails at once.
+  1. delete temporary files of this name left by a crash (`<name>.<32 hex>.tmp`, `<name>.bak.<32 hex>.tmp`) that are
+     older than an hour (`CleanUpStale`; a younger one may belong to a save running in another process);
+  2. with `keepBackup` and an existing file: copy it to `<name>.bak.<32 hex>.tmp`, **best effort**: one try, no waiting,
+     and if it fails (the old file cannot be read, the disk is full) the save goes ahead without a backup;
+  3. write to `<name>.<32 hex>.tmp` in the same folder (created new, opened with the DELETE right), then
+     `Flush(flushToDisk: true)`;
+  4. rename it over the target **through its own handle with POSIX semantics** (`SetFileInformationByHandle`,
+     `FileRenameInfoEx`, `FILE_RENAME_FLAG_POSIX_SEMANTICS | FILE_RENAME_FLAG_REPLACE_IF_EXISTS`), then flush the handle
+     again so the rename reaches the disk soon. Where Windows or the file system does not support that (before
+     Windows 10 1709, FAT, some network shares: `ERROR_INVALID_PARAMETER`, `ERROR_NOT_SUPPORTED`,
+     `ERROR_INVALID_FUNCTION`), fall back to `MoveFileEx(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`;
+  5. rename the backup copy to `<name>.bak` (one copy; a failure here does not fail the save, the save already happened).
+  On any failure before step 4 completes, the target is untouched, the temporary files are deleted, and the error is thrown.
+- With POSIX semantics, a program that holds the old file open **and allows deleting it** (`FILE_SHARE_DELETE`, common
+  for indexers, sync and backup tools) no longer blocks the save; it keeps reading the old, now nameless, file. A handle
+  that does not allow deleting (for example `File.ReadAllText`) still blocks the rename.
+- Only errors that can clear by waiting are retried, for `RetryBudget` (one second; tests set 400 ms):
+  - the rename: sharing and lock violations, and "access denied" unless the target is read-only (a file that another
+    program holds open reports "access denied" to a rename; a read-only target says the same and fails at once);
+  - `ReadWithRetry(Func<T>)`: sharing and lock violations (`HRESULT` `0x80070020`, `0x80070021`) and `JsonException`
+    (another program is halfway through writing the file in place). A missing file, "access denied", disk full or a path
+    that is too long fail at once.
+- Temporary names end in `.tmp`, the backup in `.bak`, kept-aside settings in `.corrupt-<time>`, so the runner's
+  `*.json` watcher does not see them. One save raises a `Renamed` event (temp name to `theme.json`). With the
+  `MoveFileEx` fallback, a `Deleted` event for the old file comes just before it (measured by the reviewer). The runner
+  does not subscribe to `Deleted`; anyone who adds such a handler must expect it on every save.
 
-`File.Move(overwrite)` was chosen over `File.Replace`: `File.Replace` can fail halfway
-(`ERROR_UNABLE_TO_MOVE_REPLACEMENT`) and leave no file under the target name. The cost is that the new file gets the
-folder's default permissions and attributes instead of the old file's; that is fine for files in `%AppData%\Glance`
-and for exported packages.
+A rename was chosen over `File.Replace`: `File.Replace` can fail halfway (`ERROR_UNABLE_TO_MOVE_REPLACEMENT`) and
+leave no file under the target name. The cost is that the new file gets the folder's default permissions and
+attributes instead of the old file's; that is fine for files in `%AppData%\Glance` and for exported packages.
 
 ### Callers
 
-- `Theme.Save` uses `AtomicFile.WriteAllText(target, json, keepBackup: true)`, so `theme.json.bak` holds the previous
-  version. The H1 order is unchanged: assets are copied first, the theme file is written next, and the open theme only
-  changes after both succeed; on failure the copied assets are removed and the previous theme file stays.
-- `AppSettings.Save(path)` uses `AtomicFile.WriteAllText` (no backup). `Save()` still ignores errors, as before.
-- `AppSettings.TryLoad(path, out settings, log)` (new) tells the cases apart:
-  - missing: `true`, defaults, nothing logged (first run);
-  - valid: `true`, the saved settings;
-  - corrupt (does not parse, `null`, empty, zeroed), checked again for about a second in case another program is
-    still writing it: logged, renamed to `settings.json.corrupt-<yyyyMMdd-HHmmss>` (a copy if it cannot be renamed),
-    `true` with the defaults. The next save writes a fresh file and leaves the corrupt copy alone;
-  - unreadable (still locked after the retries): logged, `false` with the defaults, and the file is left where it is.
-- `AppSettings.Load(...)` = `TryLoad` that always returns the settings. Without a log, the parameterless overloads
-  write to `%AppData%\Glance\glance.log` (the editor has no log of its own).
+- `Theme.Save` uses `AtomicFile.WriteAllText(target, json, keepBackup: true)`, so `theme.json.bak` holds the version
+  before the last save. The H1 order is unchanged: assets are copied first, the theme file is written next, and the
+  open theme only changes after both succeed; on failure the copied assets are removed and the previous theme file stays.
+- `ThemeFile.Load(path, log)` (new) is how the editor and the runner read a theme: `Theme.Load` with `ReadWithRetry`;
+  when `theme.json` is damaged (`JsonException`, `InvalidDataException`) and `theme.json.bak` can be read, the backup is
+  returned with `FromBackup = true` and a message, and nothing on disk changes. The editor shows the message in its
+  status bar and keeps the real `theme.json` path, so the next save repairs it; the runner logs it and shows the backup.
+- `AppSettings.Read(path, log)` (new) returns a `SettingsRead` (`Settings`, `State`, `KeptAs`, `Problem`):
+  - `Missing`: the defaults, nothing logged (first run);
+  - `Loaded`: the saved settings;
+  - `Corrupt` (not valid JSON: cut off, empty, zeroed), checked again for up to a second in case another program is
+    still writing it, and `WrongContent` (valid JSON that is not settings: wrong types, `null`, an array), not waited
+    for: logged, renamed to `settings.json.corrupt-<yyyyMMdd-HHmmss>` (a copy if it cannot be renamed; the newest five
+    are kept), the defaults are used, and `KeptAs`/`Problem` say where the file went;
+  - `Unreadable` (still locked after the retries): logged, and the defaults are returned as a **stand-in** that refuses
+    to be saved, so the file keeps the user's settings (review M1).
+  `Load` and `TryLoad` remain as wrappers (`TryLoad` is false only for `Unreadable`).
+- `AppSettings.TrySave(path, log)` saves all or nothing and returns false (and logs why) when it could not; `Save()`
+  does the same for `%AppData%\Glance\settings.json` and returns the result. `Save(path)` throws, including
+  `InvalidOperationException` for a stand-in.
+- Without a log, the parameterless overloads write to `%AppData%\Glance\glance.log`; past 512 KB it is renamed to
+  `glance.log.old` and started afresh.
+- Editor (`MainWindow`): reads settings once with `AppSettings.Read()`. A damaged or unreadable settings file, and a
+  theme shown from its backup, are reported in the status bar when the window opens. A save that could not save the
+  settings says so after "Saved ..." (and why). The theme save itself still runs on the UI thread: `Theme.Save` changes
+  the open theme's widget paths at the end, which must happen on the UI thread, and with the narrower retries it only
+  waits when another program really holds the file.
+- Runner (`RunnerContext`): reads settings and the theme **before** taking its lock and only swaps them in under it,
+  so a power event never waits behind a busy file. When settings are unreadable, at start or on a reload, it keeps the
+  settings it has (the defaults at start) and reads again 10 s later from its supervisor timer, instead of waiting for
+  the next file change. Messages go to `runner.log`.
 - `ThemePackage.Export` writes the zip through `AtomicFile.Write` (no backup), so a failed export keeps the previous package.
-- Runner (`RunnerContext`): the theme is loaded with `AtomicFile.ReadWithRetry(() => Theme.Load(p))`; settings with
-  `AppSettings.TryLoad(out var fresh, Log)`, and when that returns `false` the runner keeps the settings it already
-  has instead of switching to the defaults. Corrupt-settings messages go to `runner.log`.
 
 `Theme.Load`, `Theme.Normalize`, `ResolveAsset` and `ThemePackage.Import` are untouched (another session works on them).
 
@@ -109,16 +140,21 @@ together with `ThemeModelTests`: all green each time. Build: `dotnet build src/G
 
 ## Not covered / left open
 
-- The flush to the disk (`Flush(true)`) and the behaviour after a real power cut cannot be tested here; only the
-  crash-after-truncation case is simulated.
-- Nobody reads `theme.json.bak` automatically yet. A corrupt `theme.json` (for example left by an older version)
-  still makes the runner show the starter layout (logged in `runner.log`); the user can rename the `.bak` by hand.
-  An automatic fallback to the backup would be a small follow-up.
-- A crash between writing the temporary file and the rename leaves a `theme.json.<random>.tmp` in the folder. It is
-  harmless (the watcher ignores it) but is not cleaned up.
-- Saves and reads can now wait up to about one second when another program holds the file. The runner's reload runs on
-  its UI thread, so a locked file can delay the tray menu by that much.
-- The runner is being redesigned into a service on another branch; the two `RunnerContext` lines changed here
-  (`ReadWithRetry` around `Theme.Load`, `TryLoad` keeping the current settings) need to move with it.
+(Updated after the review fixes.)
+
+- The flush to the disk and the rename after a real power cut cannot be tested here; only the crash-after-truncation
+  case is simulated. The rename is flushed (POSIX path: the handle is flushed after the rename; fallback:
+  `MOVEFILE_WRITE_THROUGH`), which is as far as Windows lets a program go.
+- A program that holds `theme.json` or `settings.json` open **without** allowing deletes still blocks a save for the
+  retry budget; the save then fails and says so (theme: "Save failed"; settings: a note after "Saved ..." and a line
+  in `glance.log`).
+- After the editor shows a theme from `theme.json.bak` and the user saves, the damaged `theme.json` becomes the new
+  `.bak` (the good content is then in `theme.json`).
+- The editor's theme save still runs on the UI thread (see "Callers"); it can wait up to a second while another
+  program holds the file.
+- Review N3 (a microsecond race in which a just-saved good settings file is moved aside) and N7 (a read-only `.bak`
+  goes stale without a log line) are not changed.
+- The runner is being redesigned into a service on another branch; the `RunnerContext` changes here (`ReadTheme` with
+  `ThemeFile.Load`, `Reload` reading before the lock, `NoteSettingsRead`/`RereadLockedSettings`) need to move with it.
 - Other writers in the code base (`AidaImporter` writing extracted images, the legacy-folder migration) are not
   covered; they write new files, not files the runner watches.
