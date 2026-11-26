@@ -1429,7 +1429,7 @@ public sealed class MainWindow : Window
 
     private void StartLive()
     {
-        _liveToRunner = true; _liveGate.Reset();
+        _liveToRunner = true; _liveGate.Reset(); _keepAlive.Reset();
         _liveTimer.Tick -= OnLiveTick; _liveTimer.Tick += OnLiveTick;
         _liveTimer.Start();
         // one ordered link (M5): these arrive before the LIVE below, and a later LIVE_CLEAR after it
@@ -1448,7 +1448,27 @@ public sealed class MainWindow : Window
         RunnerClient.Post(ControlCommand.LiveClear);   // behind any LIVE still on its way, never before it (M5)
     }
 
-    private void OnLiveTick(object? s, EventArgs e) => PushLive();
+    private void OnLiveTick(object? s, EventArgs e)
+    {
+        PushLive();
+        KeepLive();
+    }
+
+    private readonly LiveKeepAlive _keepAlive = new();
+
+    /// <summary>
+    /// M5: the tray shows the live theme only while the editor keeps it alive (a 5 s lease). If the tray says it no longer holds
+    /// it (it restarted), the next tick sends the theme again.
+    /// </summary>
+    private void KeepLive()
+    {
+        if (!_liveToRunner || !_keepAlive.TryBegin(DateTime.UtcNow)) return;
+        RunnerClient.SendAsync(ControlCommand.LiveKeep).ContinueWith(t =>
+        {
+            var reply = t.IsCompletedSuccessfully ? t.Result : null;
+            Dispatcher.UIThread.Post(() => { if (_keepAlive.Complete(reply) && _liveToRunner) _liveGate.Lost(); });
+        });
+    }
 
     /// <summary>Turns the display black right now, whoever is driving it.</summary>
     private void TurnDisplayOff()

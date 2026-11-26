@@ -31,6 +31,12 @@ public sealed class LiveSendGate
         _generation++;
     }
 
+    /// <summary>
+    /// The tray app no longer holds the last accepted snapshot (its <c>LIVE_KEEP</c> reply said so, review M5): the next
+    /// <see cref="TryBegin"/> sends the current snapshot again even if it did not change.
+    /// </summary>
+    public void Lost() => _sent = null;
+
     /// <summary>Returns the send to start now, or null when the snapshot is already on the display or another send is still on its way.</summary>
     public LiveSend? TryBegin(string snapshot)
     {
