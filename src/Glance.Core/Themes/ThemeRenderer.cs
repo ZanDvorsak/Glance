@@ -9,6 +9,7 @@ public sealed class ThemeRenderer : IDisposable
 {
     private readonly Dictionary<string, ImageEntry> _images = new();
     private readonly Dictionary<string, VideoSource> _videos = new();
+    private readonly Dictionary<string, FileCheck> _videoFiles = new();
 
     /// <summary>Creates video sources; tests swap it to avoid starting ffmpeg.</summary>
     internal Func<string, int, int, ImageFit, VideoSource> VideoFactory { get; set; } = (path, w, h, fit) => new VideoSource(path, w, h, fit);
@@ -23,6 +24,7 @@ public sealed class ThemeRenderer : IDisposable
     private readonly Dictionary<string, FontEntry> _fileFaces = new();
     private long _pass;         // one per Render call: pictures drawn in the current frame are never evicted
     private long _lastSweep;
+    private readonly HashSet<string> _themePictures = new();
     private Theme? _theme;
     private readonly SensorHistory _history = new();
     private IReadOnlyList<SensorInfo>? _indexedFor;
@@ -38,6 +40,7 @@ public sealed class ThemeRenderer : IDisposable
         _theme = theme;
         _pass++;
         page ??= theme.ActivePage;
+        CollectThemePictures(theme, page);
         var bg = string.IsNullOrWhiteSpace(page.BackgroundColor) ? theme.BackgroundColor : page.BackgroundColor!;
         canvas.Clear(Parse(bg, SKColors.Black));
 
@@ -57,6 +60,7 @@ public sealed class ThemeRenderer : IDisposable
             }
         }
 
+        SettleImages();
         SweepVideos();
         SweepIdle();
 
@@ -88,8 +92,9 @@ public sealed class ThemeRenderer : IDisposable
     /// <summary>
     /// Pre-fills graph history with a gentle synthetic curve around each graph's current value, so a freshly placed
     /// graph (or a gallery thumbnail) does not look empty. Real samples replace it as time passes.
-    /// Only sensors with no history yet are seeded, once each (for the longest graph showing them), so seeding a page
-    /// again, for example after adding a preset, never draws synthetic samples over real ones.
+    /// Each sensor is seeded once for the longest graph showing it, and only for the past its history does not cover
+    /// yet: seeding a page again (for example after adding a preset) never touches real or earlier samples, and a new,
+    /// longer graph next to a shorter one still gets a full line.
     /// </summary>
     public void SeedGraphHistory(ThemePage page, ISensorSource sensors)
     {
@@ -100,14 +105,16 @@ public sealed class ThemeRenderer : IDisposable
             .Select(g => (id: g.Key, seconds: g.Max(w => Math.Clamp(w.HistorySeconds, 5, 900))));
         foreach (var (id, seconds) in graphs.ToList())
         {
-            if (_history.HasSamples(id)) continue;
             if (!_index.TryGetValue(id, out var s) || s.Value is not { } raw) continue;
+            long? oldest = _history.Oldest(id);
             int n = (int)(seconds * 1000 / SensorHistory.SampleMs);
             for (int i = 0; i < n; i++)
             {
+                long ms = now - (n - i) * SensorHistory.SampleMs;
+                if (oldest is { } o && ms > o - SensorHistory.SampleMs) break;   // from here on the history already has samples
                 double phase = i * 0.11 + id.Length;
                 double wobble = 0.04 * Math.Sin(phase) + 0.015 * Math.Sin(phase * 2.3);
-                _history.Seed(id, now - (n - i) * SensorHistory.SampleMs, (float)(raw * (1 + wobble)));
+                _history.Seed(id, ms, (float)(raw * (1 + wobble)));
             }
         }
     }
@@ -234,16 +241,18 @@ public sealed class ThemeRenderer : IDisposable
 
         if (_index.TryGetValue(w.SensorId, out var s) && s.Value is { } raw) _history.Record(w.SensorId, raw, now);
         double window = Math.Clamp(w.HistorySeconds, 5, 900);
-        var samples = _history.Window(w.SensorId, now, window);
+        var samples = _history.View(w.SensorId, now, window);   // no copy per frame; not changed until the next Record
 
         // value range: fixed when Max > Min, otherwise fitted to what is on screen
         double min = w.Min, max = w.Max;
         if (max <= min)
         {
-            if (samples.Count == 0) { min = 0; max = 1; }
+            if (samples.Length == 0) { min = 0; max = 1; }
             else
             {
-                min = samples.Min(p => p.value) * w.Multiplier; max = samples.Max(p => p.value) * w.Multiplier;
+                float lo = float.MaxValue, hi = float.MinValue;
+                foreach (var (_, v) in samples) { if (v < lo) lo = v; if (v > hi) hi = v; }
+                min = lo * w.Multiplier; max = hi * w.Multiplier;
                 if (max - min < 1e-6) { min -= 1; max += 1; }
                 var pad = (max - min) * 0.1; min -= pad; max += pad;
             }
@@ -263,7 +272,7 @@ public sealed class ThemeRenderer : IDisposable
             }
         }
 
-        if (samples.Count > 0)
+        if (samples.Length > 0)
         {
             float X(long t) => box.Left + (float)((t - (now - window * 1000)) / (window * 1000)) * box.Width;
             float Y(float v)
@@ -277,7 +286,7 @@ public sealed class ThemeRenderer : IDisposable
 
             using var line = new SKPath();
             line.MoveTo(X(samples[0].ms), Y(samples[0].value));
-            for (int i = 1; i < samples.Count; i++) line.LineTo(X(samples[i].ms), Y(samples[i].value));
+            for (int i = 1; i < samples.Length; i++) line.LineTo(X(samples[i].ms), Y(samples[i].value));
 
             using var area = new SKPath(line);
             area.LineTo(X(samples[^1].ms), box.Bottom);
@@ -311,6 +320,7 @@ public sealed class ThemeRenderer : IDisposable
         SKImage? img = null;
         var fit = w.Fit;
         string? note = null;
+        float srcW = 0, srcH = 0;   // the picture's shape (a decode may be stretched to another one)
 
         if (Ffmpeg.IsVideo(path))
         {
@@ -318,10 +328,18 @@ public sealed class ThemeRenderer : IDisposable
             img = v.Latest;
             fit = ImageFit.Stretch; // ffmpeg already fitted the frame to the widget box
             if (img is null) note = v.Error is null ? "Loading video..." : v.Error;
+            else (srcW, srcH) = (img.Width, img.Height);
         }
-        else if (LoadImage(path, Math.Max(1, (int)Math.Ceiling(r.Width)), Math.Max(1, (int)Math.Ceiling(r.Height)), w.Fit) is { } anim)
+        else
         {
-            img = anim.At(_clock.ElapsedMilliseconds);
+            // the size the box really covers on the target (the display pusher scales the theme to fit the panel)
+            var device = c.TotalMatrix.MapRect(r);
+            int bw = Math.Max(1, (int)Math.Ceiling(device.Width)), bh = Math.Max(1, (int)Math.Ceiling(device.Height));
+            if (LoadImage(path, bw, bh, w.Fit) is { } anim)
+            {
+                img = anim.At(_clock.ElapsedMilliseconds);
+                (srcW, srcH) = (anim.SourceWidth, anim.SourceHeight);
+            }
         }
 
         if (img is null)
@@ -339,20 +357,20 @@ public sealed class ThemeRenderer : IDisposable
 
         using var paint = new SKPaint { IsAntialias = true, Color = SKColors.White.WithAlpha((byte)Math.Round(Math.Clamp(w.Opacity, 0, 100) * 2.55)) };
         var sampling = new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear);
-        float sx = r.Width / img.Width, sy = r.Height / img.Height;
+        float sx = r.Width / srcW, sy = r.Height / srcH;
         switch (fit)
         {
             case ImageFit.Contain:
             {
                 var s = Math.Min(sx, sy);
-                float dw = img.Width * s, dh = img.Height * s;
+                float dw = srcW * s, dh = srcH * s;
                 c.DrawImage(img, SKRect.Create(r.Left + (r.Width - dw) / 2, r.Top + (r.Height - dh) / 2, dw, dh), sampling, paint);
                 break;
             }
             case ImageFit.Cover:
             {
                 var s = Math.Max(sx, sy);
-                float dw = img.Width * s, dh = img.Height * s;
+                float dw = srcW * s, dh = srcH * s;
                 c.Save();
                 c.ClipRect(r);
                 c.DrawImage(img, SKRect.Create(r.Left + (r.Width - dw) / 2, r.Top + (r.Height - dh) / 2, dw, dh), sampling, paint);
@@ -369,6 +387,18 @@ public sealed class ThemeRenderer : IDisposable
     {
         var key = $"{path}|{w}x{h}|{fit}";
         var now = Now();
+        // a video file replaced on disk starts again from the new file (review L4; picking it again used to do that)
+        if (!_videoFiles.TryGetValue(path, out var check)) _videoFiles[path] = check = new FileCheck(null, now);   // first stamp comes from the background check
+        if (check.Poll(path, now, StatFile, StatWaitMs) is { } stamp)
+        {
+            if (check.Stamp is { } known && known != stamp)
+                foreach (var k in _videos.Keys.Where(k => k.StartsWith(path + "|", StringComparison.Ordinal)).ToList())
+                {
+                    _videos[k].Dispose();
+                    _videos.Remove(k);
+                }
+            check.Stamp = stamp;
+        }
         if (_videos.TryGetValue(key, out var v) && v.FfmpegMissing && now - v.CreatedTicks >= VideoRetryMs)
         {
             // FFmpeg was missing (or not trusted by the elevated runner) when this source was made: try again, so a
@@ -394,6 +424,9 @@ public sealed class ThemeRenderer : IDisposable
             _videos[k].Dispose();
             _videos.Remove(k);
         }
+        if (_videoFiles.Count > _videos.Count)   // forget file checks of videos that no longer play
+            foreach (var p in _videoFiles.Keys.Where(p => !_videos.Keys.Any(k => k.StartsWith(p + "|", StringComparison.Ordinal))).ToList())
+                _videoFiles.Remove(p);
     }
 
     private void DrawText(SKCanvas c, Widget w, string text, SKColor? color = null)
@@ -443,21 +476,19 @@ public sealed class ThemeRenderer : IDisposable
     private SKTypeface? FileFace(string path)
     {
         var now = Now();
-        if (_fileFaces.TryGetValue(path, out var e))
+        if (!_fileFaces.TryGetValue(path, out var e))
         {
-            e.LastUsedAt = now;
-            if (now - e.CheckedAt < StatIntervalMs) return e.Face;
-            e.CheckedAt = now;
-            var stamp = FileStamp.Of(path);
-            if (stamp == e.Stamp) return e.Face;
-            e.Face?.Dispose();
-            e.Face = null;
+            var stamp = StatFile(path);
+            _fileFaces[path] = e = new FontEntry { Check = new FileCheck(stamp, now), LastUsedAt = now, Face = ReadFontFile(path, stamp) };
+            return e.Face;
         }
-        else _fileFaces[path] = e = new FontEntry { LastUsedAt = now };
-
-        e.CheckedAt = now;
-        e.Stamp = FileStamp.Of(path);
-        e.Face = ReadFontFile(path, e.Stamp);
+        e.LastUsedAt = now;
+        if (e.Check.Poll(path, now, StatFile, StatWaitMs) is { } s && s != e.Check.Stamp)
+        {
+            e.Check.Stamp = s;   // the stamp that was checked is the one read (review N2: one stat per change)
+            e.Face?.Dispose();
+            e.Face = ReadFontFile(path, s);
+        }
         return e.Face;
     }
 
@@ -477,55 +508,163 @@ public sealed class ThemeRenderer : IDisposable
     }
 
     /// <summary>
-    /// The picture for <paramref name="path"/>, decoded at about the size it is drawn at. Cached entries notice when
-    /// the file changes (checked at most every <see cref="StatIntervalMs"/>), a missing file is looked for again on
-    /// the same schedule, and a widget drawn bigger than its decode gets a sharper one.
+    /// The picture for <paramref name="path"/>, decoded at the size its box covers on the target
+    /// (<paramref name="boxW"/> x <paramref name="boxH"/> device pixels). Cached entries notice when the file changes
+    /// (a background check at most every <see cref="StatIntervalMs"/>), a missing file is looked for again on the same
+    /// schedule, and a changed file that does not decode yet keeps the old picture. Size changes are handled after the
+    /// frame by <see cref="SettleImages"/>, once the size has stopped changing.
     /// </summary>
     private AnimatedImage? LoadImage(string? path, int boxW, int boxH, ImageFit fit)
     {
         if (string.IsNullOrEmpty(path)) return null;
         var now = Now();
-        if (_images.TryGetValue(path, out var e))
+        if (!_images.TryGetValue(path, out var e))
         {
-            e.LastPass = _pass; e.LastUsedAt = now;
-            bool changed = false;
-            if (now - e.CheckedAt >= StatIntervalMs)
+            var stamp = StatFile(path);   // before decoding, so a change made during the decode is seen next time
+            _images[path] = e = new ImageEntry { Check = new FileCheck(stamp, now), LastUsedAt = now };
+            if (stamp.Exists)
             {
-                e.CheckedAt = now;
-                changed = FileStamp.Of(path) != e.Stamp;
+                e.Image = Decode(e, path, (w, h) => AnimatedImage.NeededSize(w, h, boxW, boxH, fit));
+                TrimImages(path);
             }
-            if (!changed && (e.Image is null || e.Image.IsSharpEnoughFor(boxW, boxH, fit))) return e.Image;
-            if (!changed) { boxW += boxW / 4 + 1; boxH += boxH / 4 + 1; }   // a widget being enlarged: leave room so a drag does not decode on every step
-            e.Image?.Dispose();
-            e.Image = null;
         }
-        else _images[path] = e = new ImageEntry { LastPass = _pass, LastUsedAt = now };
-
-        e.CheckedAt = now;
-        e.Stamp = FileStamp.Of(path);   // read before decoding, so a change made during the decode is seen next time
-        if (e.Stamp.Exists)
+        else
         {
-            ImageDecodes++;
-            e.Image = AnimatedImage.Load(path, AvailableImageBytes(path), boxW, boxH, fit);
-            TrimImages(path);
+            e.LastUsedAt = now;
+            if (e.Check.Poll(path, now, StatFile, StatWaitMs) is { } s && s != e.Check.Stamp)
+                Reload(e, path, s, now, (w, h) => AnimatedImage.NeededSize(w, h, boxW, boxH, fit));
+        }
+
+        if (e.LastPass != _pass) { e.LastPass = _pass; e.Need = default; }
+        if (e.Image is { } img)
+        {
+            // the biggest size any widget showing this file needs this frame
+            var need = AnimatedImage.NeededSize(img.SourceWidth, img.SourceHeight, boxW, boxH, fit);
+            e.Need = new SKSizeI(Math.Max(e.Need.Width, need.Width), Math.Max(e.Need.Height, need.Height));
         }
         return e.Image;
     }
 
-    /// <summary>What is left of the budget for <paramref name="path"/> after the other pictures drawn this frame.</summary>
-    private long AvailableImageBytes(string path)
+    private AnimatedImage? Decode(ImageEntry e, string path, Func<int, int, SKSizeI> sizeFor)
     {
-        long inUse = _images.Where(kv => kv.Key != path && kv.Value.LastPass == _pass).Sum(kv => kv.Value.Image?.Bytes ?? 0);
-        return Math.Max(0, ImageBudgetBytes - inUse);
+        ImageDecodes++;
+        e.Decoding = true;   // counts as an animation while its share is worked out (it may be one)
+        long cap = AnimationShare();
+        e.Decoding = false;
+        var img = AnimatedImage.Load(path, cap, sizeFor);
+        if (img is not null) e.Cap = cap;
+        return img;
     }
 
-    /// <summary>Frees the least recently drawn pictures (never ones drawn this frame) until the cache fits the budget.</summary>
+    /// <summary>
+    /// The file changed on disk. The new version replaces the picture only when it decodes (review L1): a file caught
+    /// half-written, or briefly missing during a save, keeps showing the old picture. If the new version still fails
+    /// after <see cref="BrokenFileMs"/>, the file really is broken or gone and the placeholder is shown.
+    /// </summary>
+    private void Reload(ImageEntry e, string path, FileStamp stamp, long now, Func<int, int, SKSizeI> sizeFor)
+    {
+        var fresh = stamp.Exists ? Decode(e, path, sizeFor) : null;
+        if (fresh is not null || e.Image is null)
+        {
+            e.Image?.Dispose();
+            e.Image = fresh;
+            e.Check.Stamp = stamp;
+            e.Pending = null;
+            if (fresh is not null) TrimImages(path);
+        }
+        else if (e.Pending != stamp) { e.Pending = stamp; e.PendingSince = now; }   // retried at the next check
+        else if (now - e.PendingSince >= BrokenFileMs)
+        {
+            e.Image.Dispose();
+            e.Image = null;
+            e.Check.Stamp = stamp;
+            e.Pending = null;
+        }
+    }
+
+    /// <summary>
+    /// After a frame: a picture drawn bigger than its decode (L2), much smaller (N5), or an animation that was cut and
+    /// now has a clearly bigger share of the budget, or one using far more than its share while the cache is over
+    /// budget (M1), is decoded again, but only once that need has not changed for <see cref="SettleMs"/>. Until then the
+    /// current decode is drawn scaled, so dragging a resize handle never decodes on the UI thread at every step.
+    /// </summary>
+    private void SettleImages()
+    {
+        var now = Now();
+        long share = -1;
+        foreach (var (path, e) in _images.Where(kv => kv.Value.LastPass == _pass && kv.Value.Image is not null && kv.Value.Need.Width > 0).ToList())
+        {
+            var img = e.Image!;
+            var need = e.Need;
+            bool tooSmall = img.Width + 1 < need.Width || img.Height + 1 < need.Height;
+            bool tooBig = img.Width > 2 * need.Width + 1 || img.Height > 2 * need.Height + 1;
+            bool budget = false;
+            if (img.SourceFrameCount > 1)
+            {
+                if (share < 0) share = AnimationShare();
+                budget = (img.IsCut && share >= e.Cap + e.Cap / 2)
+                      || (img.Bytes > share + share / 4 && CachedImageBytes > ImageBudgetBytes);
+            }
+            if (!tooSmall && !tooBig && !budget) { e.Want = default; continue; }
+            if (e.Want != need) { e.Want = need; e.WantSince = now; continue; }
+            if (now - e.WantSince < SettleMs) continue;
+            e.Want = default;
+            if (Decode(e, path, (_, _) => need) is not { } fresh) continue;   // keep what is shown
+            img.Dispose();
+            e.Image = fresh;
+            TrimImages(path);
+        }
+    }
+
+    /// <summary>
+    /// The byte cap for one animation: the budget left after the theme's still pictures, shared evenly between its
+    /// animations (pictures not decoded yet count as animations). Every animation of the theme gets the same share,
+    /// whichever page is drawn first, so none is left with nothing (review M1).
+    /// </summary>
+    private long AnimationShare()
+    {
+        long stills = 0; int animations = 0;
+        foreach (var p in _themePictures)
+        {
+            if (_images.TryGetValue(p, out var e) && !e.Decoding && (e.Image is null || e.Image.SourceFrameCount == 1)) stills += e.Image?.Bytes ?? 0;
+            else animations++;
+        }
+        return Math.Max(0, ImageBudgetBytes - stills) / Math.Max(1, animations);
+    }
+
+    /// <summary>
+    /// Every picture file of the theme being drawn (all pages), recomputed each frame. It only sizes the budget shares,
+    /// so it is best effort: the display pusher renders while the editor changes the theme (undo replaces every page),
+    /// and a page caught mid-change is skipped instead of failing the frame.
+    /// </summary>
+    private void CollectThemePictures(Theme theme, ThemePage page)
+    {
+        _themePictures.Clear();
+        ThemePage[] pages;
+        try { pages = Display.DisplayPusher.StablePages(theme); } catch { pages = Array.Empty<ThemePage>(); }
+        foreach (var pg in pages.Append(page))
+        {
+            try
+            {
+                var widgets = pg.Widgets;
+                for (int i = 0; i < widgets.Count; i++)
+                    if (widgets[i] is { Kind: WidgetKind.Image } w && theme.ResolveAsset(w.ImagePath) is { Length: > 0 } p && !Ffmpeg.IsVideo(p))
+                        _themePictures.Add(p);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or NullReferenceException) { /* changing right now */ }
+        }
+    }
+
+    /// <summary>
+    /// Frees pictures not drawn this frame until the cache fits the budget: first those that are not in the theme any
+    /// more, then the least recently drawn.
+    /// </summary>
     private void TrimImages(string keep)
     {
         long total = CachedImageBytes;
         if (total <= ImageBudgetBytes) return;
         foreach (var (k, e) in _images.Where(kv => kv.Key != keep && kv.Value.LastPass != _pass && kv.Value.Image is not null)
-                     .OrderBy(kv => kv.Value.LastUsedAt).ToList())
+                     .OrderBy(kv => _themePictures.Contains(kv.Key)).ThenBy(kv => kv.Value.LastUsedAt).ToList())
         {
             total -= e.Image!.Bytes;
             e.Image.Dispose();
@@ -562,8 +701,20 @@ public sealed class ThemeRenderer : IDisposable
     /// <summary>Font files bigger than this are not loaded (the installed font is used instead).</summary>
     private const long MaxFontFileBytes = 64L * 1024 * 1024;
 
-    /// <summary>What identifies one version of a file: replacing or editing it changes the time or the size.</summary>
-    private readonly record struct FileStamp(bool Exists, DateTime Modified, long Length)
+    /// <summary>How long a picture's needed size must stay the same before it is decoded again at that size.</summary>
+    internal const long SettleMs = 300;
+    /// <summary>How long a changed file may fail to decode before the old picture gives way to the placeholder.</summary>
+    internal const long BrokenFileMs = 2000;
+    /// <summary>A file check slower than this (a network share that went away) backs off, doubling up to a minute.</summary>
+    private const long SlowStatMs = 200;
+    private const long MaxStatIntervalMs = 60_000;
+
+    /// <summary>
+    /// What identifies one version of a file: replacing or editing it changes the time or the size. On FAT32 and exFAT
+    /// (USB sticks) times have 2 s or 10 ms steps, so a rewrite of the same size within one step can be missed until
+    /// the next change; NTFS has 100 ns steps.
+    /// </summary>
+    internal readonly record struct FileStamp(bool Exists, DateTime Modified, long Length)
     {
         public static FileStamp Of(string path)
         {
@@ -576,18 +727,67 @@ public sealed class ThemeRenderer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Watches one file for changes without blocking the rendering thread (review L5): the stat runs on the thread
+    /// pool, the renderer waits for it only briefly when it starts it, and otherwise picks the result up on a later
+    /// frame. A slow stat (an unreachable network path) makes the checks rarer.
+    /// </summary>
+    private sealed class FileCheck
+    {
+        /// <summary>The version the cache holds (null: not known yet).</summary>
+        public FileStamp? Stamp;
+        private long _checkedAt, _interval = StatIntervalMs;
+        private Task<(FileStamp stamp, long ms)>? _pending;
+
+        public FileCheck(FileStamp? stamp, long now)
+        {
+            Stamp = stamp;
+            _checkedAt = stamp is null ? long.MinValue / 2 : now;   // no stamp yet: check at once
+        }
+
+        /// <summary>A fresh stamp when a check finished, otherwise null (not due yet, or still running).</summary>
+        public FileStamp? Poll(string path, long now, Func<string, FileStamp> stat, int waitMs)
+        {
+            bool started = false;
+            if (_pending is null)
+            {
+                if (now - _checkedAt < _interval) return null;
+                _checkedAt = now;
+                _pending = Task.Run(() =>
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    FileStamp s;
+                    try { s = stat(path); } catch { s = default; }
+                    return (s, sw.ElapsedMilliseconds);
+                });
+                started = true;
+            }
+            if (started ? !_pending.Wait(waitMs) : !_pending.IsCompleted) return null;
+            var (stamp, ms) = _pending.Result;
+            _pending = null;
+            _interval = ms > SlowStatMs ? Math.Min(_interval * 2, MaxStatIntervalMs) : StatIntervalMs;
+            return stamp;
+        }
+    }
+
     private sealed class ImageEntry
     {
         public AnimatedImage? Image;
-        public FileStamp Stamp;
-        public long CheckedAt, LastUsedAt, LastPass;
+        public FileCheck Check = null!;
+        public FileStamp? Pending;          // a changed version that has not decoded yet
+        public long PendingSince, LastUsedAt, LastPass;
+        public long Cap;                    // the byte cap the picture was decoded with
+        public bool Decoding;               // being decoded right now (AnimationShare counts it as an animation)
+        public SKSizeI Need;                // the biggest size asked for in LastPass (device pixels)
+        public SKSizeI Want;                // a decode size waiting to settle
+        public long WantSince;
     }
 
     private sealed class FontEntry
     {
         public SKTypeface? Face;
-        public FileStamp Stamp;
-        public long CheckedAt, LastUsedAt;
+        public FileCheck Check = null!;
+        public long LastUsedAt;
     }
 
     // ---- test hooks ---------------------------------------------------------------------------------------------
@@ -596,6 +796,8 @@ public sealed class ThemeRenderer : IDisposable
     internal long CachedImageBytes => _images.Values.Sum(e => e.Image?.Bytes ?? 0);
     internal long ImageBudgetBytes { get; set; } = DefaultImageBudgetBytes;
     internal int ImageDecodes { get; private set; }
+    internal Func<string, FileStamp> StatFile { get; set; } = FileStamp.Of;
+    internal int StatWaitMs { get; set; } = 25;
     internal SensorHistory History => _history;
 
     /// <summary>
@@ -608,6 +810,7 @@ public sealed class ThemeRenderer : IDisposable
         _images.Clear();
         foreach (var v in _videos.Values) v.Dispose();
         _videos.Clear();
+        _videoFiles.Clear();
         foreach (var e in _fileFaces.Values) e.Face?.Dispose();
         _fileFaces.Clear();
     }

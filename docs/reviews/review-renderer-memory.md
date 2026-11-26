@@ -286,3 +286,127 @@ These need the real editor and display; I could not do them.
 - **Editor call sites:** `Restore` (undo/redo), Save and the two pickers no longer clear caches; opening another theme and installing FFmpeg
   still do. Undo that points a widget at a different file simply loads that file; undo while a file changed on disk shows the current file
   (files are not versioned, same as before).
+
+---
+
+## Fixes after review
+
+Fixed by the author on the same branch. The reviewer's findings above are unchanged. Nothing was checked in the running editor or
+on the display; the manual checks at the end of this section are still needed.
+
+**Method.** The user's rule: each finding got a test first, run against the branch as reviewed (`c2a1fb2`), then the fix,
+then the same test again plus the full suite. Five tests needed a test hook that did not exist yet; the hooks were added first,
+with no change in behaviour: `ThemeRenderer.StatFile` (the file check, swappable), `ThemeRenderer.StatWaitMs`,
+`AnimatedImage.SourceFrameCount`, `AnimatedImage.TotalMs` and the `[ThreadStatic] AnimatedImage.WorkingBitmapCreated` hook.
+The new tests are in `src/Glance.Tests/RendererReviewFixTests.cs` (classes `RendererReviewFixTests` and `GraphHistoryReviewFixTests`).
+
+**Before:** 16 of the 19 new tests failed on `c2a1fb2`; 3 are guards that already passed (listed below).
+**After:** 19 of 19 pass. Full suite **578 / 578**, three runs in a row (561 before, minus 2 replaced tests, plus 19 new).
+Build: 0 errors.
+
+| Finding | Test | Before (on `c2a1fb2`) | After |
+|---|---|---|---|
+| M1 | `M1_two_animations_on_one_page_both_keep_animating` | fail: `a frames 40, b frames 1` | pass: 20 frames each, cache within the budget |
+| M1 | `M1_a_shortened_animation_keeps_its_full_loop_time` | fail: loop `2000` ms, expected `4000` (first half kept) | pass: 20 of 40 frames, loop still 4000 ms |
+| M1 | `M1_an_animation_never_freezes_even_with_no_budget_left` | fail: "a frozen animation shows one frame forever" | pass: 10 frames |
+| M2 | `M2_pictures_are_decoded_for_the_panel_when_the_theme_is_scaled_up` (320x240 theme on 480x320) | fail: `decoded 320 px wide for a 427 px box on the panel` | pass: 427 px |
+| M2 | `M2_a_theme_larger_than_the_panel_decodes_no_more_than_the_panel_shows` (800x600 theme on 400x300) | fail: decoded `800` px, expected 400-420 | pass: 400 px |
+| L1 | `L1_a_half_written_file_keeps_showing_the_old_picture` | fail: expected `#ffff0000`, got the placeholder `#ff282828` | pass: old picture until the file decodes, then the new one |
+| L1 | `L1_a_file_that_stays_broken_finally_shows_the_placeholder` | pass (guard) | pass: placeholder after 2 s of failing |
+| L2 | `L2_resizing_does_not_decode_at_every_step_and_decodes_once_settled` (40 to 800 px in 4 px steps) | fail: `13` decodes during the drag, expected 1 | pass: 1 during the drag, 1 more once settled |
+| L3 | `L3_a_longer_graph_added_next_to_a_shorter_one_is_seeded_for_the_missing_part` | fail: `history covers 29 s of a 300 s graph` | pass |
+| L3 | `L3_real_samples_stay_and_only_the_missing_past_is_seeded` | fail: "the empty past of the graph is filled" | pass: real samples unchanged and newest, past filled, sorted |
+| L4 | `L4_a_video_file_replaced_on_disk_is_restarted` | fail: `1` video source created, expected 2 | pass (and an unchanged file is not restarted) |
+| L5 | `L5_a_slow_file_check_does_not_block_rendering` (stat hook sleeps 3 s) | fail: the render blocked on the stat (the test ran 6 s) and then drew the placeholder `#ff282828` | pass: the test took about 35 ms in all and kept the picture |
+| N1 | the tautological `The_default_budget_is_far_below_the_old_600_MB_per_image` was removed; the M1 tests above are the behaviour tests for the budget | n/a | n/a |
+| N2 | `N2_a_changed_file_is_checked_once` | fail: `2` stats for one change, expected 1 | pass: 1 |
+| N3 | `N3_a_failed_animation_load_frees_its_working_bitmaps` | fail: 1 of 2 working bitmaps not freed (`Handle` non-zero) | pass: all freed |
+| N4 | `N4_drawing_a_graph_does_not_copy_its_history_every_frame` (900 s graph) | fail: `a full history costs 28784 more bytes per frame` | pass: under 4 KB |
+| N5 | `N5_a_much_smaller_widget_gets_a_smaller_decode_once_settled` | fail: stays `800` px for a 100 px widget | pass: 100 px |
+| N6 | `N6_stretch_decodes_to_the_exact_box` (1000x1000 in 200x50) | fail: `(200, 200)`, expected `(200, 50)` | pass |
+| N6 | `N6_contain_keeps_the_aspect_ratio_when_another_widget_stretches_the_same_file` | pass (guard) | pass |
+| test gap | `Downscaled_detail_averages_instead_of_aliasing` (2 px checkerboard, 2000x1500 in 100x75) | pass (guard) | pass |
+| N7 | none: the guard was unreachable, so there is nothing to make fail. It was removed, and the comment on the throttle explains why the list stays ordered | n/a | n/a |
+| N8 | none: a comment on `FileStamp` about FAT32 and exFAT time steps | n/a | n/a |
+
+**Tests changed because the expected behaviour changed:**
+- `Growing_an_image_widget_decodes_it_again_at_the_bigger_size` now advances the clock past the settle time before it checks (L2).
+- `A_graph_that_already_has_real_samples_is_not_seeded_over` asserted that nothing was seeded next to real samples. L3 asks for the
+  missing past to be filled, so it became `L3_real_samples_stay_and_only_the_missing_past_is_seeded` (real samples untouched, order kept).
+- The four file-change tests in `RendererMemoryTests` set `StatWaitMs = 5000`, so they do not depend on thread-pool timing now that the
+  file check runs in the background.
+
+**Mutation checks after the fix** (each alone on the fixed code, then restored):
+
+| Mutation | Caught by |
+|---|---|
+| Every animation's share is the whole budget | `M1_two_animations_on_one_page_both_keep_animating` (`320 bytes for a 160 byte budget`) |
+| A changed file always replaces the picture, even when it fails to decode | `L1_a_half_written_file_keeps_showing_the_old_picture` |
+| No settle time: re-decode at once when the size changes | `L2_resizing_does_not_decode_at_every_step_and_decodes_once_settled` |
+| The renderer waits for the file check to finish | `L5_a_slow_file_check_does_not_block_rendering` |
+| A changed video file does not restart its sources | `L4_a_video_file_replaced_on_disk_is_restarted` |
+
+The first mutation run also found a real bug in the fix: while a picture was being decoded, its own (still empty) cache entry counted
+as a still picture, so the first animation got the whole budget again. The tightened M1 test caught it, and it was fixed before the
+commit (`ImageEntry.Decoding`).
+
+### What changed
+
+- **M1 (`ThemeRenderer.AnimationShare`, `AnimatedImage.Load`).** The cap for one animation is the budget left after the theme's still
+  pictures, divided evenly between its animations. It covers every page of the theme, so the share does not depend on which page is
+  drawn first and does not swing as pages rotate; pictures not decoded yet count as animations. When an animation does not fit, it keeps
+  every k-th frame and adds a skipped frame's time to the frame before it, so the loop keeps its length. It never keeps fewer than
+  `MinAnimationFrames` (10) frames, so it cannot freeze, even when that goes over the budget. A shortened animation is reported through
+  `AnimatedImage.Log` (file, frames kept, size, cap). An animation that was cut is decoded again once its share has grown by half
+  (another picture removed), and one far over its share is decoded smaller when the cache is over budget; both wait for the settle time.
+  Resolution is not reduced to save frames: on the LCD that would blur the picture, and dropping frames evenly keeps it sharp.
+- **M2 (`DrawImage`).** The box is measured on the target with `c.TotalMatrix.MapRect(r)`, so the display pusher's fit-to-panel scale
+  is included. The editor preview, the virtual display and the thumbnails draw at theme resolution with an identity matrix, and the
+  editor's zoom only enlarges that finished bitmap, so they get exactly the pixels they show: as sharp as `main`.
+- **L1 (`Reload`).** A changed file is decoded into a new image first, and the old picture is replaced only if that works. A file
+  caught half-written, or missing for a moment during a save, keeps the old picture and is tried again at the next check. If the same
+  new version still fails after `BrokenFileMs` (2 s), the file really is broken or gone, and the placeholder is shown.
+- **L2 and N5 (`SettleImages`).** `LoadImage` only notes the biggest size each picture needs in the frame (device pixels, over every
+  widget showing it). After the frame, a picture that is too small, more than twice too big (N5), or due a budget change (M1) is decoded
+  again only after that need has stayed the same for `SettleMs` (300 ms). During a drag the current decode is drawn scaled.
+  The 25% headroom is gone.
+- **L3 (`SeedGraphHistory`, `SensorHistory.Oldest`).** Each sensor is seeded for its longest graph, from the start of that window up to
+  half a sample before its oldest existing sample. Seeding a page again adds nothing, and real samples are never touched.
+- **L4 (`GetVideo`).** Each video file has a background file check. When the file changes, every source playing it is stopped and
+  started again from the new file. `VideoSource` and `Ffmpeg` are untouched.
+- **L5 (`FileCheck`).** Pictures, font files and videos share one checker: the stat runs on the thread pool, the renderer waits at most
+  `StatWaitMs` (25 ms) when it starts one and otherwise picks up the result on a later frame. A stat slower than 200 ms doubles that
+  file's interval, up to a minute. The first look at a new picture or font is still synchronous, because the decode that follows reads
+  the file anyway (same as `main`). A video's first stamp also comes from the background check.
+- **N2.** The stamp that was checked is the one stored and decoded; no second stat.
+- **N3.** Each working bitmap of an animation is freed in a `finally` unless it was handed on as the previous or a kept frame.
+- **N4 (`SensorHistory.View`).** Drawing uses an internal non-copying span over the list, valid until the next `Record` or `Seed`,
+  and computes min and max with a loop. The public `Window` still returns a copy.
+- **N6 (`AnimatedImage.NeededSize`).** Stretch decodes to the box itself (shape included); Contain and Cover keep the shape.
+  `DrawImage` now takes the picture's shape from `SourceWidth`/`SourceHeight`, so a stretched decode shared with a Contain widget still
+  draws the right shape (guard test above).
+- **N7.** The unreachable `Record` guard was removed.
+- **N8.** The comment on `FileStamp` names the FAT32 and exFAT time steps.
+- **Thread safety.** The list of the theme's pictures (used only for the share) is read with `DisplayPusher.StablePages` and skips a
+  page caught mid-change. The first version iterated `theme.Pages` directly and broke the existing test
+  `Undo_redo_racing_a_fast_loop_never_faults_it` (3 unexpected render errors); that test passes now.
+
+### Still open
+
+- `AnimatedImage.Log` is not routed anywhere yet. The runner is off-limits for this branch, and the editor has no log file, so a
+  shortened animation is not visible to the user. Route it to `runner.log` when the runner work lands.
+- PNG, GIF and WebP still need one full-size frame in memory while decoding (only JPEG decodes smaller natively).
+- A brand-new picture is still decoded on the rendering thread the first time it is drawn (the editor's UI thread for the preview).
+- No permanent test for multi-frame GIF compositing at reduced size (the reviewer's probe showed it correct).
+- `docs/walkthroughs/renderer-memory.md` describes the first version (25% headroom, first-come budget) and needs an update.
+
+### Manual checks for the user
+
+1. **A 320 x 240 theme on the LCD** ("Small LCD" preset) with a photo: it should look as sharp as on `main` (M2).
+2. **Two GIFs on one page** on the LCD and in the editor: both animate. A long full-screen GIF plays its whole loop at the right speed;
+   if it is very long it may look a little choppier (frames skipped evenly), but not shorter (M1).
+3. **Resize a large photo** in the editor by dragging a handle: smooth, slightly soft while dragging, sharp about 0.3 s after letting go (L2).
+4. **Save over a picture** from an image editor while the editor and the display run: no grey box in between (L1).
+5. **Replace a video file** on disk with another clip of the same name: within about a second the new clip plays (L4).
+6. **Editor zoom at 300%** with a detailed photo: same as `main`.
+7. Repeat the reviewer's earlier checks 2, 3 and 6 (replace a picture, replace a font file, undo and redo with pictures and a video).

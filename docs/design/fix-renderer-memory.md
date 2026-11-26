@@ -99,3 +99,15 @@ Mutation check after the fix: disabling "skip sensors that already have history"
   smaller natively in SkiaSharp's `SKCodec`). Only the cached result is small.
 - Decoding still happens on the thread that renders (the editor's UI thread for the preview). Undo no longer causes it,
   but adding or replacing a large picture still decodes once on the UI thread.
+
+## Changed after the independent review
+
+The review (`docs/reviews/review-renderer-memory.md`) found two regressions and some polish; its section "Fixes after review" has the
+proof. Some statements above no longer hold:
+- The budget is no longer first come, first served: animations share it evenly, a cut animation skips frames evenly and keeps its loop
+  length, and none keeps fewer than 10 frames.
+- Pictures are decoded for the box on the target (`c.TotalMatrix.MapRect`), which includes the display pusher's scale; Stretch decodes to
+  the exact box.
+- There is no 25% headroom any more: size changes (bigger or much smaller) are decoded once the size has been stable for 300 ms.
+- A changed file replaces the picture only when it decodes; file checks run in the background; videos restart when their file changes.
+- Graphs are seeded for the part of their window that has no samples yet, instead of only when the history is empty.

@@ -90,7 +90,7 @@ public sealed class RendererMemoryTests : IDisposable
         var t = Fake.Canvas(200, 60);
         t.Widgets.Add(new Widget { Kind = WidgetKind.Text, Text = "Hello", FontSize = 30, FontFile = path });
         long now = 0;
-        using var r = new ThemeRenderer { Now = () => now };
+        using var r = new ThemeRenderer { Now = () => now, StatWaitMs = 5000 };
         using (Fake.Render(t, null, renderer: r)) { }
         var old = r.CachedFileFace(path)!;
 
@@ -170,9 +170,12 @@ public sealed class RendererMemoryTests : IDisposable
     {
         var path = Png("big.png", 2000, 1500, SKColors.Red);
         var t = ImageTheme(path, 40, 30, themeW: 400, themeH: 300);
-        using var r = new ThemeRenderer();
+        long now = 0;
+        using var r = new ThemeRenderer { Now = () => now, StatWaitMs = 5000 };
         using (Fake.Render(t, null, renderer: r)) { }
         t.Widgets[0].Width = 400; t.Widgets[0].Height = 300;
+        using (Fake.Render(t, null, renderer: r)) { }
+        now += 1000;   // the size has settled (review L2: no decode at every step of a drag)
         using (Fake.Render(t, null, renderer: r)) { }
         Assert.True(r.CachedImage(path)!.Width >= 400);
     }
@@ -199,13 +202,6 @@ public sealed class RendererMemoryTests : IDisposable
         }
     }
 
-    [Fact]
-    public void The_default_budget_is_far_below_the_old_600_MB_per_image()
-    {
-        using var r = new ThemeRenderer();
-        Assert.True(r.ImageBudgetBytes <= 128L * 1024 * 1024);
-    }
-
     // ---- files that change on disk ------------------------------------------------------------------------------
 
     [Fact]
@@ -214,7 +210,7 @@ public sealed class RendererMemoryTests : IDisposable
         var path = Png("pic.png", 50, 50, SKColors.Red);
         Touch(path, -60);
         long now = 0;
-        using var r = new ThemeRenderer { Now = () => now };
+        using var r = new ThemeRenderer { Now = () => now, StatWaitMs = 5000 };
         var t = ImageTheme(path, 100, 100);
         using (var bmp = Fake.Render(t, null, renderer: r)) Assert.Equal(SKColors.Red, bmp.GetPixel(50, 50));
 
@@ -229,7 +225,7 @@ public sealed class RendererMemoryTests : IDisposable
     {
         var path = Path.Combine(_dir, "later.png");
         long now = 0;
-        using var r = new ThemeRenderer { Now = () => now };
+        using var r = new ThemeRenderer { Now = () => now, StatWaitMs = 5000 };
         var t = ImageTheme(path, 100, 100);
         using (var bmp = Fake.Render(t, null, renderer: r)) Assert.NotEqual(SKColors.Red, bmp.GetPixel(50, 50));
 
@@ -243,7 +239,7 @@ public sealed class RendererMemoryTests : IDisposable
     {
         var path = Png("pic.png", 50, 50, SKColors.Red);
         long now = 0;
-        using var r = new ThemeRenderer { Now = () => now };
+        using var r = new ThemeRenderer { Now = () => now, StatWaitMs = 5000 };
         var t = ImageTheme(path, 100, 100);
         using (Fake.Render(t, null, renderer: r)) { }
         for (int i = 0; i < 5; i++)
@@ -351,21 +347,6 @@ public class GraphHistorySeedTests
         Assert.Equal(120 * 1000 / SensorHistory.SampleMs, w.Count);
     }
 
-    [Fact]
-    public void A_graph_that_already_has_real_samples_is_not_seeded_over()
-    {
-        var t = Fake.Canvas(200, 100);
-        t.Widgets.Add(Graph("v", 60));
-        var src = new FakeSource(new[] { new SensorInfo("v", "t", "v", "Load", 40, "%") });
-        using var r = new ThemeRenderer();
-        using (Fake.Render(t, src, renderer: r)) { }   // records a real sample
-        var real = r.History.Window("v", 0, 1e9).Count;
-        Assert.True(real >= 1);
-
-        r.SeedGraphHistory(t.ActivePage, src);
-
-        var w = r.History.Window("v", 0, 1e9);
-        Assert.True(Sorted(w), "no zigzag back to the left edge");
-        Assert.Equal(real, w.Count);
-    }
+    // A_graph_that_already_has_real_samples_is_not_seeded_over became
+    // GraphHistoryReviewFixTests.L3_real_samples_stay_and_only_the_missing_past_is_seeded (review L3: the empty past is now filled).
 }

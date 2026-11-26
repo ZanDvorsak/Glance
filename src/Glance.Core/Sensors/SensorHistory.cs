@@ -13,8 +13,9 @@ public sealed class SensorHistory
     public void Record(string sensorId, float value, long nowMs)
     {
         if (!_data.TryGetValue(sensorId, out var list)) _data[sensorId] = list = new();
+        // _lastSample is always the newest sample's time (Seed raises it too), so this throttle also keeps the list
+        // in time order: a time at or before the newest sample is less than SampleMs after it
         if (_lastSample.TryGetValue(sensorId, out var last) && nowMs - last < SampleMs) return;
-        if (list.Count > 0 && list[^1].ms >= nowMs) return;   // never out of order
         _lastSample[sensorId] = nowMs;
         list.Add((nowMs, value));
         var cutoff = nowMs - MaxSeconds * 1000L;
@@ -25,6 +26,9 @@ public sealed class SensorHistory
 
     /// <summary>True when the sensor has at least one sample (real or seeded).</summary>
     public bool HasSamples(string sensorId) => _data.TryGetValue(sensorId, out var list) && list.Count > 0;
+
+    /// <summary>Time of the sensor's oldest sample, or null when it has none.</summary>
+    public long? Oldest(string sensorId) => _data.TryGetValue(sensorId, out var list) && list.Count > 0 ? list[0].ms : null;
 
     /// <summary>
     /// Inserts a sample in time order without the sampling throttle (a sample at a time that is already there is
@@ -45,6 +49,17 @@ public sealed class SensorHistory
         if (!_data.TryGetValue(sensorId, out var list)) return Array.Empty<(long, float)>();
         int start = IndexOf(list, nowMs - (long)(seconds * 1000));
         return list.GetRange(start, list.Count - start);
+    }
+
+    /// <summary>
+    /// The same samples as <see cref="Window"/> without copying them, for drawing every frame. The view is only valid
+    /// until the history is changed again (the next Record or Seed), so use it at once and do not keep it.
+    /// </summary>
+    internal ReadOnlySpan<(long ms, float value)> View(string sensorId, long nowMs, double seconds)
+    {
+        if (!_data.TryGetValue(sensorId, out var list)) return ReadOnlySpan<(long, float)>.Empty;
+        int start = IndexOf(list, nowMs - (long)(seconds * 1000));
+        return System.Runtime.InteropServices.CollectionsMarshal.AsSpan(list)[start..];
     }
 
     /// <summary>Index of the first sample at or after <paramref name="ms"/> (the list is sorted).</summary>
