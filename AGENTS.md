@@ -144,3 +144,4 @@ dotnet test src/Glance.Tests -c Release      # ~240 tests, about 2 seconds, no h
 - Installer and exes are unsigned (SmartScreen will warn); no GitHub release has been published.
 - Full-screen video is limited to ~2.5 fps by USB; GIFs and small animations look better.
 - UI code (`Glance.App`) has no automated tests; its logic should live in `Glance.Core` where it can be tested.
+- **TODO:** make the live display a widget, so people without the hardware can still see their screen (for example docked in the editor or a small always-on-top window). The virtual display window already renders the theme with live sensors, so reuse that renderer.
