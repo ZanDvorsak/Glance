@@ -6,7 +6,8 @@ using Microsoft.Win32;
 namespace Glance.Core.Setup;
 
 public enum CheckStatus { Ok, Info, Warning, Problem }
-public enum FixKind { None, OpenUrl, WingetInstall, OpenServiceDialog }
+/// <summary><see cref="WingetInstallMachine"/> installs for all users (machine scope, Windows asks for administrator rights).</summary>
+public enum FixKind { None, OpenUrl, WingetInstall, OpenServiceDialog, WingetInstallMachine }
 
 /// <summary>One line of the setup check: what was looked at, the verdict, and (when there is one) a one-click fix.</summary>
 public sealed record CheckResult(string Id, string Title, CheckStatus Status, string Detail,
@@ -52,14 +53,55 @@ public static class SetupChecks
 
         Ffmpeg.Reset();
         var ffmpeg = Ffmpeg.Find();
-        list.Add(ffmpeg is not null
-            ? new CheckResult("ffmpeg", "FFmpeg (video backgrounds)", CheckStatus.Ok, "Found. Video backgrounds are ready.")
-            : new CheckResult("ffmpeg", "FFmpeg (video backgrounds)", CheckStatus.Info,
-                "Optional. Only needed for video backgrounds; images and GIFs work without it.",
-                "Install FFmpeg", FixKind.WingetInstall, FfmpegId));
+        list.Add(DiagnoseFfmpeg(ffmpeg, ffmpeg is null ? null : Ffmpeg.FindForElevated()));
 
         return list;
     }
+
+    /// <summary>
+    /// The FFmpeg row. <paramref name="found"/> is what this (normal) process would use; <paramref name="usableByRunner"/>
+    /// is what the elevated runner would use, which must sit in a folder only administrators can change.
+    /// </summary>
+    public static CheckResult DiagnoseFfmpeg(string? found, string? usableByRunner)
+    {
+        const string id = "ffmpeg", title = "FFmpeg (video backgrounds)";
+        if (usableByRunner is not null)
+            return new CheckResult(id, title, CheckStatus.Ok, "Found. Video backgrounds are ready, in the editor and in the background runner.");
+        if (found is not null)
+            return new CheckResult(id, title, CheckStatus.Warning,
+                $"Found at {found}, but that folder can be changed without administrator rights. The background runner runs as " +
+                "administrator and will not start FFmpeg from there, so video backgrounds only play while the editor is sending. " +
+                "Install FFmpeg for all users to fix this (Windows asks for permission).",
+                "Install for all users", FixKind.WingetInstallMachine, FfmpegId);
+        return new CheckResult(id, title, CheckStatus.Info,
+            "Optional. Only needed for video backgrounds; images and GIFs work without it. It is installed for all users " +
+            "(Windows asks for permission) so the background runner can use it too.",
+            "Install FFmpeg", FixKind.WingetInstallMachine, FfmpegId);
+    }
+
+    /// <summary>
+    /// How to start winget for a fix. A machine-scope install starts winget elevated (Windows shows a UAC prompt), so
+    /// portable packages land under Program Files where only administrators can change them.
+    /// </summary>
+    public static ProcessStartInfo WingetInstallStartInfo(string packageId, bool machineScope)
+    {
+        var args = $"install --id {packageId} --exact --accept-package-agreements --accept-source-agreements --disable-interactivity";
+        if (!machineScope)
+            return new ProcessStartInfo("winget", args)
+                { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+        // runas needs the shell, which rules out redirecting output; the exit code still comes back
+        return new ProcessStartInfo("winget", args + " --scope machine")
+            { UseShellExecute = true, Verb = "runas", WindowStyle = ProcessWindowStyle.Hidden };
+    }
+
+    /// <summary>What to tell the user when a machine-scope FFmpeg install did not end with a usable copy.</summary>
+    public const string FfmpegMachineInstallHelp =
+        "If FFmpeg is already installed for your user only, winget may not add a second copy. Remove it first with " +
+        "\"winget uninstall --id Gyan.FFmpeg --scope user\", then click Install again, or run " +
+        "\"winget install --id Gyan.FFmpeg --scope machine\" in a terminal opened as administrator.";
+
+    /// <summary>Win32 error code when the user says No to the UAC prompt.</summary>
+    public const int UacCancelled = 1223;
 
     public static bool NeedsAttention(IEnumerable<CheckResult> results) => results.Any(r => r.Status == CheckStatus.Problem);
 

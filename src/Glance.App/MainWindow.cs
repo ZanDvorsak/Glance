@@ -1263,17 +1263,18 @@ public sealed class MainWindow : Window
     {
         if (_installingFfmpeg) return;
         _installingFfmpeg = true;
-        _status.Text = "Installing FFmpeg via winget (Gyan.FFmpeg)... this can take a minute.";
+        _status.Text = "Installing FFmpeg for all users via winget (Gyan.FFmpeg); Windows asks for permission. This can take a minute.";
         try
         {
-            var psi = new ProcessStartInfo("winget", "install --id Gyan.FFmpeg --exact --accept-package-agreements --accept-source-agreements --disable-interactivity")
-            { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
-            using var proc = Process.Start(psi)!;
+            // machine scope: the elevated background runner only starts an ffmpeg.exe that normal users cannot change
+            using var proc = Process.Start(SetupChecks.WingetInstallStartInfo(SetupChecks.FfmpegId, machineScope: true))!;
             await proc.WaitForExitAsync();
             Ffmpeg.Reset();
             _renderer.ClearImageCache();
-            _status.Text = Ffmpeg.Find() is not null ? "FFmpeg installed. Video backgrounds are ready." : $"FFmpeg install finished with code {proc.ExitCode}; it may need an app restart.";
+            _status.Text = Ffmpeg.Find() is not null ? "FFmpeg installed. Video backgrounds are ready."
+                : $"FFmpeg install finished with code {proc.ExitCode}. " + SetupChecks.FfmpegMachineInstallHelp;
         }
+        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == SetupChecks.UacCancelled) { _status.Text = "FFmpeg install cancelled: Windows did not get permission."; }
         catch (Exception ex) { _status.Text = "FFmpeg install failed: " + ex.Message; }
         finally { _installingFfmpeg = false; }
     }

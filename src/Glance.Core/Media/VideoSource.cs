@@ -22,7 +22,11 @@ public sealed class VideoSource : IDisposable
     {
         Width = Math.Max(2, width); Height = Math.Max(2, height);
         var ffmpeg = Ffmpeg.Find();
-        if (ffmpeg is null) { Error = "FFmpeg not found"; return; }
+        if (ffmpeg is null)
+        {
+            Error = Ffmpeg.LastRejection is not null ? "FFmpeg is only in a folder normal users can change (see runner.log)" : "FFmpeg not found";
+            return;
+        }
 
         var scale = fit switch
         {
