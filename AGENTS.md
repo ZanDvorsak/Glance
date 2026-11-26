@@ -76,6 +76,17 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
   `BRIGHTNESS <0-7>`, `LIVE <base64 folder> <base64 theme json>` (show the editor's unsaved theme; `-` for no folder), `LIVE_CLEAR`.
   Build and parse them only with `Glance.Core.Control.ControlCommand` (shared by both sides and tested). Pipes are limited to the current Windows user.
 - Single runner per session (mutex `Local\Glance.Runner`). Auto-start is a scheduled task named `Glance Runner` created only from the editor on request.
+- **Runner command-line modes** (no tray, no display, no mutex; outcome in `runner.log`): `--install-autostart --user DOMAIN\name`
+  registers the task through the Task Scheduler COM API, built in memory from the runner's own path, then reads it back;
+  `--remove-autostart` deletes it. Exit codes are `AutostartTask.Exit` (0 ok, 10-20 failures, each with a message). The editor
+  starts install mode through UAC, but removes the task with `schtasks /Delete` so it never elevates a possibly untrusted copy.
+  Auto-start is refused unless `FolderTrust.CheckExecutable` says only administrators can change the runner and everything
+  in its folder, and unless the signed-in user is an administrator.
+- **Trust checks:** `Glance.Core.Security.FolderTrust` is the one engine for "may an elevated process start this?"
+  (owner and ACL allow-list, no links, fixed local drive, complete chain to the drive root). Use it, do not add another.
+- The runner's environment comes from the user (autostart passes it on). `StartupHookSupport` is off for the runner and the
+  sensor host; profiler and diagnostics variables (`CORECLR_*`, `DOTNET_DiagnosticPorts`) cannot be blocked in-process and
+  are only logged as a warning. See the H1 notes in `docs/reviews/review-autostart-task.md`.
 - **Settings and themes:** `%AppData%\Glance` (`settings.json`, `Themes\<name>\theme.json` + `assets\`). On first use, the old
   `%AppData%\MiniLcd` folder is copied over (the app used to be called MiniLcd).
 
@@ -100,7 +111,11 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
 - **`AidaImporter`** reads `.axlcd` (text, one item per line, BGR colour ints) and maps AIDA item codes to sensors. Pages become pages.
 - **`ThemePackage`** reads/writes `.glance` (zip with `theme.json` + `assets/`). Import is defensive on purpose (path traversal, drive letters, size/entry caps, only `theme.json` and `assets/*`). Keep it that way.
 - **Undo/redo** is snapshot based (`Theme.ToSnapshot/ApplySnapshot`), debounced; all pages and widgets are hooked (`HookAll`).
-- **Video** is decoded by an `ffmpeg` child process (`-re` is required or it plays several times too fast); FFmpeg is optional and found automatically (PATH, winget, app folder).
+- **Video** is decoded by an `ffmpeg` child process (`-re` is required or it plays several times too fast); FFmpeg is optional and found automatically (app folder, PATH, winget machine and user folders).
+  In an elevated process (the runner) `Ffmpeg.Find` only accepts a copy that only administrators can change
+  (`FolderTrust.CheckExecutable(exe, TrustScope.FolderFiles)`: the exe, the files next to it, its folder and every folder above it, no links); rejections go to `runner.log`. The editor's
+  "Install for all users" runs winget with `--scope machine` elevated and then resets the package folder's permissions,
+  because winget moves the files there from the user's temp folder with the user's access still on them.
 
 ## Conventions and gotchas
 

@@ -124,7 +124,7 @@ public sealed class SetupWindow : Window
             {
                 case FixKind.OpenServiceDialog: _openService(); break;
                 case FixKind.OpenUrl: Process.Start(new ProcessStartInfo(r.FixArg!) { UseShellExecute = true }); break;
-                case FixKind.WingetInstall: await InstallAsync(r, b); break;
+                case FixKind.WingetInstall or FixKind.WingetInstallMachine: await InstallAsync(r, b); break;
             }
         };
         return b;
@@ -137,12 +137,11 @@ public sealed class SetupWindow : Window
         Say($"Installing {r.FixArg} with winget. Windows may ask for permission. This can take a minute.");
         try
         {
+            bool machine = r.Fix == FixKind.WingetInstallMachine;
             var code = await Task.Run(() =>
             {
-                var psi = new ProcessStartInfo("winget", $"install --id {r.FixArg} --exact --accept-package-agreements --accept-source-agreements --disable-interactivity")
-                { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
-                using var p = Process.Start(psi)!;
-                p.StandardOutput.ReadToEnd(); p.StandardError.ReadToEnd();
+                using var p = Process.Start(SetupChecks.WingetInstallStartInfo(r.FixArg!, machine))!;
+                if (!machine) { p.StandardOutput.ReadToEnd(); p.StandardError.ReadToEnd(); }
                 p.WaitForExit();
                 return p.ExitCode;
             });
@@ -150,8 +149,11 @@ public sealed class SetupWindow : Window
                 ? r.FixArg == SetupChecks.ZadigId
                     ? "Zadig is installed. Click \"Open Zadig\", then: Options > List All Devices, choose \"USB-Display\", pick libusb-win32 and click Install Driver."
                     : $"{r.FixArg} is installed."
-                : $"The installer finished with code {code}. If it did not install, try the same command in a terminal: winget install --id {r.FixArg}");
+                : r.FixArg == SetupChecks.FfmpegId && machine
+                    ? $"The installer finished with code {code}. " + SetupChecks.FfmpegMachineInstallHelp
+                    : $"The installer finished with code {code}. If it did not install, try the same command in a terminal: winget install --id {r.FixArg}");
         }
+        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == SetupChecks.UacCancelled) { Say("Install cancelled: Windows did not get permission."); }
         catch (Exception ex) { Say("Could not run winget: " + ex.Message); }
         finally { _installing = false; await RefreshAsync(); }
     }

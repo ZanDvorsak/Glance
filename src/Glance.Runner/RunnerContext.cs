@@ -48,6 +48,7 @@ internal sealed class RunnerContext : ApplicationContext
     {
         _ = _ui.Handle; // force handle creation so other threads can marshal onto the UI thread
         Log("Runner starting as " + WindowsIdentity.GetCurrent().Name);
+        Glance.Core.Media.Ffmpeg.Rejected += Log; // say why a user-writable ffmpeg.exe is not started as administrator
 
         _sensors = new LocalSensorSource();
         _pipeServer.Start();

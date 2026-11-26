@@ -21,7 +21,7 @@ Start `Glance.App.exe`. On the first start (or any time from the **Setup check**
 | Sensor driver (PawnIO) | CPU and motherboard sensors cannot be read until [PawnIO](https://pawnio.eu/) is installed. |
 | Hardware sensors | The runner is not running, so only basic sensors are available (CPU temperature may show 0 °C). |
 | Background runner | Not started yet, see [step 8](#8-keep-it-running-without-the-editor). |
-| FFmpeg | Only needed for video backgrounds. GIFs and images work without it. |
+| FFmpeg | Only needed for video backgrounds. GIFs and images work without it. The background runner only uses FFmpeg installed for all users; if the row says it is installed for your user only, click **Install for all users** (Windows asks for permission). |
 
 The page updates by itself, so you can plug in the display or install a driver and watch the dot turn green.
 
