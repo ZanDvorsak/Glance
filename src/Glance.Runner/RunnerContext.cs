@@ -8,6 +8,7 @@ using Glance.Core.Control;
 using Glance.Core.Display;
 using Glance.Core.Sensors;
 using Glance.Core.Settings;
+using Glance.Core.Storage;
 using Glance.Core.Themes;
 using Glance.Core.Usb;
 
@@ -37,7 +38,7 @@ internal sealed class RunnerContext : ApplicationContext
     private bool _quitting;
     private volatile bool _blankOwed;     // a power event found the display busy; blank it when the UI thread lets go
 
-    private AppSettings _settings = AppSettings.Load();
+    private AppSettings _settings = AppSettings.Load(Log);
     private Theme _theme = Theme.CreateDefault(null);
     private Theme? _live;                 // unsaved theme streamed from the editor
     private DisplayPusher? _pusher;
@@ -98,7 +99,7 @@ internal sealed class RunnerContext : ApplicationContext
         try
         {
             var p = _settings.LastTheme;
-            _theme = p is not null && File.Exists(p) ? Theme.Load(p) : Theme.CreateDefault(null);
+            _theme = p is not null && File.Exists(p) ? AtomicFile.ReadWithRetry(() => Theme.Load(p)) : Theme.CreateDefault(null);
             Log(p is not null && File.Exists(p) ? "Loaded theme " + p : "No saved theme yet; showing the starter layout");
         }
         catch (Exception ex) { Log("Theme load failed: " + ex.Message); _theme = Theme.CreateDefault(null); }
@@ -109,7 +110,8 @@ internal sealed class RunnerContext : ApplicationContext
     {
         lock (_gate)
         {
-            _settings = AppSettings.Load();
+            // a settings file that cannot be read right now keeps the settings already in use (never the defaults)
+            if (AppSettings.TryLoad(out var fresh, Log)) _settings = fresh;
             _brightness = _settings.Brightness;
             LoadTheme();
             RewatchThemeFolder();

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Glance.Core.Storage;
 
 namespace Glance.Core.Settings;
 
@@ -50,15 +51,28 @@ public sealed class AppSettings
         foreach (var dir in Directory.EnumerateDirectories(from)) CopyDirectory(dir, Path.Combine(to, Path.GetFileName(dir)));
     }
 
-    public static AppSettings Load()
+    public static AppSettings Load(Action<string>? log = null) => Load(FilePath, log);
+
+    public static AppSettings Load(string path, Action<string>? log = null)
     {
-        try { return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath)) ?? new(); }
-        catch { return new(); }
+        TryLoad(path, out var settings, log);
+        return settings;
+    }
+
+    public static bool TryLoad(out AppSettings settings, Action<string>? log = null) => TryLoad(FilePath, out settings, log);
+
+    public static bool TryLoad(string path, out AppSettings settings, Action<string>? log = null)
+    {
+        try { settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path)) ?? new(); }
+        catch { settings = new(); }
+        return true;
     }
 
     public void Save()
     {
-        try { Directory.CreateDirectory(Folder); File.WriteAllText(FilePath, JsonSerializer.Serialize(this)); }
+        try { Directory.CreateDirectory(Folder); Save(FilePath); }
         catch { /* non-fatal */ }
     }
+
+    public void Save(string path) => AtomicFile.WriteAllText(path, JsonSerializer.Serialize(this));
 }
