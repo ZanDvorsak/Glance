@@ -36,6 +36,7 @@ public sealed class DisplayPowerPolicy
 {
     private readonly object _lock = new();
     private bool _ended, _suspended;
+    private int _awakeTicks;
 
     /// <summary>True once the session ended or the program quit. The display must not be opened again.</summary>
     public bool Ended { get { lock (_lock) return _ended; } }
@@ -46,6 +47,29 @@ public sealed class DisplayPowerPolicy
     /// <summary>Whether the display may be opened (and drawn to) right now.</summary>
     public bool MayDrive { get { lock (_lock) return !_ended && !_suspended; } }
 
+    /// <summary>
+    /// Called by the owner's periodic timer (the runner's 2 s supervisor). Timers do not run while the PC sleeps, so ticks only
+    /// count time spent awake. If Windows never sends the wake-up notice (a vetoed or failed suspend, a missed broadcast),
+    /// this clears the "asleep" state after <paramref name="ticksToHeal"/> awake ticks so the display does not stay dark for good.
+    /// </summary>
+    /// <returns><see cref="PowerAction.Reopen"/> when it healed a stuck sleep state, otherwise <see cref="PowerAction.None"/>.</returns>
+    public PowerAction NoteAwakeTick(int ticksToHeal = 15)
+    {
+        lock (_lock)
+        {
+            if (_ended || !_suspended) { _awakeTicks = 0; return PowerAction.None; }
+            if (++_awakeTicks < ticksToHeal) return PowerAction.None;
+            _awakeTicks = 0;
+            _suspended = false;
+            return PowerAction.Reopen;
+        }
+    }
+
+    /// <remarks>
+    /// The first session end or quit always returns <see cref="PowerAction.BlankAndStop"/>, even while asleep (then there is
+    /// nothing open to blank, but the owner must still stop, for example when an installer closes the app).
+    /// Owners also treat a user's "resume" or "reload" as <see cref="PowerEvent.Resume"/>, which clears a stale sleep state.
+    /// </remarks>
     public PowerAction Handle(PowerEvent e)
     {
         lock (_lock)
@@ -56,11 +80,12 @@ public sealed class DisplayPowerPolicy
                 case PowerEvent.Quit:
                     if (_ended) return PowerAction.None;                       // the final blank already happened
                     _ended = true;
-                    return _suspended ? PowerAction.None : PowerAction.BlankAndStop; // while asleep the display is already dark and released
+                    return PowerAction.BlankAndStop;
 
                 case PowerEvent.Suspend:
                     if (_ended || _suspended) return PowerAction.None;
                     _suspended = true;
+                    _awakeTicks = 0;
                     return PowerAction.BlankAndHold;
 
                 case PowerEvent.Resume:

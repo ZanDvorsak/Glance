@@ -8,6 +8,7 @@ using Glance.Core.Display;
 using Glance.Core.Sensors;
 using Glance.Core.Settings;
 using Glance.Core.Themes;
+using Glance.Core.Usb;
 
 namespace Glance.Runner;
 
@@ -33,6 +34,7 @@ internal sealed class RunnerContext : ApplicationContext
     private readonly DisplayPowerPolicy _power = new();
     private SessionPowerWatcher? _powerWatcher;
     private bool _quitting;
+    private volatile bool _blankOwed;     // a power event found the display busy; blank it when the UI thread lets go
 
     private AppSettings _settings = AppSettings.Load();
     private Theme _theme = Theme.CreateDefault(null);
@@ -67,7 +69,7 @@ internal sealed class RunnerContext : ApplicationContext
         menu.Items.Add(_pauseItem);
         menu.Items.Add("Next page", null, (_, _) => { lock (_gate) _pusher?.NextPage(); });
         menu.Items.Add("Previous page", null, (_, _) => { lock (_gate) _pusher?.PrevPage(); });
-        menu.Items.Add("Reload theme", null, (_, _) => Reload());
+        menu.Items.Add("Reload theme", null, (_, _) => { ClearStaleSleep(); Reload(); });
         menu.Items.Add("Open editor", null, (_, _) => OpenEditor());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => Quit());
@@ -82,6 +84,7 @@ internal sealed class RunnerContext : ApplicationContext
         WatchFiles();
         _ = Task.Run(ControlLoop);
         _powerWatcher = StartPowerWatcher();
+        _supervisor.Tick += (_, _) => HealStuckSleep();
     }
 
     // ---- theme / settings ---------------------------------------------------------------------------------------
@@ -146,12 +149,14 @@ internal sealed class RunnerContext : ApplicationContext
     {
         lock (_gate)
         {
-            if (!_power.MayDrive) { DisposePusher(); SetStatus(_power.Ended ? "Display off: Windows is ending the session" : "Display off while Windows sleeps"); return; }
+            if (!_power.MayDrive) { PayOwedBlank(); DisposePusher(); SetStatus(_power.Ended ? "Display off: Windows is ending the session" : "Display off while Windows sleeps"); return; }
             if (_paused) { DisposePusher(); SetStatus("Display paused"); return; }
             if (_pusher is null)
             {
                 try { _pusher = new DisplayPusher(() => Current, _sensors, _brightness) { PinnedPage = _pinPage }; _failingSince = null; _lastError = null; Log("Display opened"); }
                 catch (Exception ex) { _lastError = ex.Message; }
+                // Windows may have started a shutdown or sleep while it opened (the power event does not wait behind this lock)
+                if (_pusher is not null && !_power.MayDrive) { Log("Windows is ending the session or sleeping; closing the display just opened"); _blankOwed = false; DisposePusher(); }
             }
             else if (_pusher.LastError is not null)
             {
@@ -178,28 +183,59 @@ internal sealed class RunnerContext : ApplicationContext
     }
 
     /// <summary>
-    /// Runs on the watcher's own thread, and Windows waits for it: at a session end the process is killed soon after it returns,
-    /// so the display is blanked here, not later on the UI thread. It must never wait on the UI thread (BeginInvoke only).
+    /// Runs on a watcher thread while Windows waits for the answer: at a session end the process is killed soon after, so the
+    /// display is blanked here, not later on the UI thread. It never waits on the UI thread (BeginInvoke only), and the blank is
+    /// bounded: if the UI thread holds <see cref="_gate"/> for long (opening or reloading the display), it gives up and leaves
+    /// the blank to the UI thread, which sees the policy and pays the owed blank when it lets go.
     /// </summary>
     private void OnPowerEvent(PowerEvent e)
     {
-        PowerAction action;
-        lock (_gate)
+        var action = _power.Handle(e);       // the policy has its own lock: from now on Supervise will not open the display
+        Log($"Windows {e}: {action}");      // before blanking, in case Windows ends the process during it
+        if (action is PowerAction.BlankAndStop or PowerAction.BlankAndHold)
         {
-            action = _power.Handle(e);
-            if (action is PowerAction.BlankAndStop or PowerAction.BlankAndHold) DisposePusher(blank: true);
+            var result = PowerBlank.Run(_gate, TakePusher, PowerBlank.OwnerBudgetFor(e));
+            if (result == PowerBlank.Result.Busy) _blankOwed = true;
+            Log($"Windows {e}: blank {result}");
         }
-        Log($"Windows {e}: {action}");
-        switch (action)
-        {
-            case PowerAction.BlankAndStop: _ui.BeginInvoke(Quit); break;   // also covers an installer closing the app (Restart Manager)
-            case PowerAction.BlankAndHold:
-            case PowerAction.Reopen: _ui.BeginInvoke(Supervise); break;    // updates the status; after wake it reopens the display (and keeps retrying)
-        }
+        if (e == PowerEvent.SessionEnding) _ui.BeginInvoke(Quit);   // always, even while asleep: also an installer closing the app (Restart Manager)
+        else if (action is PowerAction.BlankAndHold or PowerAction.Reopen) _ui.BeginInvoke(Supervise); // status now; after wake it reopens (and keeps retrying)
+    }
+
+    /// <summary>Runs under <see cref="_gate"/>: detaches the pusher so it can be blanked outside the lock.</summary>
+    private Action? TakePusher()
+    {
+        var p = _pusher;
+        _pusher = null; _failingSince = null;
+        return p is null ? null : () => p.Stop(blank: true);
+    }
+
+    /// <summary>Under <see cref="_gate"/>: a power event found the display busy, so blank it now that the lock is free.</summary>
+    private void PayOwedBlank()
+    {
+        if (!_blankOwed) return;
+        _blankOwed = false;
+        if (_pusher is not null) DisposePusher();
+        else if (Ax206Display.TryBlank() is { } err) Log("Could not blank the display after a power event: " + err);
+    }
+
+    /// <summary>Supervisor tick: if Windows never sent the wake-up notice, do not stay dark for good.</summary>
+    private void HealStuckSleep()
+    {
+        if (_power.NoteAwakeTick() != PowerAction.Reopen) return;
+        Log("No wake-up notice from Windows after 30 s awake; reopening the display");
+        Supervise();
+    }
+
+    /// <summary>The user asked for the display (Resume, Reload): that also clears a sleep state Windows never ended.</summary>
+    private void ClearStaleSleep()
+    {
+        if (_power.Handle(PowerEvent.Resume) == PowerAction.Reopen) Log("Cleared a sleep state that Windows never ended");
     }
 
     private void SetPaused(bool paused)
     {
+        if (!paused) ClearStaleSleep();
         _paused = paused;
         _pauseItem.Text = paused ? "Resume display" : "Pause display";
         Supervise();
@@ -317,7 +353,12 @@ internal sealed class RunnerContext : ApplicationContext
         _cts.Cancel();
         _supervisor.Stop();
         foreach (var w in _watchers) w.Dispose();
-        lock (_gate) { if (_power.Handle(PowerEvent.Quit) == PowerAction.BlankAndStop) DisposePusher(); } // blank once, even if a session end got there first
+        lock (_gate)
+        {
+            _power.Handle(PowerEvent.Quit);   // nothing may reopen the display from here on
+            PayOwedBlank();                   // a session end that found the display busy
+            DisposePusher();                  // blanks it unless a session end already took and blanked it
+        }
         _powerWatcher?.Dispose();
         _pipeServer.Dispose();
         _sensors.Dispose();

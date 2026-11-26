@@ -66,14 +66,48 @@ public class DisplayPowerPolicyTests
     }
 
     [Fact]
-    public void Session_end_while_asleep_needs_no_second_blank_and_wake_does_not_reopen()
+    public void Session_end_while_asleep_still_stops_so_the_owner_exits_and_wake_does_not_reopen()
     {
+        // review L1: with a stuck "asleep" state, an installer's WM_ENDSESSION must still make the runner quit
         var p = new DisplayPowerPolicy();
         p.Handle(PowerEvent.Suspend);
-        Assert.Equal(PowerAction.None, p.Handle(PowerEvent.SessionEnding)); // already dark and released
+        Assert.Equal(PowerAction.BlankAndStop, p.Handle(PowerEvent.SessionEnding)); // the blank is a no-op (nothing open), the stop is not
         Assert.True(p.Ended);
+        Assert.Equal(PowerAction.None, p.Handle(PowerEvent.Quit));
         Assert.Equal(PowerAction.None, p.Handle(PowerEvent.Resume));
         Assert.False(p.MayDrive);
+    }
+
+    [Fact]
+    public void A_missed_wake_notice_heals_after_enough_awake_ticks()
+    {
+        // review L1: if Windows never sends the resume notification, the display must not stay dark for good
+        var p = new DisplayPowerPolicy();
+        p.Handle(PowerEvent.Suspend);
+        for (int i = 0; i < 14; i++) Assert.Equal(PowerAction.None, p.NoteAwakeTick(15));
+        Assert.Equal(PowerAction.Reopen, p.NoteAwakeTick(15));
+        Assert.True(p.MayDrive);
+        Assert.Equal(PowerAction.None, p.Handle(PowerEvent.Resume));   // the late real notice changes nothing
+    }
+
+    [Fact]
+    public void Awake_ticks_do_nothing_when_awake_or_after_the_session_ended_and_restart_with_each_sleep()
+    {
+        var p = new DisplayPowerPolicy();
+        for (int i = 0; i < 20; i++) Assert.Equal(PowerAction.None, p.NoteAwakeTick(3));   // not asleep
+        p.Handle(PowerEvent.Suspend);
+        p.NoteAwakeTick(3); p.NoteAwakeTick(3);
+        p.Handle(PowerEvent.Resume);
+        p.Handle(PowerEvent.Suspend);                                                        // a new sleep starts the count again
+        Assert.Equal(PowerAction.None, p.NoteAwakeTick(3));
+        Assert.Equal(PowerAction.None, p.NoteAwakeTick(3));
+        Assert.Equal(PowerAction.Reopen, p.NoteAwakeTick(3));
+
+        var ended = new DisplayPowerPolicy();
+        ended.Handle(PowerEvent.Suspend);
+        ended.Handle(PowerEvent.SessionEnding);
+        for (int i = 0; i < 20; i++) Assert.Equal(PowerAction.None, ended.NoteAwakeTick(3));
+        Assert.False(ended.MayDrive);
     }
 
     [Fact]
@@ -109,7 +143,6 @@ public class PowerMessagesTests
     [InlineData(PowerMessages.PBT_APMSUSPEND, PowerEvent.Suspend)]
     [InlineData(PowerMessages.PBT_APMRESUMEAUTOMATIC, PowerEvent.Resume)]
     [InlineData(PowerMessages.PBT_APMRESUMESUSPEND, PowerEvent.Resume)]
-    [InlineData(PowerMessages.PBT_APMRESUMECRITICAL, PowerEvent.Resume)]
     public void Power_broadcasts_map_to_sleep_and_wake(int pbt, PowerEvent expected) =>
         Assert.Equal(expected, PowerMessages.Translate(PowerMessages.WM_POWERBROADCAST, pbt));
 
@@ -120,9 +153,110 @@ public class PowerMessagesTests
         Assert.Null(PowerMessages.Translate(PowerMessages.WM_POWERBROADCAST, pbt));
 }
 
+public class PowerBlankTests
+{
+    private static readonly TimeSpan Budget = TimeSpan.FromMilliseconds(300);
+
+    [Fact]
+    public void Gives_up_on_a_stalled_display_within_its_budget()
+    {
+        // review M1: a display that stops answering must not hold Windows' shutdown or sleep
+        using var release = new ManualResetEventSlim();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = PowerBlank.Run(new object(), () => () => release.Wait(5000), Budget);
+        sw.Stop();
+        release.Set();
+        Assert.Equal(PowerBlank.Result.TimedOut, result);
+        Assert.True(sw.ElapsedMilliseconds < 1000, $"took {sw.ElapsedMilliseconds} ms");
+    }
+
+    [Fact]
+    public void Does_not_wait_for_ever_behind_a_busy_owner()
+    {
+        // review M1: the runner's UI thread can hold its lock for seconds while it opens or reloads the display
+        var gate = new object();
+        using var held = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var owner = new Thread(() => { lock (gate) { held.Set(); release.Wait(5000); } }) { IsBackground = true };
+        owner.Start();
+        held.Wait();
+        bool taken = false;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = PowerBlank.Run(gate, () => { taken = true; return null; }, Budget);
+        sw.Stop();
+        release.Set();
+        Assert.Equal(PowerBlank.Result.Busy, result);
+        Assert.False(taken);
+        Assert.True(sw.ElapsedMilliseconds < 1000, $"took {sw.ElapsedMilliseconds} ms");
+    }
+
+    [Fact]
+    public void Blanks_normally_when_nothing_is_stuck()
+    {
+        int stops = 0;
+        Assert.Equal(PowerBlank.Result.Blanked, PowerBlank.Run(new object(), () => () => stops++, Budget));
+        Assert.Equal(1, stops);
+        Assert.Equal(PowerBlank.Result.NothingOpen, PowerBlank.Run(new object(), () => null, Budget));
+    }
+
+    [Fact]
+    public void Budgets_fit_inside_what_Windows_allows()
+    {
+        Assert.True(PowerBlank.BudgetFor(PowerEvent.SessionEnding) <= TimeSpan.FromSeconds(4));   // WM_ENDSESSION: about 5 s
+        Assert.True(PowerBlank.BudgetFor(PowerEvent.Suspend) <= TimeSpan.FromSeconds(1.5));       // PBT_APMSUSPEND: about 2 s
+        foreach (var e in new[] { PowerEvent.SessionEnding, PowerEvent.Suspend })
+            Assert.True(PowerBlank.OwnerBudgetFor(e) < PowerBlank.BudgetFor(e) && PowerBlank.OwnerBudgetFor(e) > TimeSpan.Zero);
+    }
+
+    [Fact]
+    public void Wake_retries_last_long_enough_for_a_hibernate_resume()
+    {
+        // review L2: the editor gave up after 7.5 s; USB can take longer to come back after hibernate
+        var delays = ResumeRetry.Delays().ToList();
+        var total = TimeSpan.FromTicks(delays.Sum(d => d.Ticks));
+        Assert.True(total >= TimeSpan.FromSeconds(45), $"retries for {total.TotalSeconds} s only");
+        Assert.True(total <= TimeSpan.FromSeconds(90));
+        Assert.True(delays[0] <= TimeSpan.FromSeconds(2));                       // the common case is still quick
+        Assert.All(delays, d => Assert.True(d <= TimeSpan.FromSeconds(5)));      // and a late display is picked up soon
+    }
+}
+
 /// <summary>Uses a real (hidden) window and sends it the messages Windows would send. Nothing is shut down or put to sleep.</summary>
+[System.Runtime.Versioning.SupportedOSPlatform("windows")]
 public class SessionPowerWatcherTests
 {
+    [Fact]
+    public void Handler_has_finished_when_the_window_answers()
+    {
+        // review L6: the display must be blank before Windows gets the answer; a slow handler exposes an asynchronous one
+        var seen = new List<PowerEvent>();
+        using var w = new SessionPowerWatcher(e => { Thread.Sleep(150); lock (seen) seen.Add(e); });
+        SendMessageW(w.WindowHandle, PowerMessages.WM_ENDSESSION, 1, 0);
+        lock (seen) Assert.Equal(new[] { PowerEvent.SessionEnding }, seen);
+        SendMessageW(w.WindowHandle, PowerMessages.WM_POWERBROADCAST, PowerMessages.PBT_APMSUSPEND, 0);
+        lock (seen) Assert.Equal(new[] { PowerEvent.SessionEnding, PowerEvent.Suspend }, seen);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Windows_gets_its_answer_within_the_budget_even_if_the_handler_hangs(bool sessionEnd)
+    {
+        // review M1: whatever the owner does, the watcher answers in time and always drops the shutdown block reason
+        using var release = new ManualResetEventSlim();
+        var budget = TimeSpan.FromMilliseconds(300);
+        using var w = new SessionPowerWatcher(_ => release.Wait(5000), sessionEndBudget: budget, otherBudget: budget);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        if (sessionEnd) SendMessageW(w.WindowHandle, PowerMessages.WM_ENDSESSION, 1, 0);
+        else SendMessageW(w.WindowHandle, PowerMessages.WM_POWERBROADCAST, PowerMessages.PBT_APMSUSPEND, 0);
+        sw.Stop();
+        uint n = 0;
+        bool stillBlocking = ShutdownBlockReasonQuery(w.WindowHandle, IntPtr.Zero, ref n);
+        release.Set();
+        Assert.True(sw.ElapsedMilliseconds < 1500, $"answered after {sw.ElapsedMilliseconds} ms");
+        Assert.False(stillBlocking);
+    }
+
     [Fact]
     public void Window_is_hidden_and_top_level_so_it_receives_broadcasts()
     {

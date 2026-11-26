@@ -159,9 +159,11 @@ public sealed class MainWindow : Window
         Closing += (_, _) =>
         {
             StopLive();
-            lock (_powerGate) _power.Handle(PowerEvent.Quit);   // nothing may reopen the display from here on
-            ReleasePusher();
-            _powerWatcher?.Dispose();
+            _power.Handle(PowerEvent.Quit);   // nothing may reopen the display from here on
+            // Avalonia also closes the window this way when Windows shuts down (WM_QUERYENDSESSION), so this is usually where the
+            // session-end blank happens. It runs off the UI thread so the window closes at once; Program.Main waits for it (bounded).
+            if (Interlocked.Exchange(ref _pusher, null) is { } closing) PendingExitBlank = Task.Run(closing.Dispose);
+            if (OperatingSystem.IsWindows()) _powerWatcher?.Dispose();
             _renderer.Dispose(); _hub.Dispose(); _settings.Save();
         };
         StartPowerWatcher();   // blank the display at shutdown, sign-out and sleep while the editor drives it
@@ -1366,20 +1368,38 @@ public sealed class MainWindow : Window
     private SessionPowerWatcher? _powerWatcher;
     private bool _resumeAfterSleep;
 
+    /// <summary>The blank started while the window closed. <see cref="Program"/> waits for it (bounded) before the process exits.</summary>
+    internal static Task? PendingExitBlank { get; private set; }
+
+    internal static void WaitForExitBlank()
+    {
+        try { PendingExitBlank?.Wait(PowerBlank.SessionEndBudget); } catch { /* best effort */ }
+    }
+
     private void StartPowerWatcher()
     {
-        try { _powerWatcher = new SessionPowerWatcher(OnPowerEvent); }
-        catch { /* without it the display just keeps its last frame at shutdown, as before */ }
+        if (!OperatingSystem.IsWindows()) return;
+        try { _powerWatcher = new SessionPowerWatcher(OnPowerEvent, log: m => Trace.WriteLine("Glance power: " + m)); }
+        catch (Exception ex)
+        {
+            Trace.WriteLine("Glance power watcher failed: " + ex);
+            _status.Text = "Could not watch for shutdown and sleep, so the display will not be turned off then: " + ex.Message;
+        }
     }
+
+    private string NotNowReason => _power.Ended ? "The editor is closing or Windows is ending the session." : "Windows is going to sleep.";
 
     /// <summary>Opens the display unless Windows is sleeping or ending the session.</summary>
     private bool TryStartPusher(out string? error)
     {
         lock (_powerGate)
         {
-            if (!_power.MayDrive) { error = "Windows is going to sleep or ending the session."; return false; }
-            try { _pusher = new DisplayPusher(() => _theme, _hub, _settings.Brightness) { PinnedPage = DesiredPin }; error = null; return true; }
+            if (!_power.MayDrive) { error = NotNowReason; return false; }
+            try { _pusher = new DisplayPusher(() => _theme, _hub, _settings.Brightness) { PinnedPage = DesiredPin }; error = null; }
             catch (Exception ex) { error = ex.Message; return false; }
+            // a power event does not wait behind this lock for long; if one came while the display opened, close it again
+            if (!_power.MayDrive) { error = NotNowReason; ReleasePusher(); return false; }
+            return true;
         }
     }
 
@@ -1391,19 +1411,32 @@ public sealed class MainWindow : Window
         return p is not null;
     }
 
-    /// <summary>Runs on the watcher's thread and Windows waits for it, so the display is blanked here, not on the UI thread.</summary>
+    /// <summary>
+    /// Runs on a watcher thread while Windows waits for the answer, so the blank happens here and never needs the UI thread.
+    /// It is bounded (<see cref="PowerBlank"/>). For sleep this is the only path; for a shutdown Avalonia usually closes the window
+    /// first (see <c>Closing</c>), and this is the backup, for example when an installer closes the app.
+    /// </summary>
     private void OnPowerEvent(PowerEvent e)
     {
-        PowerAction action;
-        bool released = false;
-        lock (_powerGate)
+        var action = _power.Handle(e);   // the policy has its own lock: from now on TryStartPusher refuses
+        if (action is PowerAction.BlankAndStop or PowerAction.BlankAndHold)
         {
-            action = _power.Handle(e);
-            if (action is PowerAction.BlankAndStop or PowerAction.BlankAndHold) released = ReleasePusher();
-            if (action == PowerAction.BlankAndHold) _resumeAfterSleep = released;
+            bool hadOne = false;
+            var result = PowerBlank.Run(_powerGate, () =>
+            {
+                var p = Interlocked.Exchange(ref _pusher, null);
+                hadOne = p is not null;
+                return p is null ? null : p.Dispose;    // Dispose blanks the screen as it closes
+            }, PowerBlank.OwnerBudgetFor(e));
+            Trace.WriteLine($"Glance power: {e} -> {action}, blank {result}");
+            if (action == PowerAction.BlankAndHold)
+            {
+                _resumeAfterSleep = hadOne;
+                if (hadOne) Dispatcher.UIThread.Post(() => _status.Text = "Display off while Windows sleeps.");
+            }
         }
-        if (action == PowerAction.BlankAndHold && released)
-            Dispatcher.UIThread.Post(() => _status.Text = "Display off while Windows sleeps.");
+        if (e == PowerEvent.SessionEnding)
+            Dispatcher.UIThread.Post(() => { try { Close(); } catch { /* already closing */ } }); // an installer asked the app to close
         else if (action == PowerAction.Reopen && _resumeAfterSleep)
         {
             _resumeAfterSleep = false;
@@ -1411,17 +1444,18 @@ public sealed class MainWindow : Window
         }
     }
 
-    /// <summary>After wake, reopen the display if the editor was sending to it. The USB device can take a moment to come back.</summary>
+    /// <summary>After wake, reopen the display if the editor was sending to it. USB can take a while to come back (hibernate, hubs).</summary>
     private async void ResumeSendingAfterSleep()
     {
         string? error = null;
-        for (int attempt = 0; attempt < 5; attempt++)
+        _status.Text = "Waiting for the display after wake...";
+        foreach (var delay in ResumeRetry.Delays())
         {
-            await Task.Delay(1500);
+            await Task.Delay(delay);
             if (_send.IsChecked != true || _pusher is not null || _liveToRunner || !_power.MayDrive) return; // the user (or Windows) moved on
             if (TryStartPusher(out error)) { _status.Text = "Sending to the display..."; return; }
         }
-        _status.Text = "Could not reopen the display after sleep: " + error;
+        _status.Text = "Could not reopen the display after waking up: " + error;
         _send.IsChecked = false;
     }
 }

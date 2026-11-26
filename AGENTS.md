@@ -87,10 +87,15 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
 - On exit/pause the display is blanked (black frame, backlight 0), otherwise it keeps its last picture. Reload/error recovery deliberately does not blank (flicker).
 - **Shutdown, restart, sign-out and sleep** also blank it (the USB port often stays powered, so the last frame would stay lit). `SessionPowerWatcher`
   (Core) runs a hidden top-level window on its own thread and turns `WM_ENDSESSION`/`WM_POWERBROADCAST` into `PowerEvent`s; the handler runs
-  synchronously before the message is answered (Windows waits for it), with a shutdown block reason set during a session end.
-  `DisplayPowerPolicy` (pure, tested) decides: session end/quit -> blank once and never reopen; suspend -> blank and hold; resume -> reopen
-  (the runner's `Supervise` does it, the editor retries if it was sending). Owners check `MayDrive` before opening the display.
-  Only verifiable by hand: shut down / sleep with the display attached and look.
+  before the message is answered (Windows waits for it) but never longer than `PowerBlank.BudgetFor` (4 s session end, 1.5 s sleep), with a
+  shutdown block reason set during a session end and always removed. `DisplayPowerPolicy` (pure, tested) decides: session end/quit -> blank once,
+  stop and never reopen (also while asleep, so an installer can close the runner); suspend -> blank and hold; resume -> reopen (the runner's
+  `Supervise` does it, the editor retries for about a minute). Owners update the policy first, then blank with `PowerBlank.Run` (bounded lock
+  wait and stop; if the owner's lock is busy the owner pays the blank itself), and check `MayDrive` before and right after opening the display.
+  A missed wake notice heals after 30 s awake (`NoteAwakeTick`), or at once on tray Resume/Reload or the `RESUME` command.
+  In the editor, Avalonia closes the window on an OS shutdown, so `Closing` usually does the session-end blank (off the UI thread;
+  `Program.Main` waits for it); the watcher covers sleep and is the backup. Out of scope: Modern Standby timing (`PBT_APMSUSPEND` can come late),
+  monitor off and lock (no `GUID_CONSOLE_DISPLAY_STATE` handling yet). Only verifiable by hand: shut down / sleep with the display attached and look.
 - AIDA64 uses the same device; only one program can hold it.
 - The display and runner pages: `DisplayPusher.NextPageIndex` is the pure rotation logic (shared with the virtual display window).
 

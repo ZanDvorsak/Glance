@@ -116,7 +116,11 @@ You can also pick another screen size in the **Screen** menu, which is handy for
 - **The display stays lit after shutting down the PC**: Glance turns it off when Windows shuts down, restarts, signs out or sleeps, but only if
   the runner (or the editor, while it is sending) is running at that moment. If it is still lit, check `runner.log` in your Glance folder for a
   line like `Windows SessionEnding: BlankAndStop`. Some PCs keep USB powered when off; turning that off in the BIOS/UEFI also works.
-- **The display stays black after the PC wakes up**: the runner reopens it within a few seconds. If it does not, unplug and replug it, or use **Reload theme** in the tray menu.
+  Locking the PC or letting the monitor turn off does not turn the display off, and on laptops with Modern Standby it can stay lit for a
+  while after the screen goes dark, until Windows really goes to sleep.
+- **The display stays black after the PC wakes up**: the runner reopens it within a few seconds, and on its own after about 30 s even if
+  Windows did not report the wake-up. To bring it back at once, use **Reload theme** or **Resume display** in the tray menu. If the display
+  itself did not come back, unplug and replug it. The editor (when it sends without the runner) keeps trying for about a minute.
 - **CPU temperature is 0 °C or sensors are missing**: the runner is not running or PawnIO is not installed. Start the runner from **Background service**.
 - **Updates look slow**: the display accepts about 2.5 full frames per second, so fast animation is not possible. Glance skips frames that did not change.
 - **Colours look wrong**: report it with your display model; Glance sends RGB565 big-endian frames, which this display family expects.

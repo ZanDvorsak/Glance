@@ -314,3 +314,98 @@ When Windows ends the session, it terminates the process without running either 
   - that the display is not reopened after a session-end blank.
 
 **Not provable here:** a real shutdown, restart, sign-out or sleep, and what the physical display shows. To confirm the bug is gone, follow the manual test plan above. The short version: with the runner running, shut down from Start and check that the display goes black; then sleep the PC, wake it, and check that the theme comes back.
+
+---
+
+## Fixes after review (phase 1)
+
+**Date:** 2026-11-26. **By:** the author of the change (not the reviewer). The findings above are unchanged.
+M2 is left for phase 2 (it needs `claude/fix-display-loop-693991` merged first). This round does not use that branch's
+`Stop(bool blank, TimeSpan timeout)` yet. The bounded stop lives in this branch's own `PowerBlank.RunWithDeadline` and will move to
+the public timeout during integration.
+
+**Method (the user's rule for every bug):**
+1. The new API was first added as **stubs that behave like the reviewed code**: `PowerBlank.Run` locked and stopped without a limit,
+   the watcher ignored its budgets, `NoteAwakeTick` did nothing, `ResumeRetry` was 5 × 1.5 s, and the policy still returned `None`
+   for a session end while asleep.
+2. The new tests were run against that, and the failures were captured (`dotnet test --filter "FullyQualifiedName~Power"`:
+   **Failed: 8, Passed: 21, Total: 29**).
+3. Then the fixes were made, and the same tests ran again (**Passed: 29, Total: 29**). The full suite is **282/282** (273 before this round).
+   `dotnet build src/Glance.sln -c Release -p:SkipHost=true` succeeds. The `CA1416` warning for `SessionPowerWatcher` is gone, and no new warnings were added.
+
+### Proof per finding
+
+| Finding | Test | Before (stub = reviewed behaviour) | After |
+|---|---|---|---|
+| M1 (stalled display) | `PowerBlankTests.Gives_up_on_a_stalled_display_within_its_budget` | `Assert.Equal() Failure: Expected: TimedOut, Actual: Blanked` after **5 s** | Passed in 324 ms |
+| M1 (busy owner lock) | `PowerBlankTests.Does_not_wait_for_ever_behind_a_busy_owner` | `Expected: Busy, Actual: NothingOpen` after **5 s** (it waited for the lock) | Passed in 127 ms |
+| M1 / L4 (Windows always answered, block reason always released) | `SessionPowerWatcherTests.Windows_gets_its_answer_within_the_budget_even_if_the_handler_hangs(sessionEnd: True)` | `answered after 5007 ms` | Passed in 335 ms, no block reason left |
+| M1 (sleep) | same test, `(sessionEnd: False)` | `answered after 5009 ms` | Passed in 342 ms |
+| M1 (budgets) | `PowerBlankTests.Budgets_fit_inside_what_Windows_allows` | (passed: only checks the constants) | Passed |
+| L1 (session end while asleep) | `DisplayPowerPolicyTests.Session_end_while_asleep_still_stops_so_the_owner_exits_and_wake_does_not_reopen` (replaces `Session_end_while_asleep_needs_no_second_blank_and_wake_does_not_reopen`, which asserted the buggy `None`) | `Expected: BlankAndStop, Actual: None` | Passed |
+| L1 (missed wake notice) | `DisplayPowerPolicyTests.A_missed_wake_notice_heals_after_enough_awake_ticks` | `Expected: Reopen, Actual: None` | Passed |
+| L1 (heal rules) | `DisplayPowerPolicyTests.Awake_ticks_do_nothing_when_awake_or_after_the_session_ended_and_restart_with_each_sleep` | `Expected: Reopen, Actual: None` | Passed |
+| L2 (editor gives up too early) | `PowerBlankTests.Wake_retries_last_long_enough_for_a_hibernate_resume` | `retries for 7,5 s only` | Passed (1.5 s, 3 s, then 11 × 5 s = 59.5 s) |
+| L6 (sync test too weak) | `SessionPowerWatcherTests.Handler_has_finished_when_the_window_answers` (150 ms handler) | Passed on the reviewed code, which is correct because it is synchronous. With `Raise` changed to `ThreadPool.QueueUserWorkItem(_ => _handler(e))` (the reviewer's mutation), it **failed**: `Expected: [SessionEnding], Actual: []`. The old `Messages_reach_the_handler_...` test still passed on that mutation, which reproduces L6 | Passed |
+
+**Mutation checks on the fixed code** (each change was reverted byte for byte afterwards):
+
+| Mutation | Tests that failed |
+|---|---|
+| A. The watcher answers without waiting for the handler (thread pool) | `Handler_has_finished_when_the_window_answers`, `Messages_reach_the_handler_...`, `A_shutdown_block_reason_is_set_only_...` |
+| B. The block reason is not removed when the handler overruns | `Windows_gets_its_answer_..._hangs(sessionEnd: True)`, `A_shutdown_block_reason_is_set_only_...` |
+| C. `PowerBlank.Run` waits for the owner's lock without a limit | `Does_not_wait_for_ever_behind_a_busy_owner` |
+| D. `RunWithDeadline` waits for the stop without a limit | `Gives_up_on_a_stalled_display_...`, both `Windows_gets_its_answer_..._hangs` |
+| E. The wake retries go back to 7.5 s | `Wake_retries_last_long_enough_for_a_hibernate_resume` |
+| F. No self-heal | `A_missed_wake_notice_heals_...`, `Awake_ticks_do_nothing_...` |
+| G. A session end while asleep returns `None` again | `Session_end_while_asleep_still_stops_...` |
+
+### What changed, per finding
+
+- **M1:**
+  - `SessionPowerWatcher.Raise` now runs the handler on a helper thread and waits at most `PowerBlank.BudgetFor(e)`: 4 s for `WM_ENDSESSION`, 1.5 s otherwise. The constructor can override this for tests.
+  - The shutdown block reason is removed in `finally`, so it always goes when Windows gets its answer.
+  - Owners update the policy first. The policy has its own lock, so `MayDrive` turns false at once. Then they call `PowerBlank.Run(gate, take, OwnerBudgetFor(e))`:
+    - It waits for the owner's lock for at most a third of the budget.
+    - `take` detaches the pusher under the lock.
+    - The stop and blank run outside the lock, with the remaining time as the deadline.
+  - Results are `Blanked`, `NothingOpen`, `TimedOut` (the blank goes on in the background) or `Busy`.
+  - In the runner, `Busy` sets `_blankOwed`. Whoever holds `_gate` then pays it in `PayOwedBlank`: `Supervise`'s `!MayDrive` branch (a reload ends in `Supervise`) and `Quit`. It uses `Ax206Display.TryBlank` if the pusher is already gone.
+  - Both `Supervise` and the editor's `TryStartPusher` check `MayDrive` again right after opening, and close a display that was opened during a power event.
+  - In phase 2, `PowerBlank.RunWithDeadline(() => p.Stop(true), ...)` becomes the display-loop branch's `Stop(true, timeout)`.
+- **L1:**
+  - The first session end or quit now always returns `BlankAndStop`, even while asleep.
+  - The runner requests `Quit` for every `SessionEnding`.
+  - `DisplayPowerPolicy.NoteAwakeTick` runs on the runner's 2 s supervisor timer and heals a stuck sleep after 15 awake ticks (30 s). WinForms timers do not tick while the PC sleeps.
+  - Tray **Reload theme**, tray **Resume display** and the `RESUME` command (all through `SetPaused(false)`) clear a stale sleep state at once.
+  - A display replug is covered by the 30 s heal.
+  - The automatic file-watcher reload does *not* clear it. A file change in the seconds between `PBT_APMSUSPEND` and the real sleep must not relight the display.
+  - The TUTORIAL troubleshooting text was rewritten to match.
+- **L2:** the editor uses `ResumeRetry.Delays()` (about 60 s). It shows "Waiting for the display after wake..." meanwhile and unticks **Send to display** only at the end.
+- **L3:**
+  - The editor's `Closing` now detaches the pusher and blanks it on a background task (`PendingExitBlank`), so the UI thread stays free.
+  - `Program.Main` waits for that task after the Avalonia lifetime ends, for at most `PowerBlank.SessionEndBudget`.
+  - The watcher path is bounded by `PowerBlank.Run`.
+  - AGENTS.md now says that Avalonia's `Closing` usually does the session-end blank in the editor, and the watcher is the backup.
+- **L4:** the block reason stays in `WM_ENDSESSION`, deliberately (the reasons are in the `SessionPowerWatcher` doc comment):
+  - At `WM_QUERYENDSESSION` the shutdown can still be cancelled and nothing is being done yet. A registered reason would put Glance on Windows' "apps are preventing shutdown" screen for nothing.
+  - Inside the bounded `WM_ENDSESSION` handler it can never hold a shutdown for longer than the 4 s budget.
+  - If blanking is slow, it names the work instead of leaving an anonymous hang.
+  - Manual check 14 below covers this.
+- **L5:** documented as out of scope in AGENTS.md and the TUTORIAL: Modern Standby timing, monitor off and lock. `GUID_CONSOLE_DISPLAY_STATE` support would need a new event and probably a setting, so it is not trivial.
+- **L6:** the new slow-handler test, proven above.
+- **N1:** `[SupportedOSPlatform("windows")]` is on `SessionPowerWatcher` and `SessionPowerWatcherTests`. The editor guards the calls with `OperatingSystem.IsWindows()`.
+- **N2:** the runner logs `Windows {e}: {action}` *before* blanking and `Windows {e}: blank {result}` after it. The editor reports a watcher start failure in the status bar and in `Trace`, and traces each power event.
+- **N3:** the editor's "cannot open now" message depends on the state: "The editor is closing or Windows is ending the session." or "Windows is going to sleep.".
+- **N4:** on `SessionEnding` the editor posts `Close()` to the UI thread (installers or Restart Manager).
+- **N5:** `docs/WALKTHROUGH.md` §4.3 and §4.7 now point to the shutdown and sleep blank.
+- **N6:** `PBT_APMRESUMECRITICAL` was removed, with a comment explaining why.
+
+### Still open
+
+- **M2** (phase 2): rewrite `RestartDeadPusher` through `TryStartPusher` when `fix-display-loop` is merged, and switch to its public `Stop(blank, timeout)`.
+- **The owner logic in the runner and editor is still not unit tested** (test gap 1): `Supervise`'s guards, `PayOwedBlank`, `Quit` on session end, and the editor's retry loop. Their decisions now sit in tested Core pieces (`DisplayPowerPolicy`, `PowerBlank`, `ResumeRetry`), but the wiring is only checked by reading it and by the manual plan.
+- **`docs/walkthroughs/shutdown-blank.md`** describes the code as reviewed. It does not mention `PowerBlank`, the self-heal or the bounded handlers yet.
+- **The manual test plan above still applies.** Add:
+  - **14.** With the runner running, unplug the display while it shows a frame and shut down at once. Windows must not wait more than about 4 s for Glance. `runner.log` shows `blank TimedOut` or `blank Blanked`.
+  - **15.** Sleep and wake, then check that `runner.log` has no "No wake-up notice" line. That line would mean the wake notice was missed and the 30 s heal fired.

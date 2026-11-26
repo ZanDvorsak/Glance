@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 
 namespace Glance.Core.Display;
 
@@ -6,7 +7,8 @@ namespace Glance.Core.Display;
 public static class PowerMessages
 {
     public const uint WM_QUERYENDSESSION = 0x0011, WM_ENDSESSION = 0x0016, WM_POWERBROADCAST = 0x0218;
-    public const int PBT_APMSUSPEND = 0x4, PBT_APMRESUMECRITICAL = 0x6, PBT_APMRESUMESUSPEND = 0x7, PBT_APMRESUMEAUTOMATIC = 0x12;
+    // PBT_APMRESUMECRITICAL (0x6) is not listed: Windows has not sent it since Vista.
+    public const int PBT_APMSUSPEND = 0x4, PBT_APMRESUMESUSPEND = 0x7, PBT_APMRESUMEAUTOMATIC = 0x12;
 
     public static PowerEvent? Translate(uint msg, nint wParam)
     {
@@ -19,7 +21,7 @@ public static class PowerMessages
                 return (int)wParam switch
                 {
                     PBT_APMSUSPEND => PowerEvent.Suspend,
-                    PBT_APMRESUMEAUTOMATIC or PBT_APMRESUMESUSPEND or PBT_APMRESUMECRITICAL => PowerEvent.Resume,
+                    PBT_APMRESUMEAUTOMATIC or PBT_APMRESUMESUSPEND => PowerEvent.Resume,
                     _ => null,
                 };
             default: return null;
@@ -35,17 +37,25 @@ public static class PowerMessages
 /// UI thread being free. A top-level window is required: message-only windows do not receive these broadcasts.
 /// </para>
 /// <para>
-/// The handler runs synchronously on the watcher's thread, before the window answers the message. Windows does not end the
-/// process until WM_ENDSESSION has been answered (and gives sleep about two seconds after PBT_APMSUSPEND), so the display can be
-/// blanked inside the handler. During a session end a shutdown block reason is set while the handler runs, so if blanking is
-/// slow Windows shows "Turning off the display" instead of killing the process mid-transfer; it is removed right after.
+/// The window answers the message only after the handler has finished, or after a budget (about 4 s for WM_ENDSESSION, 1.5 s for
+/// sleep), whichever comes first. Windows does not end the process until WM_ENDSESSION has been answered (it allows about 5 s)
+/// and gives sleep about 2 s after PBT_APMSUSPEND, so the display can be blanked inside the handler.
+/// </para>
+/// <para>
+/// During a session end a shutdown block reason is set while the handler runs and is always removed when the window answers.
+/// It is created in WM_ENDSESSION, not WM_QUERYENDSESSION, on purpose: at query time the shutdown can still be cancelled and
+/// nothing is being done yet, and a registered reason would list Glance on Windows' "apps are preventing shutdown" screen for no
+/// reason. Inside WM_ENDSESSION it only matters if blanking is slow; then Windows names the work instead of an anonymous hang,
+/// and because the handler is bounded it can never hold the shutdown for longer than the budget.
 /// </para>
 /// </summary>
+[SupportedOSPlatform("windows")]
 public sealed class SessionPowerWatcher : IDisposable
 {
     private readonly Action<PowerEvent> _handler;
     private readonly Action<string>? _log;
     private readonly string _reason;
+    private readonly TimeSpan _sessionEndBudget, _otherBudget;
     private readonly string _className = "Glance.PowerWatcher." + Guid.NewGuid().ToString("N");
     private readonly WndProcDelegate _wndProc;   // kept in a field so the GC cannot collect it while Windows calls it
     private readonly Thread _thread;
@@ -54,12 +64,17 @@ public sealed class SessionPowerWatcher : IDisposable
     /// <summary>The hidden window (for tests and diagnostics).</summary>
     public IntPtr WindowHandle => _hwnd;
 
-    /// <param name="handler">Called on the watcher's thread; Windows waits for it to return. Must not wait on the UI thread.</param>
+    /// <param name="handler">Called on a helper thread while the watcher waits for it (up to the budget) before answering Windows. Must not wait on the UI thread.</param>
     /// <param name="reason">Shown by Windows if the session end has to wait for the handler.</param>
     /// <param name="log">Optional diagnostics.</param>
-    public SessionPowerWatcher(Action<PowerEvent> handler, string reason = "Turning off the Glance display", Action<string>? log = null)
+    /// <param name="sessionEndBudget">Longest wait for a session-end handler (default <see cref="PowerBlank.SessionEndBudget"/>).</param>
+    /// <param name="otherBudget">Longest wait for a sleep or wake handler (default <see cref="PowerBlank.SleepBudget"/>).</param>
+    public SessionPowerWatcher(Action<PowerEvent> handler, string reason = "Turning off the Glance display", Action<string>? log = null,
+        TimeSpan? sessionEndBudget = null, TimeSpan? otherBudget = null)
     {
         _handler = handler; _reason = reason; _log = log;
+        _sessionEndBudget = sessionEndBudget ?? PowerBlank.SessionEndBudget;
+        _otherBudget = otherBudget ?? PowerBlank.SleepBudget;
         _wndProc = WndProc;
         using var ready = new ManualResetEventSlim();
         Exception? failure = null;
@@ -128,11 +143,26 @@ public sealed class SessionPowerWatcher : IDisposable
         return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
 
+    [ThreadStatic] private static bool t_inHandler;
+
+    /// <summary>
+    /// Runs the handler and waits for it, but never longer than the budget: whatever the owner does, Windows gets its answer in
+    /// time and the shutdown block reason is always removed. A handler that overruns keeps going on its own background thread.
+    /// </summary>
     private void Raise(IntPtr hwnd, PowerEvent e)
     {
         bool blocking = e == PowerEvent.SessionEnding && ShutdownBlockReasonCreate(hwnd, _reason);
-        try { _handler(e); }
-        catch (Exception ex) { _log?.Invoke($"Handling {e} failed: {ex.Message}"); }
+        try
+        {
+            var budget = e == PowerEvent.SessionEnding ? _sessionEndBudget : _otherBudget;
+            bool finished = PowerBlank.RunWithDeadline(() =>
+            {
+                t_inHandler = true;
+                try { _handler(e); }
+                catch (Exception ex) { _log?.Invoke($"Handling {e} failed: {ex.Message}"); }
+            }, budget);
+            if (!finished) _log?.Invoke($"Handling {e} took longer than {budget.TotalSeconds:0.#} s; answered Windows anyway");
+        }
         finally { if (blocking) ShutdownBlockReasonDestroy(hwnd); }
     }
 
@@ -140,7 +170,8 @@ public sealed class SessionPowerWatcher : IDisposable
     {
         var hwnd = _hwnd;
         if (hwnd != IntPtr.Zero) PostMessageW(hwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
-        if (Thread.CurrentThread != _thread) _thread.Join(1000);
+        // from the handler (or the watcher thread) waiting would only wait for ourselves
+        if (Thread.CurrentThread != _thread && !t_inHandler) _thread.Join(1000);
     }
 
     // ---- Win32 ----------------------------------------------------------------------------------------------------

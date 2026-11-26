@@ -299,6 +299,8 @@ canvas.Scale(s, s);
 
 `Stop(bool blank)` exists because "close the display" has two meanings. On exit or pause, the screen should go black. On reload or
 error recovery, the display is reopened straight away, and blanking it would cause a visible flicker.
+Windows shutdown, restart, sign-out and sleep also blank it: see `SessionPowerWatcher`, `DisplayPowerPolicy` and `PowerBlank` in
+`src/Glance.Core/Display/`, and `docs/walkthroughs/shutdown-blank.md`.
 
 ### 4.4 The theme model
 
@@ -590,6 +592,10 @@ The runner is a WinForms `ApplicationContext` with no main window: a tray icon, 
   Base64 makes the arguments safe in a space-separated, newline-terminated protocol. `LIVE` is how **Send to display** works while the
   runner owns the device: only one process can hold the USB display, so the editor sends its theme to the runner instead of opening it.
   On the editor side, `PushLive` only sends when the snapshot actually changed.
+
+- **Blank on shutdown and sleep.** A `SessionPowerWatcher` (a hidden top-level window on its own thread) reports Windows shutdown,
+  sign-out, sleep and wake. The runner blanks the display within a time limit, quits at a session end, and reopens the display after
+  wake through `Supervise`. See `docs/walkthroughs/shutdown-blank.md`.
 
 Two Windows details worth knowing:
 
