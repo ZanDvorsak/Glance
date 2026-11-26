@@ -81,7 +81,7 @@ public class LiveSendGateTests
     {
         var gate = new LiveSendGate();
         var text = gate.Complete(gate.TryBegin("theme A")!, "ERR The input is not a valid Base-64 string");
-        Assert.Contains("restart the background runner", text);
+        Assert.Contains("restart the Glance tray app", text);   // runner-service: the runner is now the (non-elevated) tray app
     }
 
     [Fact]

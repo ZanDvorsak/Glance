@@ -8,7 +8,7 @@
     <Nullable>enable</Nullable>
     <PlatformTarget>x64</PlatformTarget>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <!-- Runs elevated with the user's environment: ignore DOTNET_STARTUP_HOOKS (written into runtimeconfig.json, which sits in the admin-only folder). -->
+    <!-- Runs with the user's normal rights now (the service does the admin work); startup hooks stay off anyway. -->
     <StartupHookSupport>false</StartupHookSupport>
     <ApplicationIcon>..\..\assets\glance.ico</ApplicationIcon>
   </PropertyGroup>

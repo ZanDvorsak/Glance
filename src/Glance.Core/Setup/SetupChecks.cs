@@ -14,7 +14,7 @@ public sealed record CheckResult(string Id, string Title, CheckStatus Status, st
     string? FixLabel = null, FixKind Fix = FixKind.None, string? FixArg = null);
 
 /// <summary>Facts only the running app knows.</summary>
-public sealed record SetupContext(bool SensorsElevated, int SensorCount, bool AutostartInstalled);
+public sealed record SetupContext(bool SensorsFromService, int SensorCount, Glance.Core.Service.ServiceState Service, bool TrayRunning);
 
 /// <summary>Checks what Glance depends on and says what to do about anything missing. Reads only; changes nothing.</summary>
 public static class SetupChecks
@@ -29,31 +29,21 @@ public static class SetupChecks
     {
         var list = new List<CheckResult>();
 
-        bool runner = Process.GetProcessesByName("Glance.Runner").Length > 0;
-        list.Add(CheckDisplay(runner));
+        // the service holds the display while the tray app (or the editor) draws; do not try to open it underneath them
+        bool glanceUsesDisplay = ctx.Service == Glance.Core.Service.ServiceState.Running || ctx.TrayRunning;
+        list.Add(CheckDisplay(glanceUsesDisplay));
 
-        if (!runner && Process.GetProcessesByName("aida64").Length > 0)
+        if (!glanceUsesDisplay && Process.GetProcessesByName("aida64").Length > 0)
             list.Add(new CheckResult("aida64", "AIDA64 is running", CheckStatus.Warning,
                 "AIDA64 uses the same display. Close it completely (including its tray icon) so Glance can draw on it."));
 
         list.Add(CheckPawnIo());
-        list.Add(ctx.SensorsElevated
-            ? new CheckResult("sensors", "Hardware sensors", CheckStatus.Ok, $"{ctx.SensorCount} sensors, including CPU and motherboard, from the background runner.")
-            : new CheckResult("sensors", "Hardware sensors", CheckStatus.Warning,
-                $"Only {ctx.SensorCount} basic sensors are available because Glance is not running with administrator rights. " +
-                "Start the background runner to get CPU temperatures, fans and voltages.",
-                "Open Background service", FixKind.OpenServiceDialog));
+        list.Add(ServiceChecks.DiagnoseSensors(ctx.SensorsFromService, ctx.SensorCount));
+        list.Add(ServiceChecks.DiagnoseService(ctx.Service, ctx.TrayRunning));
 
-        list.Add(runner
-            ? new CheckResult("runner", "Background runner", CheckStatus.Ok,
-                ctx.AutostartInstalled ? "Running, and it starts automatically when you sign in." : "Running. It keeps your theme on the display without the editor.")
-            : new CheckResult("runner", "Background runner", CheckStatus.Info,
-                "Not running. Without it the display only updates while the editor is open and sending. It also provides the CPU and motherboard sensors.",
-                "Open Background service", FixKind.OpenServiceDialog));
-
+        // video is decoded by the user's own tray app or editor (never by the service), so a per-user FFmpeg is enough
         Ffmpeg.Reset();
-        var ffmpeg = Ffmpeg.Find();
-        list.Add(DiagnoseFfmpeg(ffmpeg, ffmpeg is null ? null : Ffmpeg.FindForElevated()));
+        list.Add(ServiceChecks.DiagnoseFfmpeg(Ffmpeg.Find()));
 
         return list;
     }
@@ -189,7 +179,7 @@ public static class SetupChecks
 
         if (found)
         {
-            if (runnerRunning) return new CheckResult(id, title, CheckStatus.Ok, "Connected, and the Glance background runner is using it.");
+            if (runnerRunning) return new CheckResult(id, title, CheckStatus.Ok, "Connected, and Glance (the service or the tray app) is using it.");
             if (openError is null) return new CheckResult(id, title, CheckStatus.Ok, "Connected and ready (480 × 320).");
             return new CheckResult(id, title, CheckStatus.Warning,
                 $"Connected, but it cannot be opened ({openError}). Another program is probably using it: close AIDA64 or any other LCD software.");

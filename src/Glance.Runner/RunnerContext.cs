@@ -7,27 +7,32 @@ using System.Text;
 using Glance.Core.Control;
 using Glance.Core.Display;
 using Glance.Core.Sensors;
+using Glance.Core.Service;
 using Glance.Core.Settings;
 using Glance.Core.Themes;
-using Glance.Core.Usb;
+
 
 namespace Glance.Runner;
 
 /// <summary>
-/// Tray application that owns the display: reads sensors (elevated), serves them to the editor,
-/// pushes the saved theme to the screen, reloads it when it changes, and accepts commands from the editor.
+/// The tray app (normal user rights, one per signed-in user). It draws the saved theme with this user's files and sends the
+/// frames to the Glance service (or straight to the display when there is no service), reloads the theme when it changes,
+/// and accepts commands from the editor over a pipe only this user can open. Sensors come from the service (or the basic local ones).
 /// </summary>
 internal sealed class RunnerContext : ApplicationContext
 {
-    public const string ControlPipeName = "Glance.Runner.Control";
+    /// <summary>The editor of this Windows session talks to this pipe (see <see cref="ServiceNames.TrayControlPipe"/>).</summary>
+    private static readonly string ControlPipeName = ServiceNames.TrayControlPipeForThisSession();
 
     private readonly object _gate = new();
     private readonly Control _ui = new();
     private readonly NotifyIcon _tray;
     private readonly ToolStripMenuItem _statusItem = new("Starting...") { Enabled = false };
     private readonly ToolStripMenuItem _pauseItem = new("Pause display");
-    private readonly LocalSensorSource _sensors;
-    private readonly SensorPipeServer _pipeServer = new();
+    private readonly SensorHub _sensors;
+    private readonly ToolStripMenuItem _serviceItem = new("Glance service: checking...") { Enabled = false };
+    private volatile string _serviceText = "checking...";
+    private int _serviceCheckRunning;
     private readonly CancellationTokenSource _cts = new();
     private readonly System.Windows.Forms.Timer _supervisor = new() { Interval = 2000 };
     private readonly System.Windows.Forms.Timer _reloadDebounce = new() { Interval = 700 };
@@ -54,21 +59,19 @@ internal sealed class RunnerContext : ApplicationContext
     public RunnerContext()
     {
         _ = _ui.Handle; // force handle creation so other threads can marshal onto the UI thread
-        Log("Runner starting as " + WindowsIdentity.GetCurrent().Name);
-        Glance.Core.Media.Ffmpeg.Rejected += Log; // say why a user-writable ffmpeg.exe is not started as administrator
+        Log("Tray app starting as " + WindowsIdentity.GetCurrent().Name);
 
-        _sensors = new LocalSensorSource();
-        _pipeServer.Start();
-        _pipeServer.Publish(_sensors.HardwareSnapshot);
-        _sensors.Updated += () => _pipeServer.Publish(_sensors.HardwareSnapshot);
+
+        _sensors = new SensorHub();   // the service's feed, or the basic sensors this user can read
 
         _brightness = _settings.Brightness;
         LoadTheme();
 
         _pauseItem.Click += (_, _) => SetPaused(!_paused);
         var menu = new ContextMenuStrip();
-        menu.Items.Add(new ToolStripMenuItem("Glance runner") { Enabled = false });
+        menu.Items.Add(new ToolStripMenuItem("Glance") { Enabled = false });
         menu.Items.Add(_statusItem);
+        menu.Items.Add(_serviceItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_pauseItem);
         menu.Items.Add("Next page", null, (_, _) => { lock (_gate) _pusher?.NextPage(); });
@@ -77,7 +80,7 @@ internal sealed class RunnerContext : ApplicationContext
         menu.Items.Add("Open editor", null, (_, _) => OpenEditor());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => Quit());
-        _tray = new NotifyIcon { Icon = MakeIcon(), Text = "Glance runner", ContextMenuStrip = menu, Visible = true };
+        _tray = new NotifyIcon { Icon = MakeIcon(), Text = "Glance", ContextMenuStrip = menu, Visible = true };
         _tray.DoubleClick += (_, _) => OpenEditor();
 
         _reloadDebounce.Tick += (_, _) => { _reloadDebounce.Stop(); Reload(); };
@@ -89,6 +92,8 @@ internal sealed class RunnerContext : ApplicationContext
         _ = Task.Run(ControlLoop);
         _powerWatcher = StartPowerWatcher();
         _supervisor.Tick += (_, _) => HealStuckSleep();
+        _supervisor.Tick += (_, _) => CheckService();
+        CheckService();
     }
 
     // ---- theme / settings ---------------------------------------------------------------------------------------
@@ -261,7 +266,7 @@ internal sealed class RunnerContext : ApplicationContext
             closing.Stop(blank: true, TimeSpan.Zero);   // ask its loop to blank as well when it lets go (it may have been stopped without)
             Log("The display is still finishing its last transfer; its loop blanks it when it lets go");
         }
-        else if (Ax206Display.TryBlank() is { } err) Log("Could not blank the display after a power event: " + err);
+        else if (DisplayConnector.TryBlank() is { } err) Log("Could not blank the display after a power event: " + err);
     }
 
     /// <summary>Supervisor tick: if Windows never sent the wake-up notice, do not stay dark for good.</summary>
@@ -271,6 +276,30 @@ internal sealed class RunnerContext : ApplicationContext
         Log("No wake-up notice from Windows after 30 s awake; reopening the display");
         Supervise();
     }
+
+    /// <summary>Supervisor tick: asks the Glance service how it is, off the UI thread (a missing service costs a 0.5 s connect timeout).</summary>
+    private void CheckService()
+    {
+        if (Interlocked.Exchange(ref _serviceCheckRunning, 1) != 0) return;
+        Task.Run(() =>
+        {
+            try
+            {
+                _serviceText = DisplayConnector.ServiceStatus() is { } s ? "running, " + s
+                    : ServiceControl.Query() switch
+                    {
+                        ServiceState.NotInstalled => "not installed (basic sensors, display over USB)",
+                        ServiceState.Running => "running, but not answering",
+                        _ => "not running (basic sensors, display over USB)",
+                    };
+            }
+            catch (Exception ex) { _serviceText = "unknown (" + ex.Message + ")"; }
+            finally { Volatile.Write(ref _serviceCheckRunning, 0); }
+            try { _ui.BeginInvoke(() => _serviceItem.Text = Trim("Glance service: " + _serviceText)); } catch { /* closing */ }
+        });
+    }
+
+    private static string Trim(string text) => text.Length > 90 ? text[..90] + "..." : text;
 
     /// <summary>The user asked for the display (Resume, Reload): that also clears a sleep state Windows never ended.</summary>
     private void ClearStaleSleep()
@@ -296,8 +325,7 @@ internal sealed class RunnerContext : ApplicationContext
 
     private async Task ControlLoop()
     {
-        var security = new PipeSecurity();
-        security.AddAccessRule(new PipeAccessRule(WindowsIdentity.GetCurrent().User!, PipeAccessRights.FullControl, AccessControlType.Allow));
+        var security = ServicePipeSecurity.CurrentUserOnly();   // the editor runs as the same user; nobody else may connect
         while (!_cts.IsCancellationRequested)
         {
             try
@@ -370,9 +398,8 @@ internal sealed class RunnerContext : ApplicationContext
     private void OpenEditor()
     {
         var exe = FindEditor();
-        if (exe is null) { _tray.ShowBalloonTip(3000, "Glance", "Could not find Glance.App.exe next to the runner.", ToolTipIcon.Warning); return; }
-        // explorer starts it with the normal (non-elevated) user token, so the editor does not run as administrator
-        Process.Start(new ProcessStartInfo("explorer.exe", $"\"{exe}\"") { UseShellExecute = true });
+        if (exe is null) { _tray.ShowBalloonTip(3000, "Glance", "Could not find Glance.App.exe next to the tray app.", ToolTipIcon.Warning); return; }
+        Process.Start(new ProcessStartInfo(exe) { UseShellExecute = true, WorkingDirectory = Path.GetDirectoryName(exe)! });   // same (normal) rights as this app
     }
 
     private static string? FindEditor()
@@ -393,7 +420,7 @@ internal sealed class RunnerContext : ApplicationContext
     {
         if (_quitting) return;   // a session end and the EXIT command can both ask
         _quitting = true;
-        Log("Runner exiting");
+        Log("Tray app exiting");
         _cts.Cancel();
         _supervisor.Stop();
         foreach (var w in _watchers) w.Dispose();
@@ -404,7 +431,6 @@ internal sealed class RunnerContext : ApplicationContext
             DisposePusher();                  // blanks it unless a session end already took and blanked it
         }
         _powerWatcher?.Dispose();
-        _pipeServer.Dispose();
         _sensors.Dispose();
         _tray.Visible = false;
         _tray.Dispose();
