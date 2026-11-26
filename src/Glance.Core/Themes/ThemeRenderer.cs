@@ -314,6 +314,13 @@ public sealed class ThemeRenderer : IDisposable
 
     private void DrawImage(SKCanvas c, Theme t, Widget w)
     {
+        var lease = default(VideoFrameLease);   // a video frame stays valid until the draw is done
+        try { DrawImage(c, t, w, ref lease); }
+        finally { lease.Dispose(); }
+    }
+
+    private void DrawImage(SKCanvas c, Theme t, Widget w, ref VideoFrameLease lease)
+    {
         var r = Box(w);
         w.LastBounds = r;
         var path = t.ResolveAsset(w.ImagePath);
@@ -325,7 +332,8 @@ public sealed class ThemeRenderer : IDisposable
         if (Ffmpeg.IsVideo(path))
         {
             var v = GetVideo(path!, (int)Math.Round(w.Width), (int)Math.Round(w.Height), w.Fit);
-            img = v.Latest;
+            lease = v.AcquireFrame();
+            img = lease.Image;
             fit = ImageFit.Stretch; // ffmpeg already fitted the frame to the widget box
             if (img is null) note = v.Error is null ? "Loading video..." : v.Error;
             else (srcW, srcH) = (img.Width, img.Height);

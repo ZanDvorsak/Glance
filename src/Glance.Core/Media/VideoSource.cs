@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using SkiaSharp;
 
 namespace Glance.Core.Media;
@@ -9,14 +8,21 @@ public enum ImageFit { Stretch, Contain, Cover }
 public sealed class VideoSource : IDisposable
 {
     private readonly CancellationTokenSource _cts = new();
-    private Process? _proc;
+    private IVideoProcess? _proc;
     private volatile SKImage? _latest;
+    private int _framesRead;
 
     public int Width { get; }
     public int Height { get; }
     public long LastUsedTicks { get; set; } = Environment.TickCount64;
     public string? Error { get; private set; }
     public SKImage? Latest => _latest;
+
+    /// <summary>The newest frame, for drawing. Dispose the lease when the draw is done.</summary>
+    public VideoFrameLease AcquireFrame() => new(_latest);
+
+    /// <summary>Frames read from the decoder so far (tests wait on it).</summary>
+    internal int FramesRead => Volatile.Read(ref _framesRead);
 
     /// <summary>True when no usable ffmpeg.exe was found, so nothing is playing (the renderer may try again later).</summary>
     public bool FfmpegMissing { get; }
@@ -33,6 +39,10 @@ public sealed class VideoSource : IDisposable
     public const int MaxPixels = 1920 * 1080;
 
     internal VideoSource(string path, int width, int height, ImageFit fit, int fps, Func<string?> findFfmpeg, Func<string?> lastRejection)
+        : this(path, width, height, fit, fps, findFfmpeg, lastRejection, FfmpegProcess.Start) { }
+
+    internal VideoSource(string path, int width, int height, ImageFit fit, int fps, Func<string?> findFfmpeg, Func<string?> lastRejection,
+        Func<string, IReadOnlyList<string>, Action<string>, IVideoProcess> launch)
     {
         (Width, Height) = CapSize(Math.Max(2, width), Math.Max(2, height));
         var ffmpeg = findFfmpeg();
@@ -49,17 +59,10 @@ public sealed class VideoSource : IDisposable
             ImageFit.Cover => $"scale={Width}:{Height}:force_original_aspect_ratio=increase,crop={Width}:{Height}",
             _ => $"scale={Width}:{Height}",
         };
-        var psi = new ProcessStartInfo(ffmpeg)
-        {
-            RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true,
-        };
         // -re reads the file at its native speed; without it ffmpeg decodes as fast as the CPU allows and the video plays far too fast
-        foreach (var a in new[] { "-hide_banner", "-loglevel", "error", "-stream_loop", "-1", "-re", "-i", path, "-an", "-vf", $"{scale},fps={fps}", "-f", "rawvideo", "-pix_fmt", "bgra", "pipe:1" })
-            psi.ArgumentList.Add(a);
-        try { _proc = Process.Start(psi); }
+        var args = new[] { "-hide_banner", "-loglevel", "error", "-stream_loop", "-1", "-re", "-i", path, "-an", "-vf", $"{scale},fps={fps}", "-f", "rawvideo", "-pix_fmt", "bgra", "pipe:1" };
+        try { _proc = launch(ffmpeg, args, line => Error = line); }
         catch (Exception ex) { Error = ex.Message; return; }
-        _proc!.ErrorDataReceived += (_, e) => { if (!string.IsNullOrWhiteSpace(e.Data)) Error = e.Data; };
-        _proc.BeginErrorReadLine();
         Task.Run(ReadLoop);
     }
 
@@ -78,7 +81,7 @@ public sealed class VideoSource : IDisposable
         var buf = new byte[Width * Height * 4];
         try
         {
-            var stream = _proc!.StandardOutput.BaseStream;
+            var stream = _proc!.Output;
             while (!_cts.IsCancellationRequested)
             {
                 int got = 0;
@@ -89,6 +92,7 @@ public sealed class VideoSource : IDisposable
                     got += n;
                 }
                 _latest = SKImage.FromPixelCopy(info, buf);
+                Interlocked.Increment(ref _framesRead);
             }
         }
         catch { /* process killed */ }
@@ -97,7 +101,15 @@ public sealed class VideoSource : IDisposable
     public void Dispose()
     {
         _cts.Cancel();
-        try { if (_proc is { HasExited: false }) _proc.Kill(true); } catch { }
+        _proc?.Kill();
         _proc?.Dispose();
     }
+}
+
+/// <summary>A frame lent to a drawer. The image stays valid until the lease is disposed.</summary>
+public readonly struct VideoFrameLease : IDisposable
+{
+    internal VideoFrameLease(SKImage? image) => Image = image;
+    public SKImage? Image { get; }
+    public void Dispose() { }
 }
