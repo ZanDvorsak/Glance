@@ -1,3 +1,5 @@
+using Glance.Core.Security;
+
 namespace Glance.Core.Media;
 
 public static class Ffmpeg
@@ -8,7 +10,15 @@ public static class Ffmpeg
         path is not null && VideoExtensions.Contains(Path.GetExtension(path).ToLowerInvariant());
 
     /// <summary>The finder the app uses: real elevation, real candidates, real file system and ACLs.</summary>
-    internal static readonly FfmpegFinder Default = new(() => Environment.IsPrivilegedProcess, Candidates, File.Exists, FfmpegTrust.Check);
+    internal static readonly FfmpegFinder Default = new(() => Environment.IsPrivilegedProcess, Candidates, File.Exists, Trust);
+
+    /// <summary>
+    /// The trust check for an elevated lookup: the code base's one engine, <see cref="FolderTrust"/>. It reads the exe,
+    /// every file next to it (DLLs Windows would load from there), its folder and every folder up to the drive root.
+    /// </summary>
+    internal static TrustVerdict Trust(string exe) => OperatingSystem.IsWindows()
+        ? FolderTrust.CheckExecutable(exe, TrustScope.FolderFiles)
+        : TrustVerdict.No("Folder permissions can only be checked on Windows.");
 
     /// <summary>
     /// Raised (once per path and reason) when an elevated process skips an ffmpeg.exe because a normal user could
@@ -36,7 +46,7 @@ public static class Ffmpeg
     public static void Reset() => Default.Reset();
 
     internal static string RejectionMessage(string path, string reason) =>
-        $"FFmpeg at {path} is not used: {reason}. The runner runs as administrator, so it only starts FFmpeg from a " +
+        $"FFmpeg at {path} is not used: {reason.TrimEnd('.')}. The runner runs as administrator, so it only starts FFmpeg from a " +
         "folder that only administrators can change. Video backgrounds will not play on the display until FFmpeg is " +
         "installed for all users: in the Glance editor, open Setup check and click \"Install for all users\".";
 
@@ -158,7 +168,7 @@ internal sealed class FfmpegFinder
             if (!_exists(full)) continue;
             var verdict = _check(full);
             if (verdict.Trusted) return new(full, rejections);
-            rejections.Add((full, verdict.Reason));
+            rejections.Add((full, verdict.Reason ?? "its permissions are not admin-only"));
         }
         return new(null, rejections);
     }

@@ -113,7 +113,7 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
 - **Undo/redo** is snapshot based (`Theme.ToSnapshot/ApplySnapshot`), debounced; all pages and widgets are hooked (`HookAll`).
 - **Video** is decoded by an `ffmpeg` child process (`-re` is required or it plays several times too fast); FFmpeg is optional and found automatically (app folder, PATH, winget machine and user folders).
   In an elevated process (the runner) `Ffmpeg.Find` only accepts a copy that only administrators can change
-  (`FfmpegTrust`: file, folder and every folder above it, no links); rejections go to `runner.log`. The editor's
+  (`FolderTrust.CheckExecutable(exe, TrustScope.FolderFiles)`: the exe, the files next to it, its folder and every folder above it, no links); rejections go to `runner.log`. The editor's
   "Install for all users" runs winget with `--scope machine` elevated and then resets the package folder's permissions,
   because winget moves the files there from the user's temp folder with the user's access still on them.
 

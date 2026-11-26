@@ -866,7 +866,7 @@ Points to notice:
   the renderer draws the frame as it arrives.
 - The reader loop fills a whole frame (`while (got < buf.Length)`) before it publishes one, because a pipe `Read` can return fewer bytes than asked for.
 - `Kill(true)` kills the whole process tree when the video is disposed.
-- **Which `ffmpeg.exe`** (`src/Glance.Core/Media/Ffmpeg.cs`, `FfmpegTrust.cs`): the editor takes the first copy it finds
+- **Which `ffmpeg.exe`** (`src/Glance.Core/Media/Ffmpeg.cs`, using `src/Glance.Core/Security/FolderTrust.cs`): the editor takes the first copy it finds
   (app folder, `PATH`, winget's machine and user folders). The runner is elevated, so it only takes a copy that no
   non-admin can replace or change: the file, its folder and every folder above it must be owned by an admin principal
   and grant no write, delete or permission rights to anyone else, and none may be a link or junction. Otherwise any

@@ -1,5 +1,6 @@
 using System.Text;
 using Glance.Core.Media;
+using Glance.Core.Security;
 using Glance.Core.Setup;
 using Glance.Core.Themes;
 
@@ -116,22 +117,6 @@ public class FfmpegLookupTests
         var found = f.Find();
         Assert.Equal(@"C:\Program Files\WinGet\ffmpeg.exe", found);
         Assert.Equal(new[] { found! }, seen);
-    }
-}
-
-public class FfmpegReviewTrustTests
-{
-    // ---- N2: placeholder SIDs are never real owners ---------------------------------------------------------------
-
-    [Theory]
-    [InlineData("S-1-3-0")] // CREATOR OWNER
-    [InlineData("S-1-3-4")] // OWNER RIGHTS
-    public void Placeholder_principals_are_not_accepted_as_owners(string owner)
-    {
-        const string exe = @"C:\Tools\ffmpeg.exe";
-        var aces = new List<AceFact> { new(FfmpegTrust.AdministratorsSid, true, 0x1F01FF) };
-        var chain = new List<PathFact> { new(exe, owner, aces), new(@"C:\Tools", FfmpegTrust.AdministratorsSid, aces), new(@"C:\", FfmpegTrust.TrustedInstallerSid, aces) };
-        Assert.False(FfmpegTrust.Evaluate(exe, chain).Trusted);
     }
 }
 

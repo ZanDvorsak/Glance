@@ -484,3 +484,76 @@ N1, N3 and N4 were not in scope for this phase and are unchanged.
 - **M3** (one trust engine) is phase 2, after the autostart branch lands. **M4** (ffmpeg without admin rights) is a later follow-up.
 - The real finder's elevation flag can only be fully mutation-tested by an elevated test run (see M2).
 - Not tested here: anything with the physical display, the runner process, UAC, and the PowerShell script running.
+
+
+---
+
+## Phase 2: switched to FolderTrust
+
+This resolves M3. The branch was rebased onto `claude/fix-autostart-task-0011d2` at `1279d5e`, which holds
+`Glance.Core.Security.FolderTrust` as the single trust engine, and the FFmpeg lookup now uses it.
+
+**Rebase.** All 4 commits of this branch replayed cleanly, with **no conflicts**: `AGENTS.md` and `RunnerContext.cs` are
+changed on both branches, but in different places. After the rebase, both engines built side by side and 435/435 tests
+passed.
+
+**Switch.**
+- `Ffmpeg.Trust(exe)` = `FolderTrust.CheckExecutable(exe, TrustScope.FolderFiles)`. This reads the exe, every file next to
+  it (DLLs Windows would load from there), its folder and every folder up to the drive root. `FfmpegFinder` takes
+  `Glance.Core.Security.TrustVerdict`. If a verdict has no reason, the log says "its permissions are not admin-only".
+- **Removed:** `src/Glance.Core/Media/FfmpegTrust.cs`, with its types `AceFact`, `PathFact` and
+  `Glance.Core.Media.TrustVerdict`. There is one `TrustVerdict` now, so the `CS0104` ambiguity from M3 cannot happen.
+- Unchanged: the finder, its seams, `LastRejection`, `Rejected` (raised outside the lock, only when nothing usable is
+  found), the relative-PATH refusal and the full-path rule, the setup texts and the install script.
+- Behaviour differences, all from FolderTrust's rules:
+  - It is stricter about files next to the exe, `FILE_WRITE_EA` on the folder, and unknown ACE types (counted as writable).
+  - It ignores DELETE on a drive root itself, which cannot be deleted.
+  - It treats only name-surrogate reparse points (links, junctions) as links. A file compressed by Windows (WOF) is no
+    longer refused.
+  - Reasons are FolderTrust's sentences, for example "`<user>` owns `<path>`, so it can change its permissions."
+- `AGENTS.md` and `docs/WALKTHROUGH.md` 4.14 now name FolderTrust instead of FfmpegTrust.
+
+**Tests moved to FolderTrust.** These old FfmpegTrust cases were not already covered by FolderTrust's own tests
+(`FolderTrustTests`, `AutostartReviewFixTests` M3). They are now in `FfmpegFolderTrustTests`
+(`src/Glance.Tests/FfmpegTrustTests.cs`) and call `FolderTrust.Evaluate` with roles:
+- a machine-scope winget chain under the real C:\ root ACL is trusted; a user-scope chain in `%LOCALAPPDATA%` is refused;
+- on ffmpeg.exe: INTERACTIVE write, GENERIC_ALL, Modify, and an arbitrary domain group are refused;
+- on the bin folder: WRITE_DAC, WRITE_OWNER and GENERIC_WRITE are refused;
+- further up: DELETE, WRITE_DAC and WRITE_OWNER are refused, while WriteData, AppendData and GENERIC_WRITE are harmless;
+- a non-admin owner at the file, its folder or Program Files is refused, and so are CREATOR OWNER and OWNER RIGHTS as owners (N2);
+- the winget `Links` symlink is refused while the real package file passes;
+- the real reader through `Ffmpeg.Trust`: `C:\Program Files\dotnet\dotnet.exe` is trusted (`[StockSystemDriveFact]`,
+  the L6 skip, now judging the root with `FolderTrust.Decide` as an ancestor), and an exe in the user's temp folder is refused.
+
+Cases that FolderTrust already covered (inherit-only, deny, NULL DACL, junctions, path shapes, incomplete chain,
+drive type, system exe on this PC) were dropped as duplicates. No rule was missing from FolderTrust, so FolderTrust was
+not changed.
+
+**H3 re-proved on the rebased branch.** I reran the review's scenario as a throwaway test: create
+`%TEMP%\glance-proof-h3-<guid>\ffmpeg.exe` without admin rights, put that folder first on `PATH`, then call
+`Ffmpeg.FindForElevated()` and `Ffmpeg.Find()`. Output:
+
+```
+elevated lookup=null
+editor lookup=C:\Users\<user>\AppData\Local\Temp\glance-proof-h3-1f6b…\ffmpeg.exe
+FolderTrust on planted: <PC>\<user> owns C:\Users\<user>\AppData\Local\Temp\glance-proof-h3-1f6b…\ffmpeg.exe, so it can change its permissions.
+```
+
+Both assertions passed: the elevated lookup does not return the planted file, and the editor still does. The elevated
+result is `null` because this PC's per-user FFmpeg is refused too (see M1). The scenario is now also a permanent test,
+`FfmpegH3RegressionTests.A_planted_ffmpeg_ahead_of_everything_is_refused_when_elevated_and_still_used_by_the_editor`. It uses
+the real candidate list and the real FolderTrust check, but it injects the planted path instead of changing the process
+`PATH` (which other tests running in parallel would see). It passes.
+
+**M2 still holds.**
+- `Search(_isElevated())` changed to `Search(false)`: **9 tests fail** (the 8 from phase 1 plus the H3 regression test).
+- The real flag changed to `() => true`: **1 test fails**.
+- Both files were restored afterwards.
+
+**Result:** `dotnet build src/Glance.sln -c Release` succeeded with 0 errors, and `dotnet test src/Glance.Tests -c Release`
+gave **417/417 passed, 0 skipped**.
+
+**Still open** (unchanged from phase 1):
+- M1 needs one real "Install for all users" click to confirm.
+- M4 (ffmpeg without admin rights) is a later follow-up.
+- `docs/walkthroughs/ffmpeg-elevation.md` describes the first commit and still mentions FfmpegTrust.
