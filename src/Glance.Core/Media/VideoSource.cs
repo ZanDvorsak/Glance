@@ -27,9 +27,14 @@ public sealed class VideoSource : IDisposable
     public VideoSource(string path, int width, int height, ImageFit fit, int fps = 15)
         : this(path, width, height, fit, fps, Ffmpeg.Find, () => Ffmpeg.LastRejection) { }
 
+    /// <summary>Largest frame ffmpeg is asked for (1920 x 1080 worth of pixels, about 8 MiB per frame). The display is
+    /// 480 x 320; a bigger widget gets a smaller frame with the same aspect, which the renderer stretches to the box.
+    /// Without the cap an 8192 x 8192 widget from a shared theme made the (elevated) runner allocate 256 MiB per frame.</summary>
+    public const int MaxPixels = 1920 * 1080;
+
     internal VideoSource(string path, int width, int height, ImageFit fit, int fps, Func<string?> findFfmpeg, Func<string?> lastRejection)
     {
-        Width = Math.Max(2, width); Height = Math.Max(2, height);
+        (Width, Height) = CapSize(Math.Max(2, width), Math.Max(2, height));
         var ffmpeg = findFfmpeg();
         if (ffmpeg is null)
         {
@@ -56,6 +61,15 @@ public sealed class VideoSource : IDisposable
         _proc!.ErrorDataReceived += (_, e) => { if (!string.IsNullOrWhiteSpace(e.Data)) Error = e.Data; };
         _proc.BeginErrorReadLine();
         Task.Run(ReadLoop);
+    }
+
+    /// <summary>Scales (w, h) down, keeping the aspect, until it fits in <see cref="MaxPixels"/>.</summary>
+    internal static (int w, int h) CapSize(int w, int h)
+    {
+        long px = (long)w * h;
+        if (px <= MaxPixels) return (w, h);
+        double s = Math.Sqrt((double)MaxPixels / px);
+        return (Math.Max(2, (int)(w * s)), Math.Max(2, (int)(h * s)));
     }
 
     private void ReadLoop()

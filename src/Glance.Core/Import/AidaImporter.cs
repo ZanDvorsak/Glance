@@ -69,6 +69,9 @@ public static partial class AidaImporter
             else { skipped++; notes.Add($"Skipped unsupported item type '{id}'."); }
         }
         if (pageCount > 1) notes.Add($"The theme has {pageCount} pages; each was imported as a page and they rotate every {theme.Pages[0].DurationSeconds:0} seconds.");
+        // The .axlcd numbers come from someone else's file ("1e300" parses): give them the same limits as a loaded theme,
+        // before the layout pass below measures text with them.
+        theme.Normalize();
         int nudged = 0;
         for (int i = 0; i < theme.Pages.Count; i++) { theme.ActivePageIndex = i; nudged += SeparateLabelsFromValues(theme); }
         theme.ActivePageIndex = 0;

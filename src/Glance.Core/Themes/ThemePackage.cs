@@ -64,7 +64,15 @@ public static class ThemePackage
     }
 
     /// <summary>Extracts a package into <paramref name="destFolder"/> and returns the path of its theme.json. Throws on anything suspicious.</summary>
-    public static string Import(string package, string destFolder)
+    public static string Import(string package, string destFolder) => Import(package, destFolder, out _);
+
+    /// <summary>
+    /// Extracts a package into <paramref name="destFolder"/> and returns the path of its theme.json. Throws on anything
+    /// suspicious in the archive itself. Widget paths inside theme.json that do not point into the package's own
+    /// <c>assets/</c> folder (network, device or absolute paths, "..", anything else outside) are cleared, the cleaned
+    /// theme is saved, and what was cleared is returned in <paramref name="removed"/> so the editor can tell the user.
+    /// </summary>
+    public static string Import(string package, string destFolder, out IReadOnlyList<RemovedAssetPath> removed)
     {
         using var zip = ZipFile.OpenRead(package);
         if (zip.Entries.Count > MaxEntries) throw new InvalidDataException("This theme file has too many files.");
@@ -109,9 +117,57 @@ public static class ThemePackage
         }
 
         var themeFile = Path.Combine(destFolder, ThemeEntry);
-        Theme.Load(themeFile);   // fails early if the JSON is not a valid theme
+        var theme = Theme.Load(themeFile);   // fails early if the JSON is not a valid theme
+        removed = RemoveForeignPaths(theme, destFolder);
+        // Written directly, not with Theme.Save: every path left is relative and inside assets/, so there is nothing to
+        // copy, and Save must not touch the paths just removed. The folder is new; a failed write fails the import.
+        if (removed.Count > 0) File.WriteAllText(themeFile, theme.ToSnapshot(), new UTF8Encoding(false));
         return themeFile;
     }
 
+    /// <summary>Clears every widget image/video and font path that does not stay inside <c>&lt;destFolder&gt;\assets\</c>.</summary>
+    internal static IReadOnlyList<RemovedAssetPath> RemoveForeignPaths(Theme theme, string destFolder)
+    {
+        var removed = new List<RemovedAssetPath>();
+        foreach (var page in theme.Pages)
+            foreach (var w in page.Widgets)
+            {
+                if (WhyForeign(w.ImagePath, destFolder) is { } r1) { removed.Add(new(page.Name, w.Name, RemovedAssetPath.Picture, w.ImagePath, r1)); w.ImagePath = ""; }
+                if (WhyForeign(w.FontFile, destFolder) is { } r2) { removed.Add(new(page.Name, w.Name, RemovedAssetPath.Font, w.FontFile, r2)); w.FontFile = ""; }
+            }
+        return removed;
+    }
+
+    /// <summary>Null when <paramref name="path"/> is empty or a relative path inside the package's assets folder; otherwise why not.</summary>
+    internal static string? WhyForeign(string path, string destFolder)
+    {
+        if (string.IsNullOrEmpty(path)) return null;
+        if (Theme.IsNetworkOrDevicePath(path)) return "network or device path";
+        if (Path.IsPathRooted(path)) return "absolute path";
+        if (path.Contains(':')) return "drive or stream marker";
+        if (path.Split('/', '\\').Any(s => s == "..")) return "contains \"..\"";
+        try
+        {
+            var assets = Path.GetFullPath(Path.Combine(destFolder, "assets")).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            var full = Path.GetFullPath(Path.Combine(destFolder, path));
+            return full.StartsWith(assets, StringComparison.OrdinalIgnoreCase) ? null : "outside the theme's assets folder";
+        }
+        catch (Exception e) when (e is ArgumentException or PathTooLongException or NotSupportedException)
+        {
+            return "not a valid path";   // e.g. a null character or 40,000 characters: drop this path, keep the theme
+        }
+    }
+
     private static string SafeFileName(string n) => string.Concat(n.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
+}
+
+/// <summary>A widget path that <see cref="ThemePackage.Import(string, string, out IReadOnlyList{RemovedAssetPath})"/> cleared.</summary>
+/// <param name="Property">What the path was for: <see cref="Picture"/> or <see cref="Font"/>.</param>
+public sealed record RemovedAssetPath(string Page, string Widget, string Property, string Path, string Reason)
+{
+    public const string Picture = "picture or video";
+    public const string Font = "font";
+
+    /// <summary>One line for the editor's report, worded like the dialog around it ("pick the pictures or fonts again").</summary>
+    public override string ToString() => $"Page \"{Page}\", widget \"{Widget}\": {Property} {Path} ({Reason})";
 }
