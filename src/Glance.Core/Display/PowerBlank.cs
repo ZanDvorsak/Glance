@@ -4,9 +4,10 @@ namespace Glance.Core.Display;
 
 /// <summary>
 /// Blanks the display for a Windows shutdown, sign-out or sleep within a time limit. Windows gives about 5 s for WM_ENDSESSION
-/// and about 2 s for PBT_APMSUSPEND; a stalled USB transfer (3 s timeouts, several in a row) or an owner that holds its lock
-/// while it opens the display must not hold Windows past that. A blank that does not finish in time is abandoned on its own
-/// background thread (it may still complete), and the owner is told so it can log it.
+/// and about 2 s for PBT_APMSUSPEND; a stalled USB transfer (3 s timeouts) or an owner that holds its lock while it opens the
+/// display must not hold Windows past that. The stop itself is the display loop's own bounded
+/// <see cref="DisplayPusher.Stop(bool, TimeSpan)"/>: if it times out, the loop still owns the device and closes it when the stuck
+/// transfer gives up, so the owner is told (<c>stillClosing</c>) and must not reopen the display before <see cref="DisplayPusher.IsClosed"/>.
 /// </summary>
 public static class PowerBlank
 {
@@ -25,34 +26,28 @@ public static class PowerBlank
         /// <summary>Nothing was open, so there was nothing to blank.</summary>
         NothingOpen,
         Blanked,
-        /// <summary>The blank was started but did not finish in time (it keeps going in the background).</summary>
+        /// <summary>A transfer was still stuck when the time ran out. The loop blanks (if it can) and closes the display when it gives up.</summary>
         TimedOut,
         /// <summary>The owner held its lock for too long (for example while opening the display). It sees the policy and blanks itself.</summary>
         Busy,
     }
 
     /// <param name="gate">The owner's lock around its display field.</param>
-    /// <param name="take">Runs under <paramref name="gate"/>: detaches the display from the owner and returns how to blank and close it, or null.</param>
+    /// <param name="take">Runs under <paramref name="gate"/>: detaches the pusher from the owner and returns it, or null.</param>
     /// <param name="budget">Total time allowed, waiting for the lock included.</param>
-    public static Result Run(object gate, Func<Action?> take, TimeSpan budget)
+    /// <param name="stillClosing">Called when the stop timed out: the pusher still holds the device; do not reopen before it is closed.</param>
+    public static Result Run(object gate, Func<DisplayPusher?> take, TimeSpan budget, Action<DisplayPusher>? stillClosing = null)
     {
         var sw = Stopwatch.StartNew();
-        Action? stop;
+        DisplayPusher? p;
         if (!Monitor.TryEnter(gate, budget / 3)) return Result.Busy;
-        try { stop = take(); }
+        try { p = take(); }
         finally { Monitor.Exit(gate); }
-        if (stop is null) return Result.NothingOpen;
+        if (p is null) return Result.NothingOpen;
         var left = budget - sw.Elapsed;
-        return RunWithDeadline(stop, left > TimeSpan.Zero ? left : TimeSpan.Zero) ? Result.Blanked : Result.TimedOut;
-    }
-
-    /// <summary>Runs <paramref name="work"/> on its own background thread and waits at most <paramref name="deadline"/>. True if it finished.</summary>
-    public static bool RunWithDeadline(Action work, TimeSpan deadline)
-    {
-        var t = new Thread(() => { try { work(); } catch { /* best effort; the caller only needs to know whether it finished */ } })
-        { IsBackground = true, Name = "Glance power blank" };
-        t.Start();
-        return t.Join(deadline);
+        if (p.Stop(blank: true, left > TimeSpan.Zero ? left : TimeSpan.Zero)) return Result.Blanked;
+        stillClosing?.Invoke(p);
+        return Result.TimedOut;
     }
 }
 

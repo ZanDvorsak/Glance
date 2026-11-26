@@ -409,3 +409,92 @@ the public timeout during integration.
 - **The manual test plan above still applies.** Add:
   - **14.** With the runner running, unplug the display while it shows a frame and shut down at once. Windows must not wait more than about 4 s for Glance. `runner.log` shows `blank TimedOut` or `blank Blanked`.
   - **15.** Sleep and wake, then check that `runner.log` has no "No wake-up notice" line. That line would mean the wake notice was missed and the 30 s heal fired.
+
+
+---
+
+## Phase 2: merged display loop
+
+**Date:** 2026-11-26. **By:** the author of the change. The reviewer's findings above are unchanged.
+
+### The merge
+
+- **Merged:** `claude/fix-display-loop-693991` at `3af052b`, with a merge commit (no rebase).
+- **Merged in automatically:** `DisplayPusher.cs`, `IFrameDisplay.cs`, `Ax206Display.cs`, `Theme.cs`, `Glance.Core.csproj` (`InternalsVisibleTo`), the display-loop tests and its review and walkthrough.
+- **Three conflicts were resolved by hand:**
+
+| File | Conflict | Resolution |
+|---|---|---|
+| `AGENTS.md` | Both branches added a paragraph to "The display" | Kept both, then updated the shutdown paragraph to describe the merged design |
+| `src/Glance.Runner/RunnerContext.cs` (`Supervise`, open path) | This branch's "re-check `MayDrive` right after opening" against the display-loop branch's "do not open while `_closingPusher` is not `IsClosed`" | Both: the open happens only when the old pusher has let go, and the re-check follows it. The re-check closes with `QuickStopTimeout` |
+| `src/Glance.App/MainWindow.cs` (`TurnDisplayOff`, `ToggleSend`) | This branch's `ReleasePusher`/`TryStartPusher` against the display-loop branch's `StopPusher`/`DisplayStillClosing`/`RestartDeadPusher` | Replaced by one Core class, `PusherSlot`, below. `_pusher` is now a read-only view of `PusherSlot.Current` |
+
+- **Also adapted, without a conflict:**
+  - `DisposePusher` in the runner takes an optional timeout and records a stuck pusher through `RememberClosing`.
+  - `PayOwedBlank` uses the quick stop. If the old pusher is still closing, it asks that loop to blank as well (`Stop(true, TimeSpan.Zero)`) instead of opening the device.
+
+### M2 and the switch to the public `Stop` timeout
+
+- **New `PusherSlot` (Core)** owns the editor's display:
+  - `TryOpen` refuses while `!MayDrive` and while a stopped pusher still holds the device. It checks `MayDrive` again right after opening.
+  - `Release` detaches the pusher with `Interlocked.Exchange` and calls `Stop(blank, timeout)`. When that returns false, the pusher is remembered as still closing.
+  - `BlankForPowerEvent(e)` calls `PowerBlank.Run`, using the owner budget.
+  - `RestartIfDead` is the M2 fix:
+    - `Interlocked.CompareExchange(ref _current, null, dead)` detaches the dead pusher; if someone else released it first, it does nothing.
+    - It stops the dead pusher (blank only when not allowed to drive).
+    - It reopens through `TryOpen`, so the same policy and "still closing" checks apply.
+    - The result is `NotNow` while asleep or after a session end; the editor then lets the wake-up path reopen it.
+- **The editor's `RestartDeadPusher`** is now a thin switch over `RestartIfDead`.
+- **The runner's dead-loop restart** was already behind the policy: the `!MayDrive` guard comes before the `ShouldReopen` branch in `Supervise`, all under `_gate`. A comment now says so. A new open is followed by the `MayDrive` re-check.
+- **`PowerBlank.Run`** now takes the pusher, not an `Action`, and calls the display loop's public `DisplayPusher.Stop(blank: true, timeout)`:
+  - It waits at most a third of the budget for the owner's lock.
+  - It stops with the rest of `OwnerBudgetFor(e)`: 3.7 s for a session end, 1.2 s for sleep.
+  - **When `Stop` returns false**, it calls `stillClosing(p)`. The editor stores the pusher in the slot; the runner stores it in `_closingPusher`. Neither reopens the display until `IsClosed`, so the display is never reopened straight away.
+- **Removed:** my own "stop with a deadline" helper, `PowerBlank.RunWithDeadline`. `SessionPowerWatcher` keeps a small private bound on the *handler*, so Windows always gets its answer and the block reason is always removed. It is no longer used to stop the display.
+- **Not used:** `DisplayPusher.QuickStopTimeout` (2 s) for the power path, because it is longer than the 1.5 s sleep budget. It is used where only the UI thread waits (closing the editor, re-checks after opening).
+
+### Proof
+
+Tests first, against the merged code before the fix. `RestartIfDead` was a copy of the merged `RestartDeadPusher` (stop the dead pusher, open a new `DisplayPusher` directly). `BlankForPowerEvent` was the phase-1 path (the default `Stop` inside a deadline, with nothing remembered):
+
+| Test | Before | After |
+|---|---|---|
+| `DeadPusherRestartTests.A_dead_pusher_is_not_restarted_while_Windows_sleeps_or_after_the_session_ended(e: Suspend)` | **Failed:** `Expected: NotNow, Actual: Reopened` | Passed |
+| same, `(e: SessionEnding)` | **Failed:** `Expected: NotNow, Actual: Reopened` | Passed |
+| `PowerBlankTimingTests.A_stalled_display_is_released_within_the_budget_and_not_reopened_while_it_is_still_held(e: SessionEnding)` | **Failed:** `Assert.NotNull() Failure: Value is null`. Timed out in 3701 ms, but the still-held device was not remembered | Passed: `TimedOut after 3713 ms (budget 4000 ms)` |
+| same, `(e: Suspend)` | **Failed:** the same, after 1200 ms | Passed: `TimedOut after 1214 ms (budget 1500 ms)` |
+| `PowerBlankTimingTests.After_a_stuck_sleep_blank_the_display_is_reopened_only_once_the_old_loop_lets_go` | **Failed:** `Assert.False() Failure`. It reopened straight after wake, while the old loop still held the device | Passed |
+| `DeadPusherRestartTests.A_dead_pusher_is_restarted_while_awake` | Passed | Passed |
+| `DeadPusherRestartTests.A_dead_pusher_already_released_by_a_power_event_is_left_alone` | Passed | Passed |
+| `PowerBlankTimingTests.A_working_display_is_blanked_well_within_the_budget` (both events) | Passed: 406 / 405 ms | Passed: **407 ms** (session end), **405 ms** (sleep), exactly one blank, display closed |
+
+Fakes: the display-loop branch's `FakeDisplay`. A stalled display has `BlitDelayMs = 10 000`. A working one has `BlitDelayMs = 400`, about the real full-frame time. A dead loop has `SizeThrows = true`.
+
+The phase-1 `PowerBlankTests` now drive real pushers over `FakeDisplay`. A stalled stop gives up within a 300 ms budget and reports the pusher as still closing. A normal stop blanks once and closes.
+
+**Mutation checks:**
+
+| Mutation | Result |
+|---|---|
+| `TryOpen` ignores the power policy | The 2 M2 tests fail |
+| A timed-out power stop is not remembered | The 3 "stalled" tests fail |
+| `RestartIfDead` clears `_current` without the compare-exchange | **No test fails** |
+
+The compare-exchange is defensive. Today every caller that could race with it either runs on the same UI thread (`Release`, `TryOpen`) or updates the policy first (the power event), so `TryOpen` refuses anyway. A deterministic test would need a hook inside the method, so this is left as a known gap.
+
+**Totals:**
+- `dotnet build src/Glance.sln -c Release -p:SkipHost=true` succeeds with 0 errors. No new warnings in the changed files.
+- `dotnet test src/Glance.Tests -c Release` was run **3 times in a row**, because these tests depend on timing: **310/310** each time, about 8 s.
+
+### Changes to the manual test plan
+
+The 13 steps above still apply. Changes and additions:
+- **Step 9** (editor sending, display unplugged during sleep): the editor now keeps trying for about 60 s after wake (phase 1, L2), not 7.5 s. Plugging the display in within that minute brings it back.
+- **Step 14** (phase 1, the display unplugged mid-frame, then shut down): `runner.log` now shows `Windows SessionEnding: blank TimedOut` followed by `The display did not stop in time; it will close when its last transfer gives up`. Windows should not wait more than about 4 s.
+- **16 (new):** with the runner running, unplug the display, sleep at once, wake, and plug it back in. The runner must not log "busy" errors. It waits for the old loop ("the display is finishing its last transfer") and then reopens within a few seconds.
+- **17 (new, the editor without the runner, M2):** hard to trigger by hand, because the loop dying needs a fault inside the loop. It is covered by the `DeadPusherRestartTests`; nothing to do by hand.
+
+### Still open
+
+- The runner's wiring (`Supervise`, `PayOwedBlank`, `Quit`) has no unit tests. The editor's display logic does now (`PusherSlot`).
+- `docs/walkthroughs/shutdown-blank.md` still describes the phase-0 code.

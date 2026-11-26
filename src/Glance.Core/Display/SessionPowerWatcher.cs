@@ -155,13 +155,15 @@ public sealed class SessionPowerWatcher : IDisposable
         try
         {
             var budget = e == PowerEvent.SessionEnding ? _sessionEndBudget : _otherBudget;
-            bool finished = PowerBlank.RunWithDeadline(() =>
+            var t = new Thread(() =>
             {
                 t_inHandler = true;
                 try { _handler(e); }
                 catch (Exception ex) { _log?.Invoke($"Handling {e} failed: {ex.Message}"); }
-            }, budget);
-            if (!finished) _log?.Invoke($"Handling {e} took longer than {budget.TotalSeconds:0.#} s; answered Windows anyway");
+            }) { IsBackground = true, Name = "Glance power event" };
+            t.Start();
+            // the handler's own work is bounded too (PowerBlank, DisplayPusher.Stop); this only guarantees the answer to Windows
+            if (!t.Join(budget)) _log?.Invoke($"Handling {e} took longer than {budget.TotalSeconds:0.#} s; answered Windows anyway");
         }
         finally { if (blocking) ShutdownBlockReasonDestroy(hwnd); }
     }

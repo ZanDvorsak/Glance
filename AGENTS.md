@@ -90,12 +90,19 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
   before the message is answered (Windows waits for it) but never longer than `PowerBlank.BudgetFor` (4 s session end, 1.5 s sleep), with a
   shutdown block reason set during a session end and always removed. `DisplayPowerPolicy` (pure, tested) decides: session end/quit -> blank once,
   stop and never reopen (also while asleep, so an installer can close the runner); suspend -> blank and hold; resume -> reopen (the runner's
-  `Supervise` does it, the editor retries for about a minute). Owners update the policy first, then blank with `PowerBlank.Run` (bounded lock
-  wait and stop; if the owner's lock is busy the owner pays the blank itself), and check `MayDrive` before and right after opening the display.
+  `Supervise` does it, the editor retries for about a minute). Owners update the policy first, then blank with `PowerBlank.Run`: a bounded
+  lock wait, then the loop's own `DisplayPusher.Stop(true, timeout)` with what is left of `OwnerBudgetFor(e)`. If that returns false the
+  pusher is remembered as still closing and the display is not reopened until `IsClosed`. If the owner's lock is busy the owner pays the blank itself.
+  Every open checks `MayDrive` before and right after opening; that includes the restart of a dead loop. The editor keeps all of this in
+  `PusherSlot` (Core, tested with `FakeDisplay`); the runner's `Supervise` checks the policy before its `ShouldReopen` restart.
   A missed wake notice heals after 30 s awake (`NoteAwakeTick`), or at once on tray Resume/Reload or the `RESUME` command.
   In the editor, Avalonia closes the window on an OS shutdown, so `Closing` usually does the session-end blank (off the UI thread;
   `Program.Main` waits for it); the watcher covers sleep and is the backup. Out of scope: Modern Standby timing (`PBT_APMSUSPEND` can come late),
   monitor off and lock (no `GUID_CONSOLE_DISPLAY_STATE` handling yet). Only verifiable by hand: shut down / sleep with the display attached and look.
+- While a `DisplayPusher` runs, only its loop touches the device. `Stop(blank, timeout)` asks the loop to blank (skipped if the last
+  transfer failed) and close; it returns false if a transfer is still stuck, and `IsClosed` turns true when the loop lets go.
+  Use `DisplayPusher.QuickStopTimeout` (2 s) for sleep/shutdown. `LastError` is USB trouble (owners reopen via `DisplayPusher.ShouldReopen`);
+  `LastRenderError` is a theme that fails to draw (shown, never a reason to reopen). Tests drive it with `FakeDisplay` and short `PusherTiming`.
 - AIDA64 uses the same device; only one program can hold it.
 - The display and runner pages: `DisplayPusher.NextPageIndex` is the pure rotation logic (shared with the virtual display window).
 
@@ -130,7 +137,7 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
 ## Verifying changes
 
 ```powershell
-dotnet test src/Glance.Tests -c Release      # ~240 tests, about 2 seconds, no hardware needed
+dotnet test src/Glance.Tests -c Release      # ~270 tests, about 5 seconds, no hardware needed
 ```
 
 - `src/Glance.Tests` (xUnit) covers the hardware-free logic: page rotation, setup diagnoses, `.glance` import safety, undo,

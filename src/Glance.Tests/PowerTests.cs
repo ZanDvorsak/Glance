@@ -161,12 +161,16 @@ public class PowerBlankTests
     public void Gives_up_on_a_stalled_display_within_its_budget()
     {
         // review M1: a display that stops answering must not hold Windows' shutdown or sleep
-        using var release = new ManualResetEventSlim();
+        var opener = new FakeOpener { Make = () => new FakeDisplay { BlitDelayMs = 5000 } };
+        var p = opener.Open();
+        Assert.True(opener.Displays[0].BlitStarted.Wait(5000));
+        DisplayPusher? stuck = null;
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var result = PowerBlank.Run(new object(), () => () => release.Wait(5000), Budget);
+        var result = PowerBlank.Run(new object(), () => p, Budget, s => stuck = s);
         sw.Stop();
-        release.Set();
         Assert.Equal(PowerBlank.Result.TimedOut, result);
+        Assert.Same(p, stuck);                 // the owner is told the device is still held
+        Assert.False(p.IsClosed);
         Assert.True(sw.ElapsedMilliseconds < 1000, $"took {sw.ElapsedMilliseconds} ms");
     }
 
@@ -182,7 +186,7 @@ public class PowerBlankTests
         held.Wait();
         bool taken = false;
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var result = PowerBlank.Run(gate, () => { taken = true; return null; }, Budget);
+        var result = PowerBlank.Run(gate, () => { taken = true; return (DisplayPusher?)null; }, Budget);
         sw.Stop();
         release.Set();
         Assert.Equal(PowerBlank.Result.Busy, result);
@@ -193,9 +197,12 @@ public class PowerBlankTests
     [Fact]
     public void Blanks_normally_when_nothing_is_stuck()
     {
-        int stops = 0;
-        Assert.Equal(PowerBlank.Result.Blanked, PowerBlank.Run(new object(), () => () => stops++, Budget));
-        Assert.Equal(1, stops);
+        var opener = new FakeOpener();
+        var p = opener.Open();
+        Assert.True(opener.Displays[0].BlitStarted.Wait(5000));
+        Assert.Equal(PowerBlank.Result.Blanked, PowerBlank.Run(new object(), () => p, TimeSpan.FromSeconds(1.2), _ => Assert.Fail("not stuck")));
+        Assert.Equal(1, opener.Displays[0].Blanks);
+        Assert.True(p.IsClosed);
         Assert.Equal(PowerBlank.Result.NothingOpen, PowerBlank.Run(new object(), () => null, Budget));
     }
 

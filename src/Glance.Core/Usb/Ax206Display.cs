@@ -1,15 +1,22 @@
+using Glance.Core.Display;
+
 namespace Glance.Core.Usb;
 
 /// <summary>
 /// Driver for the 1908:0102 "USB-Display" (AX206-style protocol over libusb-win32).
 /// See docs/PROTOCOL.md. Frames are RGB565 big-endian.
+/// Every transfer and <see cref="Dispose"/> take the same lock, so the handle is never closed while a transfer is running,
+/// and a disposed display throws <see cref="ObjectDisposedException"/> instead of handing a closed handle to libusb
+/// (which would be a native crash .NET cannot catch).
 /// </summary>
-public sealed unsafe class Ax206Display : IDisposable
+public sealed unsafe class Ax206Display : IFrameDisplay
 {
     public const ushort Vid = 0x1908, Pid = 0x0102;
     private const int EpOut = 0x01, EpIn = 0x81, TimeoutMs = 3000, ChunkSize = 64 * 1024;
 
+    private readonly object _io = new();
     private IntPtr _handle;
+    private bool _disposed;
 
     public int Width { get; private set; } = 480;
     public int Height { get; private set; } = 320;
@@ -52,7 +59,10 @@ public sealed unsafe class Ax206Display : IDisposable
             throw new InvalidOperationException("Could not claim the display interface: " + err);
         }
         var d = new Ax206Display(h);
-        d.ReadDimensions();
+        // The first transfer can time out right after the display is plugged in. Release the claimed interface then,
+        // or every later open fails with "busy" until this process exits.
+        try { d.ReadDimensions(); }
+        catch { d.Dispose(); throw; }
         return d;
     }
 
@@ -67,11 +77,14 @@ public sealed unsafe class Ax206Display : IDisposable
         return b;
     }
 
+    /// <summary>The open handle; callers hold <see cref="_io"/>. Never returns zero.</summary>
+    private IntPtr Handle => _disposed || _handle == IntPtr.Zero ? throw new ObjectDisposedException(nameof(Ax206Display)) : _handle;
+
     private void Write(byte[] data, int offset, int count)
     {
         fixed (byte* p = &data[offset])
         {
-            var rc = Libusb0.usb_bulk_write(_handle, EpOut, p, count, TimeoutMs);
+            var rc = Libusb0.usb_bulk_write(Handle, EpOut, p, count, TimeoutMs);
             if (rc < 0) throw new IOException("USB write failed: " + Libusb0.LastError());
         }
     }
@@ -80,7 +93,7 @@ public sealed unsafe class Ax206Display : IDisposable
     {
         fixed (byte* p = buf)
         {
-            var rc = Libusb0.usb_bulk_read(_handle, EpIn, p, count, TimeoutMs);
+            var rc = Libusb0.usb_bulk_read(Handle, EpIn, p, count, TimeoutMs);
             if (rc < 0) throw new IOException("USB read failed: " + Libusb0.LastError());
             return rc;
         }
@@ -92,10 +105,14 @@ public sealed unsafe class Ax206Display : IDisposable
     {
         var cdb = new byte[16]; cdb[0] = 0xCD; cdb[5] = 2;
         var cbw = BuildCbw(cdb, 5);
-        Write(cbw, 0, cbw.Length);
         var data = new byte[5];
-        var n = Read(data, 5);
-        ReadStatus();
+        int n;
+        lock (_io)
+        {
+            Write(cbw, 0, cbw.Length);
+            n = Read(data, 5);
+            ReadStatus();
+        }
         if (n >= 4)
         {
             var w = data[0] | (data[1] << 8); var h = data[2] | (data[3] << 8);
@@ -109,8 +126,11 @@ public sealed unsafe class Ax206Display : IDisposable
         var cdb = new byte[16];
         cdb[0] = 0xCD; cdb[5] = 6; cdb[6] = 0x01; cdb[7] = 0x01; cdb[9] = (byte)Math.Clamp(level, 0, 7);
         var cbw = BuildCbw(cdb, 0);
-        Write(cbw, 0, cbw.Length);
-        ReadStatus();
+        lock (_io)
+        {
+            Write(cbw, 0, cbw.Length);
+            ReadStatus();
+        }
     }
 
     /// <summary>
@@ -129,13 +149,16 @@ public sealed unsafe class Ax206Display : IDisposable
         cdb[11] = (byte)x1; cdb[12] = (byte)(x1 >> 8);
         cdb[13] = (byte)y1; cdb[14] = (byte)(y1 >> 8);
         var cbw = BuildCbw(cdb, rgb565Be.Length);
-        Write(cbw, 0, cbw.Length);
-        for (int off = 0; off < rgb565Be.Length; off += ChunkSize)
-            Write(rgb565Be, off, Math.Min(ChunkSize, rgb565Be.Length - off));
-        ReadStatus();
+        lock (_io)
+        {
+            Write(cbw, 0, cbw.Length);
+            for (int off = 0; off < rgb565Be.Length; off += ChunkSize)
+                Write(rgb565Be, off, Math.Min(ChunkSize, rgb565Be.Length - off));
+            ReadStatus();
+        }
     }
 
-    /// <summary>Black frame, then backlight off, so the screen does not keep showing its last picture.</summary>
+    /// <summary>Black frame, then backlight off, so the screen does not keep showing its last picture. Never throws.</summary>
     public void Blank()
     {
         try { Blit(0, 0, Width, Height, new byte[Width * Height * 2]); } catch { /* best effort */ }
@@ -149,11 +172,20 @@ public sealed unsafe class Ax206Display : IDisposable
         catch (Exception ex) { return ex.Message; }
     }
 
+    /// <summary>
+    /// Releases and closes the device. If another thread is in the middle of a transfer, this waits for it (each transfer
+    /// gives up after 3 s). Safe to call more than once.
+    /// </summary>
     public void Dispose()
     {
-        if (_handle == IntPtr.Zero) return;
-        Libusb0.usb_release_interface(_handle, 0);
-        Libusb0.usb_close(_handle);
-        _handle = IntPtr.Zero;
+        lock (_io)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            if (_handle == IntPtr.Zero) return;
+            Libusb0.usb_release_interface(_handle, 0);
+            Libusb0.usb_close(_handle);
+            _handle = IntPtr.Zero;
+        }
     }
 }
