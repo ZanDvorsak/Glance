@@ -41,7 +41,8 @@ public class ImportedThemePathTests
         @"C:secret.png",                    // drive-relative
         @"assets\..\..\secret.png",         // climbs out of the theme folder
         "../secret.png",
-        "assets/../theme.json",             // ".." that stays inside the folder is refused as well
+        "assets/../theme.json",             // ".." that climbs back to theme.json (outside assets/)
+        "assets/sub/../a.png",              // ".." that still ends inside assets/: only the ".." rule removes it
         "theme.json",                       // relative, but not inside assets/
         "assets/a.png:hidden",              // alternate data stream
         "assets",                           // the folder itself
@@ -317,9 +318,9 @@ public class ThemeInputApiTests
         ThemePackage.Import(package, dir.Combine("imp"), out var removed);
 
         Assert.Equal(3, removed.Count);
-        Assert.Equal(new RemovedAssetPath("Main", "Logo", "Image", @"\\attacker\share\x.png", "network or device path"), removed[0]);
-        Assert.Equal(new RemovedAssetPath("Main", "Logo", "Font file", @"C:\Windows\Fonts\arial.ttf", "absolute path"), removed[1]);
-        Assert.Equal(new RemovedAssetPath("Main", "Up", "Font file", "../x.ttf", "contains \"..\""), removed[2]);
+        Assert.Equal(new RemovedAssetPath("Main", "Logo", RemovedAssetPath.Picture, @"\\attacker\share\x.png", "network or device path"), removed[0]);
+        Assert.Equal(new RemovedAssetPath("Main", "Logo", RemovedAssetPath.Font, @"C:\Windows\Fonts\arial.ttf", "absolute path"), removed[1]);
+        Assert.Equal(new RemovedAssetPath("Main", "Up", RemovedAssetPath.Font, "../x.ttf", "contains \"..\""), removed[2]);
         Assert.Contains(@"\\attacker\share\x.png", removed[0].ToString());
     }
 

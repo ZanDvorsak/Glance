@@ -124,8 +124,8 @@ public static class ThemePackage
         foreach (var page in theme.Pages)
             foreach (var w in page.Widgets)
             {
-                if (WhyForeign(w.ImagePath, destFolder) is { } r1) { removed.Add(new(page.Name, w.Name, "Image", w.ImagePath, r1)); w.ImagePath = ""; }
-                if (WhyForeign(w.FontFile, destFolder) is { } r2) { removed.Add(new(page.Name, w.Name, "Font file", w.FontFile, r2)); w.FontFile = ""; }
+                if (WhyForeign(w.ImagePath, destFolder) is { } r1) { removed.Add(new(page.Name, w.Name, RemovedAssetPath.Picture, w.ImagePath, r1)); w.ImagePath = ""; }
+                if (WhyForeign(w.FontFile, destFolder) is { } r2) { removed.Add(new(page.Name, w.Name, RemovedAssetPath.Font, w.FontFile, r2)); w.FontFile = ""; }
             }
         return removed;
     }
@@ -138,16 +138,28 @@ public static class ThemePackage
         if (Path.IsPathRooted(path)) return "absolute path";
         if (path.Contains(':')) return "drive or stream marker";
         if (path.Split('/', '\\').Any(s => s == "..")) return "contains \"..\"";
-        var assets = Path.GetFullPath(Path.Combine(destFolder, "assets")).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        var full = Path.GetFullPath(Path.Combine(destFolder, path));
-        return full.StartsWith(assets, StringComparison.OrdinalIgnoreCase) ? null : "outside the theme's assets folder";
+        try
+        {
+            var assets = Path.GetFullPath(Path.Combine(destFolder, "assets")).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            var full = Path.GetFullPath(Path.Combine(destFolder, path));
+            return full.StartsWith(assets, StringComparison.OrdinalIgnoreCase) ? null : "outside the theme's assets folder";
+        }
+        catch (Exception e) when (e is ArgumentException or PathTooLongException or NotSupportedException)
+        {
+            return "not a valid path";   // e.g. a null character or 40,000 characters: drop this path, keep the theme
+        }
     }
 
     private static string SafeFileName(string n) => string.Concat(n.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
 }
 
 /// <summary>A widget path that <see cref="ThemePackage.Import(string, string, out IReadOnlyList{RemovedAssetPath})"/> cleared.</summary>
+/// <param name="Property">What the path was for: <see cref="Picture"/> or <see cref="Font"/>.</param>
 public sealed record RemovedAssetPath(string Page, string Widget, string Property, string Path, string Reason)
 {
-    public override string ToString() => $"{Page} / {Widget}: {Property.ToLowerInvariant()} \"{Path}\" ({Reason})";
+    public const string Picture = "picture or video";
+    public const string Font = "font";
+
+    /// <summary>One line for the editor's report, worded like the dialog around it ("pick the pictures or fonts again").</summary>
+    public override string ToString() => $"Page \"{Page}\", widget \"{Widget}\": {Property} {Path} ({Reason})";
 }

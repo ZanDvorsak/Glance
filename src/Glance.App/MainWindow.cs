@@ -159,8 +159,10 @@ public sealed class MainWindow : Window
             try { await MaybeShowSetupOnFirstRunAsync(); } catch { /* never block startup */ }
         };
 
+        Program.UiError += OnUiError;
         Closing += (_, _) =>
         {
+            Program.UiError -= OnUiError;
             StopLive();
             _power.Handle(PowerEvent.Quit);   // nothing may reopen the display from here on
             // Avalonia also closes the window this way when Windows shuts down (WM_QUERYENDSESSION), so this is usually where the
@@ -818,7 +820,8 @@ public sealed class MainWindow : Window
         await ShowRemovedImportPathsAsync();
     }
 
-    private async Task SaveAsync(bool saveAs)
+    /// <returns>True when the theme was written.</returns>
+    private async Task<bool> SaveAsync(bool saveAs)
     {
         var path = _themePath;
         if (path is null || saveAs)
@@ -830,7 +833,7 @@ public sealed class MainWindow : Window
                 SuggestedStartLocation = await StorageProvider.TryGetFolderFromPathAsync(AppSettings.ThemesFolder),
                 FileTypeChoices = new[] { new FilePickerFileType("Theme") { Patterns = new[] { "*.json" } } },
             });
-            if (file?.TryGetLocalPath() is not { } p) return;
+            if (file?.TryGetLocalPath() is not { } p) return false;
             path = p;
         }
         try
@@ -841,8 +844,60 @@ public sealed class MainWindow : Window
             _themePath = path; _settings.LastTheme = path; _settings.Save();
             _renderer.ClearImageCache();
             _status.Text = "Saved " + path + (moved ? " (undo history cleared: the theme now lives in a new folder)" : "");
+            return true;
         }
-        catch (Exception ex) { _status.Text = "Save failed: " + ex.Message; }
+        catch (Exception ex) { _status.Text = "Save failed: " + ex.Message; return false; }
+    }
+
+    // ---- errors caught by Program's UI crash handler -------------------------------------------------------------
+
+    private bool _errorDialogOpen;
+
+    private void OnUiError(Glance.Core.Diagnostics.CrashVerdict verdict, Exception ex)
+    {
+        if (verdict == Glance.Core.Diagnostics.CrashVerdict.Notify)
+        {
+            _status.Text = $"Something went wrong: {ex.Message} The editor kept running; details are in {Program.CrashLogFile}.";
+            return;
+        }
+        if (_errorDialogOpen) return;
+        _errorDialogOpen = true;
+        Dispatcher.UIThread.Post(async () =>
+        {
+            try { await ShowRepeatingErrorAsync(ex); }
+            catch { /* the dialog itself failed: the status bar and the log still have it */ }
+            finally { _errorDialogOpen = false; }
+        });
+    }
+
+    /// <summary>The same error keeps repeating: the editor is stuck in a failing loop. Offer to save and close.</summary>
+    private async Task ShowRepeatingErrorAsync(Exception ex)
+    {
+        _status.Text = $"The same error keeps happening: {ex.Message} Details are in {Program.CrashLogFile}.";
+        var saveAndClose = false;
+        var dlg = new Window
+        {
+            Title = "Glance keeps hitting an error", Width = 520, SizeToContent = SizeToContent.Height, CanResize = false,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+        };
+        var save = new Button { Content = "Save and close" };
+        var keep = new Button { Content = "Keep going" };
+        save.Click += (_, _) => { saveAndClose = true; dlg.Close(); };
+        keep.Click += (_, _) => dlg.Close();
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, HorizontalAlignment = HorizontalAlignment.Right };
+        buttons.Children.Add(keep); buttons.Children.Add(save);
+        var body = new StackPanel { Margin = new Thickness(18), Spacing = 14 };
+        body.Children.Add(new TextBlock
+        {
+            TextWrapping = TextWrapping.Wrap,
+            Text = $"The same error happened {Glance.Core.Diagnostics.CrashGuard.StormCount} times in a few seconds:\n\n{ex.Message}\n\n" +
+                   "The editor may not work properly until it is restarted. Save your theme and close Glance, then start it again. " +
+                   $"Details are in {Program.CrashLogFile}.",
+        });
+        body.Children.Add(buttons);
+        dlg.Content = body;
+        await dlg.ShowDialog(this);
+        if (saveAndClose && await SaveAsync(saveAs: false)) Close();
     }
 
     private async Task ImportAidaAsync()
@@ -886,9 +941,32 @@ public sealed class MainWindow : Window
             Title = "Choose an image, GIF or video", AllowMultiple = false,
             FileTypeFilter = new[] { new FilePickerFileType("Images, GIFs and videos") { Patterns = new[] { "*.png", "*.jpg", "*.jpeg", "*.bmp", "*.gif", "*.webp", "*.mp4", "*.webm", "*.mkv", "*.mov", "*.avi", "*.m4v", "*.wmv" } } },
         });
-        var path = files.Count > 0 ? files[0].TryGetLocalPath() : null;
+        var path = LocalizePick(files.Count > 0 ? files[0].TryGetLocalPath() : null);
         if (path is not null) _renderer.ClearImageCache();
         return path;
+    }
+
+    /// <summary>Where network files picked for a theme that was never saved are copied (Save then adopts them).</summary>
+    private static string PickedStagingFolder => Path.Combine(Path.GetTempPath(), "Glance", "picked");
+
+    /// <summary>
+    /// A file picked on a network share is copied into the theme now, while the user's choice is fresh: the renderer and
+    /// Save never open network paths (a theme from someone else could name any host). Local files are used as they are.
+    /// </summary>
+    private string? LocalizePick(string? picked)
+    {
+        if (picked is null || !AppTheme.IsNetworkOrDevicePath(picked)) return picked;
+        try
+        {
+            var local = PickedFile.Localize(picked, _theme, PickedStagingFolder);
+            _status.Text = $"Copied {Path.GetFileName(picked)} from the network into the theme (Glance does not read network folders while it runs).";
+            return local;
+        }
+        catch (Exception ex)
+        {
+            _status.Text = $"Could not copy {Path.GetFileName(picked)} from the network: {ex.Message}";
+            return null;
+        }
     }
 
     private async Task<string?> PickFontAsync()
@@ -898,7 +976,7 @@ public sealed class MainWindow : Window
             Title = "Choose a font file", AllowMultiple = false,
             FileTypeFilter = new[] { new FilePickerFileType("Fonts") { Patterns = new[] { "*.ttf", "*.otf", "*.ttc" } } },
         });
-        var path = files.Count > 0 ? files[0].TryGetLocalPath() : null;
+        var path = LocalizePick(files.Count > 0 ? files[0].TryGetLocalPath() : null);
         if (path is not null) _renderer.ClearImageCache();
         return path;
     }
@@ -915,7 +993,7 @@ public sealed class MainWindow : Window
             w.ImagePath = path; w.Name = Path.GetFileNameWithoutExtension(path);
             if (!Ffmpeg.IsVideo(path))
             {
-                using var data = SKData.Create(path);
+                using var data = _theme.ResolveAsset(path) is { } file ? SKData.Create(file) : null;   // a copied network pick is "assets/..."
                 using var codec = data is null ? null : SKCodec.Create(data);
                 if (codec is not null)
                 {

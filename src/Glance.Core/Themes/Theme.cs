@@ -66,26 +66,28 @@ public partial class Theme : ObservableObject
         }
         LegacyWidgets = null;
         if (Pages.Count == 0) Pages.Add(new ThemePage { Name = "Page 1" });
-        for (int i = 0; i < Pages.Count; i++) NormalizePage(Pages[i], i);
+        var ids = new HashSet<string>(StringComparer.Ordinal);   // widget ids are unique across the whole theme
+        for (int i = 0; i < Pages.Count; i++) NormalizePage(Pages[i], i, ids);
         ActivePageIndex = Math.Clamp(ActivePageIndex, 0, Pages.Count - 1);
     }
 
     private static readonly Widget WidgetDefaults = new();
     private static readonly ThemePage PageDefaults = new();
 
-    private static void NormalizePage(ThemePage page, int index)
+    private static void NormalizePage(ThemePage page, int index, HashSet<string> ids)
     {
         page.Name ??= $"Page {index + 1}";
         page.DurationSeconds = Bound(page.DurationSeconds, 1, 86400, PageDefaults.DurationSeconds);   // the pusher waits at least 1 s anyway
         page.Widgets ??= new();
         for (int i = page.Widgets.Count - 1; i >= 0; i--) if (page.Widgets[i] is null) page.Widgets.RemoveAt(i);
-        foreach (var w in page.Widgets) NormalizeWidget(w);
+        foreach (var w in page.Widgets) NormalizeWidget(w, ids);
     }
 
-    private static void NormalizeWidget(Widget w)
+    private static void NormalizeWidget(Widget w, HashSet<string> ids)
     {
         var d = WidgetDefaults;
-        if (string.IsNullOrEmpty(w.Id)) w.Id = Guid.NewGuid().ToString("N");
+        // a missing or repeated id gets a new one (the editor finds the selection by id; the first holder keeps it)
+        if (string.IsNullOrEmpty(w.Id) || !ids.Add(w.Id)) { w.Id = Guid.NewGuid().ToString("N"); ids.Add(w.Id); }
         w.Name ??= d.Name;
         w.Text ??= "";   // null means "no text", not the placeholder word
         w.SensorId ??= d.SensorId;
@@ -167,7 +169,10 @@ public partial class Theme : ObservableObject
             if (string.IsNullOrEmpty(stored)) return stored;
             var rooted = Path.IsPathRooted(stored);
             if (!rooted && sameFolder) return stored;            // already next to the theme
-            var source = rooted ? stored : ResolveAsset(stored); // relative paths belong to the old folder
+            // Relative paths belong to the old folder. Rooted paths go through the same gate as the renderer, so Save never
+            // opens a network or device path (that would send the user's credentials to whatever host a theme names).
+            // A network file the user picks is copied in at pick time (PickedFile.Localize), so it never needs to get here.
+            var source = ResolveAsset(stored);
             if (source is null || !File.Exists(source)) return stored;
             source = Path.GetFullPath(source);
             if (adopted.TryGetValue(source, out var known)) return known;
@@ -259,19 +264,52 @@ public partial class Theme : ObservableObject
     }
 
     /// <summary>
-    /// The file a widget path points at, or null when there is none to open. Relative paths resolve against
-    /// <see cref="BaseFolder"/>; local absolute paths (C:\..., also mapped drives the user set up) are returned as they are,
-    /// because the editor uses them for files picked but not yet saved into the theme.
-    /// <para>Network and device paths (<c>\\server\share</c>, <c>//server</c>, <c>\\?\</c>, <c>\\.\</c>, <c>\??\</c>) are never
-    /// resolved, for themes from any source: opening one makes Windows sign in to that machine with the user's credentials
-    /// (and the runner does it elevated), and a device path can read raw disks. Glance never writes such paths itself
-    /// (saving copies picked files into assets/), so only a hand-made or foreign theme carries them.</para>
+    /// The file a widget path points at, or null when there is none to open. This is the one gate for every reader of
+    /// widget paths: the renderer (images, videos, fonts), Export and Save.
+    /// <list type="bullet">
+    /// <item>Fully qualified local paths (<c>C:\...</c>, also mapped drives the user set up) are returned as they are,
+    /// because the editor uses them for files picked but not yet saved into the theme.</item>
+    /// <item>Rooted paths that are not fully qualified (<c>\x.png</c>, <c>C:x.png</c>) are refused: they depend on the
+    /// process's current drive and folder, which may be on a share.</item>
+    /// <item>Relative paths resolve against <see cref="BaseFolder"/>, and the result is checked again, so a theme whose
+    /// folder is on a share (opened from there, or sent with <c>LIVE</c>) resolves nothing either.</item>
+    /// <item>Network and device paths (<c>\\server\share</c>, <c>//server</c>, <c>\\?\</c>, <c>\\.\</c>, <c>\??\</c>) are
+    /// never resolved: opening one makes Windows sign in to that machine with the user's credentials (and the runner does it
+    /// elevated), and a device path can read raw disks.</item>
+    /// </list>
+    /// Glance never stores such paths itself: a network file the user picks is copied into the theme at once
+    /// (<see cref="PickedFile.Localize"/>). <see cref="AssetProblem"/> says why a path was refused.
     /// </summary>
-    public string? ResolveAsset(string path)
+    public string? ResolveAsset(string path) => Resolve(path, out _);
+
+    /// <summary>Why <see cref="ResolveAsset"/> refuses <paramref name="path"/>, as a short sentence for the editor;
+    /// null when the path is empty, resolves, or only lacks a saved theme folder.</summary>
+    public string? AssetProblem(string path)
     {
-        if (string.IsNullOrEmpty(path) || IsNetworkOrDevicePath(path)) return null;
-        if (Path.IsPathRooted(path)) return path;
-        return BaseFolder is null ? null : Path.Combine(BaseFolder, path);
+        Resolve(path, out var problem);
+        return problem;
+    }
+
+    private string? Resolve(string path, out string? problem)
+    {
+        problem = null;
+        if (string.IsNullOrEmpty(path)) return null;
+        if (IsNetworkOrDevicePath(path))
+        {
+            problem = "Glance does not open files on network or device paths. Use the browse button: a picked file is copied into the theme.";
+            return null;
+        }
+        if (Path.IsPathRooted(path))
+        {
+            if (Path.IsPathFullyQualified(path)) return path;
+            problem = @"This path depends on the current drive or folder. Use a full path such as C:\Pictures\bg.png, or the browse button.";
+            return null;
+        }
+        if (BaseFolder is null) return null;
+        var full = Path.Combine(BaseFolder, path);
+        if (!IsNetworkOrDevicePath(full)) return full;
+        problem = "This theme is stored in a network folder, and Glance does not open files from network folders. Keep themes in a local folder.";
+        return null;
     }
 
     /// <summary>True for UNC and device paths: two leading slashes in either direction (<c>\\server</c>, <c>//server</c>,

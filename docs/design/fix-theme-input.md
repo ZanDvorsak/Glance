@@ -65,8 +65,8 @@ No, for themes from any source, not only imports. Reasons:
   `theme.json` copied into the themes folder by hand, or one shared as a plain folder.
 - Device paths (`\\.\PhysicalDrive0`, `\\?\GLOBALROOT\...`) would let a theme make the elevated runner read raw devices.
 - Glance never writes such paths itself: the file picker's result is copied into `assets\` on Save, so saved themes hold
-  relative paths. The only loss: a picture picked straight from a `\\nas\...` share shows nothing in the preview until the
-  theme is saved (Save copies it into `assets\` because its copy step does not go through `ResolveAsset`, see "Left open").
+  relative paths. (Updated after review: a file picked straight from a `\\nas\...` share is copied into the theme the moment
+  it is picked, and Save also goes through `ResolveAsset`, so it never opens a network path itself.)
   Mapped drive letters (`Z:\`) still work: they are local absolute paths to a server the user chose.
 - Local absolute paths (`C:\...`) are still resolved, because the editor needs them for files picked and not yet saved.
   For imports they are removed anyway (they could leak a local file into a re-export).
@@ -143,9 +143,8 @@ dotnet test src/Glance.Tests -c Release                    -> Passed! Failed: 0,
 
 - The editor's new dialog and crash handler were built but not run by hand (no UI automation here). The dialog reuses the
   existing `ReportWindow`.
-- `Theme.Save` still checks a stored *rooted* path with `File.Exists` before copying it (it does not go through
-  `ResolveAsset`), so saving a hand-made theme that holds a UNC path would still touch that host once. Imported `.glance`
-  themes are cleaned before they can reach Save. `Save` is being changed on another branch (atomic saves); the one-line
-  follow-up there is to skip `Theme.IsNetworkOrDevicePath` paths in `Adopt` (or decide to keep them for user-picked NAS files).
+- ~~`Theme.Save` still opens a stored UNC path~~: fixed after review (M1 in `docs/reviews/review-theme-input.md`, section
+  "Fixes after review"). `Adopt` now goes through `ResolveAsset`, and a network file the user picks is copied into the theme
+  at pick time (`PickedFile.Localize`), so the NAS-picture case still works. The same section covers L1-L5 and N1-N5.
 - Colour strings are not validated: the renderer already falls back on unparsable colours.
 - Reserved device names inside `assets\` (`assets/CON`) are the separate finding L3.

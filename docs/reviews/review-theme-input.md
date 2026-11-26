@@ -300,3 +300,175 @@ FFmpeg gets its arguments through `ArgumentList` (`VideoSource.cs:52-53`), so a 
 - It is capped at about 2 MB in total (log plus `.old`).
 - Writing in the `AppDomain` handler cannot loop, because `Write` swallows its own errors.
 - The `UnobservedTaskException` handler marks the exception observed, which is harmless on .NET 8.
+
+---
+
+## Fixes after review
+
+The author of the change wrote this section; the reviewer's findings above are unchanged.
+- **New test classes** in `src/Glance.Tests/ThemeInputReviewFixTests.cs`: `ThemeInputReviewFixTests` (31 tests) and `CrashGuardTests` (4 tests).
+- **N2** also adds 2 new cases to `ImportedThemePathTests.BadPaths`.
+
+**How "before" was captured.**
+- The tests that use only existing API were run on the branch as it was (`f9d3939`), before any fix: `Failed: 18, Passed: 3, Total: 21`.
+- The 3 that passed are:
+  - the guards `Save_still_adopts_local_files` and `Normal_video_widgets_keep_their_size`
+  - `Slash_backslash_unc_is_recognised` (the review's test gap; the code was already right)
+- Tests that use new API (`PickedFile.Localize`, `Theme.AssetProblem`, `CrashGuard`) did not compile before; that is their "before".
+- N2 is a test gap, not a bug, so its "before" is a mutation (see N2 below).
+
+**After.**
+- `dotnet build src/Glance.sln -c Release -p:SkipHost=true`: 0 errors and 29 warnings, all existing ones. The `MainWindow.cs` CS8602 is the
+  old `_bmp.GetPixels()` line.
+- `dotnet test src/Glance.Tests -c Release`: **Passed 650 / 650** (613 + 37 new). This ran from a clean rebuild, after the mutation checks were restored.
+
+### M1. `Theme.Save` opened UNC and device paths
+
+- **Test:** `Save_keeps_a_network_or_device_path_as_text_and_never_copies_it`, with three paths:
+  - `\\localhost\C$\Windows\win.ini` (the reviewer's probe)
+  - `\\127.0.0.1\C$\Windows\win.ini`
+  - `\\?\C:\Windows\win.ini`
+- **Before:** 3 of 3 failed. For the first: `Expected: "\\localhost\C$\Windows\win.ini"`, `Actual: "assets/win.ini"`; the same for the other two.
+  So `Save` opened the share and copied `win.ini` into the theme.
+- **Fix:**
+  - **Save:** `Adopt` now takes its source from `ResolveAsset(stored)` for rooted paths too. This is one line inside `Adopt`; the final
+    write that `fix-atomic-saves` changes is untouched. A network, device or not fully qualified path is kept as text and never opened.
+  - **Picking a network file:** the editor's image and font pickers call the new `PickedFile.Localize` (Core), which copies the file
+    when it is picked.
+    - A saved theme gets the copy in its `assets/` folder. An existing file is never overwritten; the copy gets a new name (`bg_1.png`).
+    - An unsaved theme gets a local copy under `%TEMP%\Glance\picked\<guid>\`, which `Save` adopts like any local file.
+    - The status bar says the file was copied.
+- **After:** 3 of 3 pass. These guards pass too:
+  - `Save_still_adopts_local_files`
+  - `A_picked_network_file_is_copied_into_a_saved_theme_at_once`
+  - `A_picked_network_file_for_an_unsaved_theme_is_staged_locally_and_adopted_on_save`
+  - `A_picked_local_file_is_used_where_it_is`
+
+  The picker tests use the `\\?\C:\...` form. It is refused like a share, but it can be read without one, so these tests also work
+  where no admin share exists (CI). The `\\localhost` and `\\127.0.0.1` cases point only at this PC.
+
+### L1. An unreadable path failed the whole import
+
+- **Test:** `An_unreadable_path_is_removed_and_the_theme_still_imports`, with `assets/a\0b.png` and with a 40,000-character path.
+- **Before:** 2 of 2 failed:
+  - `System.ArgumentException : Null character in path. (Parameter 'path')` at `Path.GetFullPath`
+  - `System.IO.PathTooLongException : The path '...\imp\assets/aaaa...' is too long`
+- **Fix:** `WhyForeign` catches `ArgumentException`, `PathTooLongException` and `NotSupportedException` around `GetFullPath`, and
+  returns "not a valid path". Only that path is removed.
+- **After:** 2 of 2 pass. The good widget next to it keeps `assets/ok.png`.
+
+### L2. `ResolveAsset` resolved `\x.png`, `C:x.png` and paths under a network base folder
+
+- **Tests:**
+  - `Rooted_paths_that_are_not_fully_qualified_are_not_resolved`: `\x.png`, `C:x.png`, `/x.png`
+  - `Relative_paths_under_a_network_base_folder_are_not_resolved`: base folders `\\server\share\themes\x`, `//server/share/themes/x`,
+    `\\?\UNC\server\share\x`
+  - `Slash_backslash_unc_is_recognised`, for the `/\server` gap
+- **Before:** 6 of 6 failed with `Assert.Null() Failure: Value is not null`. The actual values were:
+  - `"\x.png"`, `"C:x.png"`, `"/x.png"`
+  - `"\\server\share\themes\x\assets/bg.png"`
+  - `"//server/share/themes/x\assets/bg.png"`
+  - `"\\?\UNC\server\share\x\assets/bg.png"`
+- **Fix:**
+  - `ResolveAsset` returns a rooted path only if `Path.IsPathFullyQualified` accepts it.
+  - It also checks the combined `BaseFolder` + relative path with `IsNetworkOrDevicePath`. This covers a theme opened from a share, and
+    a `LIVE` folder on a share.
+  - The comment now lists the rules exactly, and says that `ResolveAsset` is also Save's gate.
+- **After:** 7 of 7 pass.
+- **Consequence, by design:** a theme *stored* on a network folder shows no pictures or fonts. The editor says why (L5).
+
+### L3. The UI crash handler swallowed everything silently and without a limit
+
+- **Tests (`CrashGuardTests`):**
+  - `The_first_error_is_shown_then_repeats_are_logged_a_few_times_then_kept_quiet`
+  - `An_error_repeating_every_frame_becomes_a_storm_once`
+  - `Different_errors_are_counted_apart`
+  - `Repeats_spread_out_over_time_never_storm`
+- **Before:** they did not compile, because `CrashGuard` did not exist. The behaviour they pin down did not exist either: every exception
+  was logged and hidden.
+- **Fix:** the new `Glance.Core.Diagnostics.CrashGuard` decides what to do for each error. Errors are told apart by type, message and
+  the top stack frame.
+  - **First time (Notify):** the error is logged, and the status bar says "Something went wrong: ... details are in editor.log".
+  - **Repeats:** each error is logged up to 5 times, then kept quiet, so the log is not flooded.
+  - **The same error 20 times within 10 s (Storm, once per error):**
+    - It is logged once, with "... further repeats are not logged".
+    - The editor shows a dialog, "Glance keeps hitting an error", with **Save and close** and **Keep going**.
+    - Save and close closes the editor only if the save worked. `SaveAsync` now returns whether it wrote the file.
+  - **Wiring:** `Program` raises `UiError`; `MainWindow` subscribes to it, and unsubscribes when it closes.
+- **After:** 4 of 4 pass.
+- **Limit:** a global dispatcher handler cannot tell which operation threw, so it cannot stop "that operation". It stops the flood
+  (logging and the hidden loop) and leaves the decision to the user.
+- **Not run in the editor** (starting it was not allowed here), so the dialog and status text have not been checked by eye.
+
+### L4. A video widget could make `VideoSource` allocate about 256 MiB per frame
+
+- **Tests:**
+  - `Huge_video_widgets_are_decoded_at_a_capped_size`: 8192 x 8192, 8192 x 4096, 4000 x 4000
+  - the guard `Normal_video_widgets_keep_their_size`
+- **Before:** 3 of 3 failed: `8192 x 8192 = 256 MiB per frame`, `8192 x 4096 = 128 MiB per frame`, `4000 x 4000 = 61 MiB per frame`.
+- **Fix:**
+  - `VideoSource.MaxPixels` is 1920 x 1080 pixels: about 8 MiB per frame, 13 times the 480 x 320 display.
+  - A larger widget is scaled down, keeping its aspect ratio (`CapSize`), before ffmpeg is asked for frames.
+  - The renderer already stretches each frame to the widget box.
+- **After:** 4 of 4 pass, with the aspect ratio within 2 %. Not run with a real ffmpeg.
+
+### L5. A network image showed a blank box with no explanation
+
+- **Tests:**
+  - `AssetProblem_explains_a_refused_path` (3 cases)
+  - `AssetProblem_explains_a_theme_stored_on_a_share`
+  - `AssetProblem_is_null_for_paths_that_resolve` (3 cases)
+- **Before:** they did not compile, because `Theme.AssetProblem` did not exist.
+- **Fix:**
+  - `Theme.AssetProblem(path)` gives, in one sentence, the reason `ResolveAsset` refused a path. It shares one code path with
+    `ResolveAsset`, so the two cannot disagree.
+  - The properties panel shows that sentence in orange under the image and font path boxes. The line follows what the user types, and
+    is hidden when the path is fine.
+  - A picked network file is never blank any more, because it is copied in (M1), and the status bar says so.
+- **After:** 7 of 7 pass. The orange line in the panel has not been seen, because the editor was not started.
+
+### Nits
+
+- **N1. Duplicate widget ids.**
+  - **Test:** `Duplicate_widget_ids_are_replaced_on_load`.
+  - **Before:** `Expected: 4, Actual: 2` (the number of distinct ids among 4 widgets).
+  - **Fix:** `Normalize` keeps one set of ids for the whole theme. A repeated or empty id gets a new GUID; the first widget with an id
+    keeps it.
+    - The editor never makes duplicates: `Widget.Clone` and `DuplicatePage` give new ids.
+    - So valid themes stay byte-identical; `Valid_themes_load_unchanged` still passes.
+  - **After:** passes.
+- **N2. Misleading comment, and the `..` rule barely covered.**
+  - **Change:** the `assets/../theme.json` comment now says what that case shows. `assets/sub/../a.png` was added to `BadPaths`, for both
+    image and font. It ends inside `assets\`, so only the `..` rule removes it.
+  - **Before (mutation):** with the `..` rule deleted from `WhyForeign`, 3 tests fail. Two of them are the new `assets/sub/../a.png`
+    cases of `A_bad_image_path_..._removed_on_import` and `A_bad_font_path_..._removed_on_import`. Before this change, the same mutation
+    broke only the reason-string test.
+  - **After:** the source was restored, and the 2 new cases pass.
+- **N3. AIDA64 imports skipped `Normalize`.**
+  - **Test:** `An_aida_import_with_absurd_numbers_is_normalized`.
+  - **Before:** `Assert.InRange() Failure: Value not in range, Range: (1 - 1000), Actual: 1,3333333333333334E+300`.
+    `<TXTSIZ>1e300</TXTSIZ>` is accepted as a number, so an `.axlcd` file could cause the same decimal overflow that M3 fixed.
+  - **Fix:** `AidaImporter.Import` calls `theme.Normalize()` after reading the items and before the layout pass that measures text.
+  - **After:** passes, and the existing importer tests still pass.
+- **N4. `CrashLog` lost entries under concurrency.**
+  - **Test:** `Concurrent_crash_log_writes_all_land` (8 threads x 150 writes).
+  - **Before:** `Expected: 1200, Actual: 552`. More than half the entries were lost to sharing violations, which is worse than the
+    review expected.
+  - **Fix:** a static lock around the rotation and the append.
+  - **After:** passes, with 1200 of 1200 entries.
+- **N5. Wording of `RemovedAssetPath.ToString`.**
+  - **Test:** `A_removed_path_reads_as_page_widget_what_path_and_why`.
+  - **Before:** `Expected: "Page "Main", widget "Logo": picture or vi"···`, `Actual: "Main / Logo: image "\\attacker\s\x.png" ("···`.
+  - **Fix:** the line now reads `Page "Main", widget "Logo": picture or video \\attacker\s\x.png (network or device path)`.
+    The property names are the constants `RemovedAssetPath.Picture` ("picture or video") and `RemovedAssetPath.Font` ("font"), matching
+    the dialog's "pick the pictures or fonts again".
+  - **After:** passes. The existing report test was updated to use the constants.
+
+### Still open
+
+- **Nothing in the editor was run by hand.** The crash dialog, the status texts and the orange path line have not been checked by eye.
+- **Themes stored on a network folder** now show no pictures or fonts. Save As from such a folder does not bring the assets along,
+  because Save does not open the network folder. The editor explains this. The way out is to move the theme to a local folder by hand.
+- **Leftover temp copies:** network files picked for an unsaved theme stay in `%TEMP%\Glance\picked` after Save copies them. Glance
+  does not clean them up.
+- **Residual risks from the review are unchanged:** paths inside media files, reserved device names (L3 of the full review).

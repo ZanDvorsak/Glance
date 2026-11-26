@@ -38,9 +38,12 @@ public sealed class PropertiesPanel : ScrollViewer
         _stack.Margin = new Thickness(10, 10, 14, 10);   // keeps the overlay bar off the fields
     }
 
+    private Theme? _theme;
+
     public void Show(Theme theme, Widget? w)
     {
         if (_target is not null) _target.PropertyChanged -= OnModelChanged;
+        _theme = theme;
         _updaters.Clear();
         _stack.Children.Clear();
 
@@ -91,7 +94,7 @@ public sealed class PropertiesPanel : ScrollViewer
                     Num("Corner radius", "CornerRadius", 0, 200, 1); Check("Vertical", "Vertical"); ColorRow("Fill", "Color"); ColorRow("Track", "BackColor"); Thresholds(); break;
                 case WidgetKind.Image:
                     Num("Width", "Width", 1, 4000, 1); Num("Height", "Height", 1, 4000, 1);
-                    Text("File", "ImagePath"); BrowseButton();
+                    Text("File", "ImagePath"); PathProblem("ImagePath"); BrowseButton();
                     EnumRow("Fit", "Fit"); Num("Opacity %", "Opacity", 0, 100, 5);
                     Hint("Supports PNG, JPG, animated GIF and video (MP4, WebM, MKV...; video needs FFmpeg)."); break;
                 case WidgetKind.Panel:
@@ -133,6 +136,26 @@ public sealed class PropertiesPanel : ScrollViewer
     }
 
     private void Header(string t) => _stack.Children.Add(new TextBlock { Text = t.ToUpperInvariant(), FontWeight = FontWeight.Bold, Opacity = 0.6, Margin = new Thickness(0, 0, 0, 4) });
+    /// <summary>
+    /// A warning under a file path box that says why the file is not shown when Glance refuses the path (a network or
+    /// device path, or one that depends on the current drive; see <see cref="Theme.AssetProblem"/>). Hidden otherwise.
+    /// Follows the box: it is chained onto the property's updater, which runs on every change of that property.
+    /// </summary>
+    private void PathProblem(string prop)
+    {
+        var tb = new TextBlock { FontSize = 11, TextWrapping = TextWrapping.Wrap, Foreground = new SolidColorBrush(Color.Parse("#FFB74D")) };
+        void Update()
+        {
+            var why = _theme?.AssetProblem(Prop(prop).GetValue(_target) as string ?? "");
+            tb.Text = why ?? "";
+            tb.IsVisible = why is not null;
+        }
+        Update();
+        var previous = _updaters.TryGetValue(prop, out var p) ? p : null;
+        _updaters[prop] = () => { previous?.Invoke(); Update(); };
+        _stack.Children.Add(tb);
+    }
+
     private void Hint(string t) => _stack.Children.Add(new TextBlock { Text = t, Opacity = 0.55, FontSize = 11, TextWrapping = TextWrapping.Wrap });
 
     private void Row(string label, Control editor)
@@ -200,6 +223,7 @@ public sealed class PropertiesPanel : ScrollViewer
         Check("Bold", "Bold");
         Check("Italic", "Italic");
         Text("Font file", "FontFile");
+        PathProblem("FontFile");
         BrowseButton("FontFile", "Use a font file...", PickFont);
         Hint("A font file (.ttf, .otf) replaces the font above and is saved and exported with the theme. Clear the box to go back to the installed font.");
         EnumRow("Align", "Align");
