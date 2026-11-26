@@ -362,7 +362,7 @@ public class ThemeModelTests
 
         Assert.Equal(new[] { "bg.png" }, FilesIn(Path.Combine(a, "assets")));
         Assert.Equal(new[] { "digits.ttf" }, FilesIn(Path.Combine(a, "assets", "fonts")));
-        Assert.Equal(new[] { "theme.json" }, FilesIn(a));
+        Assert.Equal(new[] { "theme.json", "theme.json.bak" }, FilesIn(a));   // the second save keeps the first as a backup (M4)
         Assert.Equal("assets/bg.png", t.Widgets[0].ImagePath);
         Assert.Equal("assets/fonts/digits.ttf", t.Widgets[1].FontFile);
         var reloaded = Theme.Load(themeFile);   // what the second save actually wrote

@@ -51,7 +51,8 @@ public sealed class AppSettings
         foreach (var dir in Directory.EnumerateDirectories(from)) CopyDirectory(dir, Path.Combine(to, Path.GetFileName(dir)));
     }
 
-    public static AppSettings Load(Action<string>? log = null) => Load(FilePath, log);
+    /// <summary>The saved settings, or the defaults when there are none or they cannot be read. See <see cref="TryLoad(string, out AppSettings, Action{string}?)"/>.</summary>
+    public static AppSettings Load(Action<string>? log = null) => Load(FilePath, log ?? DefaultLog);
 
     public static AppSettings Load(string path, Action<string>? log = null)
     {
@@ -59,20 +60,78 @@ public sealed class AppSettings
         return settings;
     }
 
-    public static bool TryLoad(out AppSettings settings, Action<string>? log = null) => TryLoad(FilePath, out settings, log);
+    public static bool TryLoad(out AppSettings settings, Action<string>? log = null) => TryLoad(FilePath, out settings, log ?? DefaultLog);
 
+    /// <summary>
+    /// Reads the settings file. Returns true with the saved settings, or with the defaults when the file is missing
+    /// or corrupt. A corrupt file (it does not parse, even after waiting a moment in case another program is still
+    /// writing it) is logged and renamed to <c>settings.json.corrupt-&lt;time&gt;</c>, so the next save cannot
+    /// overwrite it. Returns false, with the defaults, when the file exists but cannot be read (another process
+    /// keeps it locked): callers that already have settings should keep them.
+    /// </summary>
     public static bool TryLoad(string path, out AppSettings settings, Action<string>? log = null)
     {
-        try { settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path)) ?? new(); }
-        catch { settings = new(); }
-        return true;
+        settings = new();
+        string? text = null;
+        try
+        {
+            settings = AtomicFile.ReadWithRetry(() =>
+            {
+                text = File.ReadAllText(path);
+                return JsonSerializer.Deserialize<AppSettings>(text) ?? throw new JsonException("The file holds no settings.");
+            });
+            return true;
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException) { return true; }   // first run
+        catch (JsonException ex)
+        {
+            KeepAside(path, ex.Message, log);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            log?.Invoke($"Could not read {path}: {ex.Message}");
+            return false;
+        }
     }
 
+    /// <summary>Moves a corrupt settings file out of the way (or, failing that, copies it) and logs where it went.</summary>
+    private static void KeepAside(string path, string reason, Action<string>? log)
+    {
+        var stem = $"{path}.corrupt-{DateTime.Now:yyyyMMdd-HHmmss}";
+        var aside = stem;
+        for (var n = 2; File.Exists(aside); n++) aside = $"{stem}-{n}";
+        try
+        {
+            try { File.Move(path, aside); }
+            catch (FileNotFoundException) { return; }   // another process (the editor or the runner) moved it first
+            catch { File.Copy(path, aside); }           // cannot rename it: at least keep a copy before the next save replaces it
+            log?.Invoke($"The settings file {path} is corrupt ({reason}). It was kept as {Path.GetFileName(aside)} and the default settings are used.");
+        }
+        catch (Exception ex)
+        {
+            log?.Invoke($"The settings file {path} is corrupt ({reason}) and could not be kept aside ({ex.Message}). The default settings are used; the next save replaces it.");
+        }
+    }
+
+    /// <summary>Where <see cref="Load(Action{string}?)"/> reports problems when the caller gives no log (the editor).</summary>
+    private static void DefaultLog(string message)
+    {
+        try
+        {
+            Directory.CreateDirectory(Folder);
+            File.AppendAllText(Path.Combine(Folder, "glance.log"), $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  {message}{Environment.NewLine}");
+        }
+        catch { /* logging must never break loading */ }
+    }
+
+    /// <summary>Saves to %AppData%\Glance\settings.json. Failures are not fatal and are ignored.</summary>
     public void Save()
     {
         try { Directory.CreateDirectory(Folder); Save(FilePath); }
         catch { /* non-fatal */ }
     }
 
+    /// <summary>Saves all or nothing (see <see cref="AtomicFile"/>): a failure leaves the previous file as it was, and throws.</summary>
     public void Save(string path) => AtomicFile.WriteAllText(path, JsonSerializer.Serialize(this));
 }

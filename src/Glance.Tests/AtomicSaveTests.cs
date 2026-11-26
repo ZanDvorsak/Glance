@@ -56,7 +56,7 @@ public class AtomicSaveTests
         File.WriteAllText(path, previous);
 
         using (LockFirstByte(path))
-            Assert.ThrowsAny<IOException>(() => new AppSettings { LastTheme = @"C:\other\theme.json", Brightness = 5 }.Save(path));
+            Assert.ThrowsAny<Exception>(() => new AppSettings { LastTheme = @"C:\other\theme.json", Brightness = 5 }.Save(path));   // IOException or UnauthorizedAccessException
 
         Assert.Equal(previous, File.ReadAllText(path));
         Assert.Equal(new[] { "settings.json" }, FilesIn(dir.Path));   // no temporary file left behind
