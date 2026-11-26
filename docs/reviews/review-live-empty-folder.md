@@ -232,3 +232,95 @@ Assert.True(parts[0] == "LIVE" && parts.Length == 3);                           
 | Branch (`e5182a4`): `Live_without_a_folder_round_trips` (2 cases), `Live_from_an_older_editor_is_still_understood`, `A_live_theme_without_a_folder_can_be_applied_like_the_runner_does` | Passed, 4/4 (full suite 295/295) |
 
 **Limit:** the proof copies two lines from `main` instead of running the real runner. A full end-to-end check needs you: with the runner running, click **New**, pick a template, click **Send to display**, and confirm the display shows the new theme.
+
+---
+
+## Fixes after review
+
+Added by the session that wrote the fix. The findings above are unchanged. The method follows the user's rule for bugs: write the test,
+run it against the branch as it was (`59d7864`), capture the failure, fix, and run the same test again.
+The editor (`Glance.App`) has no tests, so the logic behind M2, L1, L2 and L3 was first moved into Core **unchanged**, which gives
+`LiveSendGate` (the old `PushLive` rules) and `ControlPipeClient` (the old `RunnerClient.Send`). The tests ran against those copies first, then the copies were fixed.
+The editor now uses them.
+
+**Totals:** before, 9 of the 55 control-pipe tests failed. After: 310/310 pass in the whole suite, and the build has 0 errors and the same 30 old warnings.
+The pipe tests use random pipe names, never the real `Glance.Runner.Control`. The pipe tests were run 3 more times in a row and passed each time.
+
+### A new finding while fixing L1: the editor never received any reply from the runner (confirmed, fixed)
+- **Where:** `RunnerClient.Send` on `main` and on this branch (now `ControlPipeClient.Send`).
+- **Problem:** `using var writer` (a `StreamWriter`) and `using var reader` (a `StreamReader`) both owned the pipe. When the method returned, the
+  reader was disposed first and closed the pipe. The writer's `Dispose` then flushed into the closed pipe and threw `ObjectDisposedException`
+  ("Cannot access a closed pipe", from `PipeStream.CheckWriteOperations`). The `catch` turned that into `null`, after the reply had already been read.
+  So **every** reply was lost. On `main` this went unnoticed because nothing looked at the replies: `SendLive`'s `false` was ignored, and the
+  service window always fell back to "Running." instead of the `STATUS` text. On this branch, the status message from H2 would have warned on every live send.
+- **Fix:** the client writes the command as raw UTF-8 bytes, so there is no writer to dispose, and the reader uses `leaveOpen: true`. Only the pipe itself closes the pipe.
+- **Test:** `ControlPipeClientTests.The_runners_reply_reaches_the_caller` (`STATUS` and `LIVE`, a fake runner on a test pipe that answers at once).
+  - Before: **Failed** (both cases): `Assert.Equal() Failure: Strings differ / Expected: "OK page 1/1" / Actual: null`. The exception was seen with a temporary
+    catch: `ObjectDisposedException: Cannot access a closed pipe. @ at System.IO.Pipes.PipeStream.CheckWriteOperations()`.
+  - After: **Passed** (2/2).
+
+### M1. All runner commands are built with `ControlCommand`
+- **Fix:** the seven raw strings are now one-line swaps to the factories: `MainWindow.cs` brightness, `PAGE`, `RESUME`/`BRIGHTNESS`/`PAGE` on start, `LIVE_CLEAR`
+  and `PAUSE`, and `ServiceWindow.cs` `STATUS` and `EXIT`. `RunnerClient.Send(string)` no longer exists; the only `Send` takes a `ControlCommand`.
+  `Glance.Core.Control` is made available to the editor through one `global using` in `RunnerClient.cs`, so the `using` blocks of `MainWindow.cs` and
+  `ServiceWindow.cs` (which sibling branches also edit) are untouched.
+- **Test:** `ControlCommandTests.The_editor_builds_every_runner_command_with_ControlCommand`. It scans `src/Glance.App` for `RunnerClient.Send("` or `Send($"`
+  and checks that `RunnerClient` has no public `Send(string)`.
+  - Before: **Failed**: `Hand-built runner commands:` followed by the seven lines (`MainWindow.cs:217`, `:426`, `:1294`, `:1304`, `:1319`, `ServiceWindow.cs:66`, `:80`).
+  - After: **Passed**.
+
+### M2. A failed live send is retried, and the warning is cleared after a later success
+- **Fix:** `LiveSendGate` counts a snapshot as sent only after the runner answers `OK`, so the next 500 ms tick sends it again after a failure. A later
+  success returns the normal "Showing your edits..." text if a warning is shown. The same failure again does not rewrite the status bar.
+- **Tests, before and after:**
+  - `A_failed_live_send_is_retried_on_the_next_tick`: before **Failed** `Assert.NotNull() Failure: Value is null`; after **Passed**.
+  - `The_warning_gives_way_to_the_normal_status_after_a_later_send_succeeds`: before **Failed** `Assert.NotNull() Failure: Value is null`
+    (the retry was never started); after **Passed**.
+  - `The_same_failure_again_does_not_rewrite_the_status`: before **Failed** `System.NullReferenceException` (no retry was started); after **Passed**.
+  - `A_send_from_before_a_restart_is_ignored` (a late failure after live sending restarts): before **Failed** `Assert.Null() Failure: Value is not null /
+    Actual: "The background runner did not accept your edits, s"...`; after **Passed**.
+  - Controls that already passed and still pass: `A_successful_send_is_not_repeated`, `Success_without_an_earlier_warning_leaves_the_status_alone`.
+
+### L3 (and the single-send part of M2). One live send at a time, always the newest snapshot
+- **Fix:** `LiveSendGate.TryBegin` returns nothing while a send is still on its way. When that send finishes, the next tick sends the newest snapshot,
+  so an older edit can no longer arrive after a newer one, and retries cannot pile up timeouts.
+- **Test:** `Only_one_send_is_in_flight_and_the_newest_snapshot_goes_next`.
+  - Before: **Failed** `Assert.Null() Failure: Value is not null / Actual: LiveSend { Snapshot = edit 2, Generation = 0 }` (a second send started while the first was on its way).
+  - After: **Passed**.
+
+### L1. A longer reply timeout for LIVE, and separate messages
+- **Fix:** `ControlPipeClient` uses separate connect and reply timeouts. LIVE waits 1 s to connect and 5 s for the reply (it was 2 s for both). The other
+  commands keep 800 ms for both, because the service window sends `STATUS` from the UI thread. `LiveSendGate` reports "did not answer in time"
+  for no reply and "rejected your edits (<runner's reason>)" for an `ERR` reply.
+- **Tests:**
+  - `ControlPipeClientTests.A_live_reply_that_takes_longer_than_connecting_is_still_received` (a fake runner answers `OK` after 2.6 s, like a runner that holds its lock while it reopens the display).
+    - Before: with the reply fix in place and the old LIVE timeouts put back (2000/2000), **Failed**: `reply null after 2015 ms`.
+      (Against the unchanged client it also failed, `reply null after 2611 ms`, but because of the lost-reply bug above.)
+    - After: **Passed** (about 2.6 s).
+  - `LiveSendGateTests.No_answer_and_a_rejection_have_different_messages`: before **Failed** `Assert.NotEqual() Failure: Strings are equal /
+    Expected: Not "The background runner did not accept your edits, s"...`; after **Passed**.
+  - `No_runner_means_no_reply_and_no_long_wait` (a control): passed before and after (about 0.8 s).
+
+### L2. The rejection message suggests restarting the runner
+- **Fix:** an `ERR` reply to LIVE shows "The background runner rejected your edits (<reason>). If you just updated Glance, restart the background runner."
+- **Test:** `A_rejection_suggests_restarting_the_runner_after_an_update`.
+  - Before: **Failed** `Assert.Contains() Failure: Sub-string not found / Not found: "restart the background runner"`.
+  - After: **Passed**.
+
+### L4. Every verb is covered
+- **Fix:** test `ControlCommandTests.Every_verb_has_a_wire_word_and_round_trips` loops over `Enum.GetValues<ControlVerb>()`, encodes a sample of each verb and parses it back.
+- **Proof** (this is a test gap, so the proof is a mutation): a new verb `Ping` with a factory but no entry in the word table.
+  - Before (the old hand-written list only): nothing caught it.
+  - With the new test: **Failed** `System.ArgumentOutOfRangeException : Specified argument was out of the range of valid values. (Parameter 'verb')`. No other `ControlCommandTests` test caught it; the M1 scan also failed in that run, but only because M1 was not fixed yet.
+  - With the mutation removed: **Passed**.
+  - The dispatch in `RunnerContext.Execute` is still untested, as the review allowed.
+
+### N4. Comment on the empty-folder check
+- **Fix:** the comment above `folderField.Length > 0` in `ControlCommand.TryParse` now says it handles editors from before the `-` placeholder, and that
+  `Live()` would map a decoded `""` to `null` anyway. No behaviour change, so there is no test. The equivalent mutant noted above still survives, as expected.
+
+### Not changed
+- N1 (namespace name), N2 (pipe name defined twice) and N3 (`ToString` returns the whole line) were not in the list of fixes asked for.
+- The editor was not started and the runner was not run, so the status messages in the window and a live send to the real display were not seen.
+  To check by hand: with the runner running, use **New**, pick a template and click **Send to display**. The display should show it, and the status bar should say
+  "Showing your edits on the display through the background runner." with no warning. The service window should now show the runner's `STATUS` text instead of "Running.".

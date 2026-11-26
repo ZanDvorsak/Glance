@@ -115,6 +115,8 @@ public sealed record ControlCommand
                 if (jsonField.Length == 0) { error = "LIVE needs a theme"; return false; }
                 if (!TryFromBase64(jsonField, out var json)) { error = "LIVE theme is not valid base64"; return false; }
                 string? folder = null;
+                // An empty field is how editors before the "-" placeholder sent "no folder" (two spaces in a row).
+                // Live() would also turn a decoded "" into null; this check just says so and skips the decode.
                 if (folderField.Length > 0 && folderField != NoFolder)
                 {
                     if (!TryFromBase64(folderField, out folder)) { error = "LIVE folder is not valid base64"; return false; }

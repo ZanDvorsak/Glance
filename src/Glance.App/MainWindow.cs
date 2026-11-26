@@ -214,7 +214,7 @@ public sealed class MainWindow : Window
             if (e.Property != RangeBase.ValueProperty) return;
             _settings.Brightness = (int)Math.Round(slider.Value);
             _pusher?.SetBrightness(_settings.Brightness);
-            if (_liveToRunner) { var b = _settings.Brightness; Task.Run(() => RunnerClient.Send($"BRIGHTNESS {b}")); }
+            if (_liveToRunner) { var b = _settings.Brightness; Task.Run(() => RunnerClient.Send(ControlCommand.Brightness(b))); }
         };
         var right = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, VerticalAlignment = VerticalAlignment.Center };
         right.Children.Add(new TextBlock { Text = "Backlight", VerticalAlignment = VerticalAlignment.Center, Foreground = Brush("#8C96A8"), Margin = new Thickness(8, 0, 0, 0) });
@@ -423,7 +423,7 @@ public sealed class MainWindow : Window
     private void ApplyPins()
     {
         if (_pusher is not null) _pusher.PinnedPage = DesiredPin;
-        if (_liveToRunner) { var n = (DesiredPin ?? -1) + 1; Task.Run(() => RunnerClient.Send($"PAGE {n}")); }   // PAGE 0 releases the pin
+        if (_liveToRunner) { var n = (DesiredPin ?? -1) + 1; Task.Run(() => RunnerClient.Send(ControlCommand.Page(n))); }   // PAGE 0 releases the pin
     }
 
     private void AddPage()
@@ -1281,19 +1281,19 @@ public sealed class MainWindow : Window
     // ---- live streaming to the background runner (when it is active, it owns the display) ------------------------
 
     private bool _liveToRunner;
-    private string? _lastLive;
+    private readonly LiveSendGate _liveGate = new();   // one send at a time, newest snapshot, retried until the runner says OK
     private readonly DispatcherTimer _liveTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
 
     private void StartLive()
     {
-        _liveToRunner = true; _lastLive = null;
+        _liveToRunner = true; _liveGate.Reset();
         _liveTimer.Tick -= OnLiveTick; _liveTimer.Tick += OnLiveTick;
         _liveTimer.Start();
         var b = _settings.Brightness;
         var pg = (DesiredPin ?? -1) + 1;
-        Task.Run(() => { RunnerClient.Send("RESUME"); RunnerClient.Send($"BRIGHTNESS {b}"); RunnerClient.Send($"PAGE {pg}"); });
+        Task.Run(() => { RunnerClient.Send(ControlCommand.Resume); RunnerClient.Send(ControlCommand.Brightness(b)); RunnerClient.Send(ControlCommand.Page(pg)); });
         PushLive();
-        _status.Text = "Showing your edits on the display through the background runner.";
+        _status.Text = LiveSendGate.ShowingText;
     }
 
     private void StopLive()
@@ -1301,7 +1301,7 @@ public sealed class MainWindow : Window
         _liveTimer.Stop();
         if (!_liveToRunner) return;
         _liveToRunner = false;
-        Task.Run(() => RunnerClient.Send("LIVE_CLEAR"));
+        Task.Run(() => RunnerClient.Send(ControlCommand.LiveClear));
     }
 
     private void OnLiveTick(object? s, EventArgs e) => PushLive();
@@ -1316,7 +1316,7 @@ public sealed class MainWindow : Window
         _send.IsChecked = false;
         if (runner)
         {
-            Task.Run(() => RunnerClient.Send("PAUSE"));   // the runner blanks it and stops drawing
+            Task.Run(() => RunnerClient.Send(ControlCommand.Pause));   // the runner blanks it and stops drawing
             _status.Text = "Display off (the background runner is paused). Click Send to display to turn it back on.";
         }
         else
@@ -1326,22 +1326,20 @@ public sealed class MainWindow : Window
         }
     }
 
-    /// <summary>Sends the current theme to the runner whenever it changed.</summary>
+    /// <summary>Sends the current theme to the runner whenever it changed, or again after a failed send (see <see cref="LiveSendGate"/>).</summary>
     private void PushLive()
     {
         if (!_liveToRunner) return;
         string snap;
         try { snap = _theme.ToSnapshot(); } catch { return; }
-        if (snap == _lastLive) return;
-        _lastLive = snap;
+        if (_liveGate.TryBegin(snap) is not { } send) return;
         var folder = _theme.BaseFolder;
         Task.Run(() => RunnerClient.SendLive(snap, folder)).ContinueWith(t =>
         {
-            if (t.IsCompletedSuccessfully && t.Result) return;
+            var reply = t.IsCompletedSuccessfully ? t.Result : null;
             Dispatcher.UIThread.Post(() =>
             {
-                if (_liveToRunner && _lastLive == snap)   // only for the latest edit, and only while still sending
-                    _status.Text = "The background runner did not accept your edits, so the display may still show the old theme.";
+                if (_liveGate.Complete(send, reply) is { } text && _liveToRunner) _status.Text = text;
             });
         });
     }

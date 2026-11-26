@@ -47,6 +47,50 @@ public class ControlCommandTests
         Assert.Equal(command, Parse(command.Encode()));
     }
 
+    private static ControlCommand Sample(ControlVerb verb) => verb switch
+    {
+        ControlVerb.Page => ControlCommand.Page(1),
+        ControlVerb.Brightness => ControlCommand.Brightness(1),
+        ControlVerb.Live => ControlCommand.Live("{}", null),
+        _ => (ControlCommand)typeof(ControlCommand).GetProperty(verb.ToString())!.GetValue(null)!,
+    };
+
+    [Fact]
+    public void Every_verb_has_a_wire_word_and_round_trips()   // review L4: a new verb missing from the word table must fail here
+    {
+        foreach (var verb in Enum.GetValues<ControlVerb>())
+        {
+            var command = Sample(verb);
+            Assert.Equal(verb, command.Verb);
+            Assert.Equal(command, Parse(command.Encode()));
+        }
+    }
+
+    /// <summary>The repository's src folder, found from the test binaries.</summary>
+    private static string SourceRoot()
+    {
+        for (var d = AppContext.BaseDirectory; d is not null; d = Path.GetDirectoryName(d))
+            if (File.Exists(Path.Combine(d, "Glance.sln"))) return d;
+        throw new DirectoryNotFoundException("Glance.sln not found above " + AppContext.BaseDirectory);
+    }
+
+    [Fact]
+    public void The_editor_builds_every_runner_command_with_ControlCommand()   // review M1
+    {
+        var app = Path.Combine(SourceRoot(), "Glance.App");
+        var handBuilt = Directory.EnumerateFiles(app, "*.cs", SearchOption.AllDirectories)
+            .Where(f => !f.Contains(Path.DirectorySeparatorChar + "obj" + Path.DirectorySeparatorChar) && !f.Contains(Path.DirectorySeparatorChar + "bin" + Path.DirectorySeparatorChar))
+            .SelectMany(f => File.ReadLines(f).Select((line, i) => (f, i, line)))
+            .Where(x => System.Text.RegularExpressions.Regex.IsMatch(x.line, @"RunnerClient\.Send\(\s*\$?@?"""))
+            .Select(x => $"{Path.GetFileName(x.f)}:{x.i + 1}: {x.line.Trim()}")
+            .ToList();
+        Assert.True(handBuilt.Count == 0, "Hand-built runner commands:\n" + string.Join("\n", handBuilt));
+
+        var client = File.ReadAllText(Path.Combine(app, "Services", "RunnerClient.cs"));
+        Assert.False(System.Text.RegularExpressions.Regex.IsMatch(client, @"public\s+static\s+string\?\s+Send\(\s*string\b"),
+            "RunnerClient.Send(string) must not be public, so only ControlCommand lines reach the pipe");
+    }
+
     [Fact]
     public void Live_with_a_folder_round_trips()
     {
