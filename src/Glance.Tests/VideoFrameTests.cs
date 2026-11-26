@@ -197,13 +197,29 @@ public class VideoFrameTests
     [Fact]
     public void M9_a_source_disposed_while_ffmpeg_is_still_starting_stops_it_once_it_has_started()
     {
+        using var entered = new ManualResetEventSlim();
         using var gate = new ManualResetEventSlim();
         var l = new Launcher();
         var v = new VideoSource("clip.mp4", 8, 8, ImageFit.Stretch, 15, () => "ffmpeg.exe", () => null,
-            (exe, args, err) => { gate.Wait(3000); return l.Launch(exe, args, err); });
+            (exe, args, err) => { entered.Set(); gate.Wait(3000); return l.Launch(exe, args, err); });
+        Assert.True(entered.Wait(5000));   // Process.Start is under way
         v.Dispose();
         gate.Set();
         WaitFor(() => l.Count == 1 && l[0].Killed && l[0].Disposed, "the late process killed");
+    }
+
+    [Fact]
+    public void M9_a_source_disposed_while_ffmpeg_is_still_being_looked_for_never_starts_it()
+    {
+        using var entered = new ManualResetEventSlim();
+        using var gate = new ManualResetEventSlim();
+        var l = new Launcher();
+        var v = new VideoSource("clip.mp4", 8, 8, ImageFit.Stretch, 15, () => { entered.Set(); gate.Wait(3000); return "ffmpeg.exe"; }, () => null, l.Launch);
+        Assert.True(entered.Wait(5000));
+        v.Dispose();
+        gate.Set();
+        Thread.Sleep(300);
+        Assert.Equal(0, l.Count);
     }
 
     // ---- M9b: resizing does not start an ffmpeg per size, nor on the rendering thread --------------------------
@@ -334,6 +350,61 @@ public class VideoFrameTests
             advance(ThemeRenderer.VideoRetryMs);
             Fake.Render(t, null, renderer: r).Dispose();
             WaitFor(() => l.Count == 2, "ffmpeg started again", 2000);
+        }
+    }
+
+    // ---- the real process wrapper and arguments --------------------------------------------------------------------
+
+    [Fact]
+    public void The_real_process_wrapper_reports_the_exit_code_of_a_process_that_said_nothing()
+    {
+        var cmd = Path.Combine(Environment.SystemDirectory, "cmd.exe");
+        using var p = FfmpegProcess.Start(cmd, new[] { "/d", "/c", "exit 3" }, _ => { });
+        Assert.Equal(-1, p.Output.ReadByte());
+        Assert.True(p.WaitForExit(5000));
+        Assert.Equal(3, p.ExitCode);
+    }
+
+    [Fact]
+    public void The_video_path_is_passed_to_ffmpeg_as_one_argument()
+    {
+        const string path = @"C:\My Videos\a ""quoted"" & clip.mp4";
+        using var v = new VideoSource(path, 8, 8, ImageFit.Cover, 15, () => null, () => null);
+        var args = v.Arguments();
+        Assert.Equal(path, args[args.ToList().IndexOf("-i") + 1]);
+    }
+
+    /// <summary>Real FFmpeg on a tiny clip it generates itself; does nothing on a PC without FFmpeg.</summary>
+    [Fact]
+    public void With_real_ffmpeg_frames_keep_coming_and_are_freed()
+    {
+        var ffmpeg = Ffmpeg.Find();
+        if (ffmpeg is null) return;   // FFmpeg is optional: nothing to check here
+        var dir = Path.Combine(Path.GetTempPath(), "glance-video-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var clip = Path.Combine(dir, "clip.mp4");
+            var psi = new System.Diagnostics.ProcessStartInfo(ffmpeg) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true };
+            foreach (var a in new[] { "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=32x32:rate=15", "-t", "1", "-pix_fmt", "yuv420p", clip })
+                psi.ArgumentList.Add(a);
+            using (var gen = System.Diagnostics.Process.Start(psi)!)
+            {
+                gen.StandardError.ReadToEnd();
+                Assert.True(gen.WaitForExit(30_000));
+            }
+            Assert.True(File.Exists(clip));
+
+            var v = new VideoSource(clip, 32, 32, ImageFit.Stretch);
+            WaitFor(() => v.FramesRead >= 20, "20 frames from ffmpeg (the 1 s clip loops)", 15_000);
+            Assert.Null(v.Error);
+            Assert.InRange(v.LiveFrames, 1, 2);
+            v.Dispose();
+            Assert.Equal(0, v.LiveFrames);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, true); } catch { }
         }
     }
 }

@@ -179,7 +179,11 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
 - **`ThemePackage`** reads/writes `.glance` (zip with `theme.json` + `assets/`). Import is defensive on purpose (path traversal, drive letters, size/entry caps, only `theme.json` and `assets/*`). Keep it that way.
 - **Undo/redo** is snapshot based (`Theme.ToSnapshot/ApplySnapshot`), debounced; all pages and widgets are hooked (`HookAll`).
 - **Video** is decoded by an `ffmpeg` child process (`-re` is required or it plays several times too fast); FFmpeg is optional and found automatically (app folder, PATH, winget machine and user folders).
-  Video is decoded only in user-side processes (tray app, editor), as the user; the service never starts ffmpeg. `Ffmpeg.Find` keeps its
+  Video is decoded only in user-side processes (tray app, editor), as the user; the service never starts ffmpeg.
+  `VideoSource` finds and starts ffmpeg on its own thread (never the UI thread); frames are reference counted, so draw them only
+  through an `AcquireFrame()` lease. While a video widget is resized, the renderer keeps the running decoder and stretches its frames;
+  a decoder for the new size starts once the size has been stable for 500 ms. A stopped ffmpeg is retried after 5 s
+  (`docs/design/fix-video-frames.md`). `Ffmpeg.Find` keeps its
   elevated rule for any elevated caller: it only accepts a copy that only administrators can change
   (`FolderTrust.CheckExecutable(exe, TrustScope.FolderFiles)`: the exe, the files next to it, its folder and every folder above it, no links). The editor's
   FFmpeg button and the setup check install per user (no prompt). `SetupChecks.MachineInstallScript` (machine scope, resets the package

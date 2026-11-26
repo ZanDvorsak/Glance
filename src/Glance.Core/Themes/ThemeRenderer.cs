@@ -19,6 +19,13 @@ public sealed class ThemeRenderer : IDisposable
 
     /// <summary>How long a video that had no usable FFmpeg waits before it is tried again.</summary>
     internal const long VideoRetryMs = 5000;
+
+    /// <summary>How long a new video size must keep being asked for before ffmpeg is started for it (a resize drag).</summary>
+    internal const long VideoSettleMs = 500;
+
+    /// <summary>A pending size not asked for within this long starts its wait again.</summary>
+    internal const long VideoSizeGapMs = 1000;
+    private readonly Dictionary<string, (long First, long Last)> _pendingVideos = new();
     private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
     private readonly Dictionary<(string, bool, bool), SKTypeface> _faces = new();
     private readonly Dictionary<string, FontEntry> _fileFaces = new();
@@ -314,12 +321,12 @@ public sealed class ThemeRenderer : IDisposable
 
     private void DrawImage(SKCanvas c, Theme t, Widget w)
     {
-        var lease = default(VideoFrameLease);   // a video frame stays valid until the draw is done
+        VideoFrameLease? lease = null;   // a video frame stays valid until the draw is done
         try { DrawImage(c, t, w, ref lease); }
-        finally { lease.Dispose(); }
+        finally { lease?.Dispose(); }
     }
 
-    private void DrawImage(SKCanvas c, Theme t, Widget w, ref VideoFrameLease lease)
+    private void DrawImage(SKCanvas c, Theme t, Widget w, ref VideoFrameLease? lease)
     {
         var r = Box(w);
         w.LastBounds = r;
@@ -331,12 +338,10 @@ public sealed class ThemeRenderer : IDisposable
 
         if (Ffmpeg.IsVideo(path))
         {
-            var v = GetVideo(path!, (int)Math.Round(w.Width), (int)Math.Round(w.Height), w.Fit);
-            lease = v.AcquireFrame();
+            lease = GetVideoFrame(path!, (int)Math.Round(w.Width), (int)Math.Round(w.Height), w.Fit, out note);
             img = lease.Image;
-            fit = ImageFit.Stretch; // ffmpeg already fitted the frame to the widget box
-            if (img is null) note = v.Error is null ? "Loading video..." : v.Error;
-            else (srcW, srcH) = (img.Width, img.Height);
+            fit = ImageFit.Stretch; // ffmpeg already fitted the frame to the widget box (or to its old size, while it is resized)
+            if (img is not null) (srcW, srcH) = (img.Width, img.Height);
         }
         else
         {
@@ -391,10 +396,61 @@ public sealed class ThemeRenderer : IDisposable
         }
     }
 
-    private VideoSource GetVideo(string path, int w, int h, ImageFit fit)
+    /// <summary>
+    /// The frame to draw for a video widget, and the note to show when there is none. While the widget's size (or fit)
+    /// keeps changing, the decoder already running for this file goes on and its frames are stretched to the new box; a
+    /// decoder for the new size starts only once that size has been asked for during <see cref="VideoSettleMs"/>, and
+    /// the old frames are shown until it has its first one (review M9: a resize drag started an ffmpeg per pixel).
+    /// </summary>
+    private VideoFrameLease GetVideoFrame(string path, int w, int h, ImageFit fit, out string? note)
     {
         var key = $"{path}|{w}x{h}|{fit}";
         var now = Now();
+        var v = GetVideo(path, key, w, h, fit, now, out var other);
+        if (v is not null)
+        {
+            v.LastUsedTicks = Environment.TickCount64;
+            var lease = v.AcquireFrame();
+            if (lease.Image is not null) { note = null; return lease; }
+            other ??= OtherVideo(path, key);
+        }
+        if (other is not null)
+        {
+            var lease = other.AcquireFrame();
+            if (lease.Image is not null)
+            {
+                other.LastUsedTicks = Environment.TickCount64;   // keep it until the new decoder has a frame
+                note = null;
+                return lease;
+            }
+        }
+        note = v?.Error ?? other?.Error ?? "Loading video...";
+        return VideoFrameLease.Empty;
+    }
+
+    /// <summary>The most recently used decoder of this file for another size or fit, or null.</summary>
+    private VideoSource? OtherVideo(string path, string key)
+    {
+        VideoSource? best = null;
+        foreach (var (k, v) in _videos)
+            if (k != key && k.StartsWith(path + "|", StringComparison.Ordinal) && (best is null || v.LastUsedTicks > best.LastUsedTicks))
+                best = v;
+        return best;
+    }
+
+    /// <summary>True once <paramref name="key"/> has been asked for without a gap for <see cref="VideoSettleMs"/>.</summary>
+    private bool VideoSizeSettled(string key, long now)
+    {
+        if (!_pendingVideos.TryGetValue(key, out var p) || now - p.Last > VideoSizeGapMs) p = (now, now);
+        else p.Last = now;
+        _pendingVideos[key] = p;
+        return now - p.First >= VideoSettleMs;
+    }
+
+    /// <summary>The decoder for exactly this size and fit, or null while a resize has not settled (then <paramref name="other"/> is the one to show).</summary>
+    private VideoSource? GetVideo(string path, string key, int w, int h, ImageFit fit, long now, out VideoSource? other)
+    {
+        other = null;
         // a video file replaced on disk starts again from the new file (review L4; picking it again used to do that)
         if (!_videoFiles.TryGetValue(path, out var check)) _videoFiles[path] = check = new FileCheck(null, now);   // first stamp comes from the background check
         if (check.Poll(path, now, StatFile, StatWaitMs) is { } stamp)
@@ -407,19 +463,22 @@ public sealed class ThemeRenderer : IDisposable
                 }
             check.Stamp = stamp;
         }
-        if (_videos.TryGetValue(key, out var v) && v.FfmpegMissing && now - v.CreatedTicks >= VideoRetryMs)
+        if (_videos.TryGetValue(key, out var v) && (v.FfmpegMissing || v.Stopped) && now - v.CreatedTicks >= VideoRetryMs)
         {
-            // FFmpeg was missing (or not trusted by the elevated runner) when this source was made: try again, so a
-            // fresh install shows up without reloading the theme. Ffmpeg.Find paces its own disk search too.
+            // FFmpeg was missing (or not trusted by the elevated runner) when this source was made, or it stopped: try
+            // again, so a fresh install shows up without reloading the theme. Ffmpeg.Find paces its own disk search too.
             v.Dispose();
             _videos.Remove(key);
         }
         if (!_videos.TryGetValue(key, out v))
         {
+            other = OtherVideo(path, key);
+            if (other is not null && !VideoSizeSettled(key, now)) return null;
+            _pendingVideos.Remove(key);
+            // cheap: the source finds and starts ffmpeg on its own thread, never on the rendering (UI) thread
             _videos[key] = v = VideoFactory(path, w, h, fit);
             v.CreatedTicks = now;
         }
-        v.LastUsedTicks = Environment.TickCount64;
         return v;
     }
 
@@ -431,6 +490,12 @@ public sealed class ThemeRenderer : IDisposable
         {
             _videos[k].Dispose();
             _videos.Remove(k);
+        }
+        if (_pendingVideos.Count > 0)   // sizes passed during a resize drag
+        {
+            var clock = Now();
+            foreach (var k in _pendingVideos.Where(kv => clock - kv.Value.Last > VideoSizeGapMs).Select(kv => kv.Key).ToList())
+                _pendingVideos.Remove(k);
         }
         if (_videoFiles.Count > _videos.Count)   // forget file checks of videos that no longer play
             foreach (var p in _videoFiles.Keys.Where(p => !_videos.Keys.Any(k => k.StartsWith(p + "|", StringComparison.Ordinal))).ToList())
@@ -819,6 +884,7 @@ public sealed class ThemeRenderer : IDisposable
         foreach (var v in _videos.Values) v.Dispose();
         _videos.Clear();
         _videoFiles.Clear();
+        _pendingVideos.Clear();
         foreach (var e in _fileFaces.Values) e.Face?.Dispose();
         _fileFaces.Clear();
     }

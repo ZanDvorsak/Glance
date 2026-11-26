@@ -192,7 +192,14 @@ public class VideoRetryTests
         var r = new ThemeRenderer
         {
             Now = () => now,
-            VideoFactory = (p, w, h, fit) => { count++; return new VideoSource(p, w, h, fit, 15, () => null, () => null); },
+            VideoFactory = (p, w, h, fit) =>
+            {
+                count++;
+                var v = new VideoSource(p, w, h, fit, 15, () => null, () => null);
+                // the source looks for ffmpeg on its own thread (review M9); wait for the answer so the test is deterministic
+                Assert.True(SpinWait.SpinUntil(() => v.FfmpegMissing, 5000));
+                return v;
+            },
         };
         return (r, () => count, n => now = n);
     }

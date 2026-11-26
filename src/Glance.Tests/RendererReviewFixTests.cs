@@ -280,8 +280,8 @@ public sealed class RendererReviewFixTests : IDisposable
         using var r = new ThemeRenderer
         {
             Now = () => now, StatWaitMs = 5000,
-            // an ffmpeg path that does not exist: the source reports an error and starts nothing
-            VideoFactory = (p, w, h, fit) => { created++; return new VideoSource(p, w, h, fit, 15, () => @"C:\glance-test\no-ffmpeg.exe", () => null); },
+            // a fake ffmpeg that keeps running (since M9 a real one that failed would be retried, which is not what this tests)
+            VideoFactory = (p, w, h, fit) => { created++; return new VideoSource(p, w, h, fit, 15, () => "ffmpeg.exe", () => null, (_, a, e) => new FakeVideoProcess(a, e)); },
         };
         var t = Fake.Canvas(); t.Widgets.Add(Picture(path, 0, 0, 100, 100));
         using (Fake.Render(t, null, renderer: r)) { }
