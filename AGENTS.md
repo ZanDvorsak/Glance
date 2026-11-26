@@ -7,9 +7,10 @@ Read this first, then `README.md` (user-facing) and `docs/PROTOCOL.md` (the disp
 
 ## Ground rules
 
-- **This runs on a real person's PC with real hardware.** The runner drives their display and reads their sensors.
+- **This runs on a real person's PC with real hardware.** The Glance service drives their display and reads their sensors.
   Do not install software, push to GitHub, publish releases, create scheduled tasks or change system settings
-  without being asked. Installs go through `winget` and only on an explicit yes.
+  without being asked. Installs go through `winget` and only on an explicit yes. Never install, start or stop the Glance service
+  (or any service or scheduled task) on this PC unless asked.
 - **Keep personal and third-party files out of git.** `Themes/` (the owner's own theme and artwork) and
   `Driver isntaller/` (a third-party binary, folder name is misspelled on purpose, it is the real name) are ignored by
   anchored rules in `.gitignore`. Never loosen those to unanchored patterns: `Themes/` would also hide `src/Glance.Core/Themes/`.
@@ -23,8 +24,8 @@ Read this first, then `README.md` (user-facing) and `docs/PROTOCOL.md` (the disp
 |---|---|
 | `src/Glance.Core` | Everything that is not UI: USB driver, renderer, theme model, sensors, presets, importer, setup checks |
 | `src/Glance.App` | Avalonia 12 editor (code-built UI, no XAML beyond `App.axaml`) |
-| `src/Glance.Runner` | Elevated WinForms tray app that owns the display and serves sensors |
-| `src/Glance.SensorHost` | Older standalone elevated sensor feed (the runner supersedes it) |
+| `src/Glance.Runner` | WinForms tray app, normal user rights: renders the saved theme and sends frames to the service |
+| `src/Glance.Service` | Windows service (LocalSystem): owns the USB display, reads the sensors, blanks on shutdown/sleep |
 | `src/Glance.Tests` | xUnit tests for `Glance.Core` |
 | `src/Glance.Demo`, `src/UsbProbe` | Small diagnostic tools, not shipped |
 | `build/` | `publish.ps1` (package + zip), `make-installer.ps1` (Inno Setup) |
@@ -35,7 +36,8 @@ Read this first, then `README.md` (user-facing) and `docs/PROTOCOL.md` (the disp
 Key files: `Core/Themes/{Theme,ThemePage,Widget,ThemeRenderer,ThemePackage}.cs`, `Core/Display/DisplayPusher.cs`,
 `Core/Usb/Ax206Display.cs`, `Core/Presets/{WidgetPresets,ThemeTemplates}.cs`, `Core/Import/AidaImporter.cs`,
 `Core/Setup/SetupChecks.cs`, `App/MainWindow.cs` (large, the editor's brain), `App/Views/PropertiesPanel.cs`,
-`Runner/RunnerContext.cs`.
+`Runner/RunnerContext.cs`, `Core/Service/{DisplayServer,RemoteFrameDisplay,DisplayConnector,DisplayAccess,ServicePipeSecurity}.cs`,
+`Service/NativeService.cs`.
 
 ## Build, run, package (PowerShell on Windows)
 
@@ -47,48 +49,71 @@ cd src
 dotnet build Glance.sln -c Release
 ```
 
-- Editor: `src\Glance.App\bin\Release\net8.0\Glance.App.exe`. Runner (asks for admin): `src\Glance.Runner\bin\Release\net8.0-windows\Glance.Runner.exe`.
+- Editor: `src\Glance.App\bin\Release\net8.0\Glance.App.exe`. Tray app: `src\Glance.Runner\bin\Release\net8.0-windows\Glance.Runner.exe`.
+  Without an installed service both drive the display over USB directly, with the basic sensors. Only the installer installs the service.
 - Package: `.\build\publish.ps1` (self-contained, ~215 MB folder in `dist\Glance`, ~90 MB zip; `-FrameworkDependent` is small).
   Installer: `.\build\make-installer.ps1` (needs Inno Setup 6). `dist/` is git-ignored.
 - Version lives in `src/Directory.Build.props` only.
 - Handy start options for the editor: `--setup`, `--new`, `--gallery` open those windows immediately.
 
 ### Things that break builds
-- **A running elevated runner locks its own output files**, and a normal shell cannot kill an elevated process
-  ("Access is denied"). Stop it with its control pipe instead (below), or build with `-p:SkipHost=true`
-  / build only the projects you need. `publish.ps1` fails the same way if the editor or runner runs from `dist\Glance`.
+- **A running tray app or editor locks its own output files**: exit it first (the tray app answers `EXIT` on its control pipe).
+  An installed Glance service runs from Program Files, not from `bin`, so it does not block builds; but an old elevated 0.1 runner
+  that still runs cannot be killed from a normal shell ("Access is denied"). `publish.ps1` fails the same way if anything runs from
+  `dist\Glance`. (`-p:SkipHost=true` is still accepted but no longer changes anything.)
 - After any change under `Glance.Core`, a running package in `dist\` is stale until you re-publish and restart.
 
 ## Architecture
 
-Two processes cooperate; both reference `Glance.Core`.
+Three processes cooperate; all reference `Glance.Core`. Design and reasons: `docs/design/runner-service.md`.
 
 ```
-Glance.Runner (admin, tray)                      Glance.App (normal user, editor)
-  LocalSensorSource -> SensorPipeServer  --pipe "Glance.Sensors" (1 JSON line/s)-->  PipeSensorClient -> SensorHub
-  DisplayPusher (renders + sends frames)  <--pipe "Glance.Runner.Control"----------  RunnerClient
-  watches %AppData%\Glance for theme/settings changes and reloads
+Glance.Service (LocalSystem, Windows service, session 0; environment from the Service Control Manager)
+  LocalSensorSource -> SensorPipeServer  --pipe "Glance.Sensors" (1 JSON line/s, read only)----> PipeSensorClient -> SensorHub
+  DisplayServer -> Ax206Display (USB)    <--pipe "Glance.Service.Display" (binary DisplayWire)--- RemoteFrameDisplay <- DisplayPusher
+  power/session: PRESHUTDOWN, POWEREVENT, SESSIONCHANGE -> ServiceControlMap -> DisplayPowerPolicy
+
+Glance.Runner (tray, normal user, one per session)          Glance.App (editor, normal user)
+  reads %AppData%\Glance, renders the theme (DisplayPusher)    RunnerClient --pipe "Glance.Runner.Control.<session>"--> tray
+  serves the control pipe for this session's editor           draws itself through DisplayConnector when no tray runs
 ```
 
-- **Sensors:** LibreHardwareMonitor (needs admin + the PawnIO driver for CPU/motherboard data). `SensorHub` in the editor prefers the
-  runner's feed and falls back to basic local sensors; the feed counts as gone after 5 s without data. Drive-space sensors come from `DriveSensors`.
-- **Control pipe commands** (one line each, reply `OK ...`): `STATUS`, `RELOAD`, `PAUSE`, `RESUME`, `EXIT`, `NEXT`, `PREV`, `PAGE <n>` (0 releases),
-  `BRIGHTNESS <0-7>`, `LIVE <base64 folder> <base64 theme json>` (show the editor's unsaved theme; `-` for no folder), `LIVE_CLEAR`.
-  Build and parse them only with `Glance.Core.Control.ControlCommand` (shared by both sides and tested). Pipes are limited to the current Windows user.
-- Single runner per session (mutex `Local\Glance.Runner`). Auto-start is a scheduled task named `Glance Runner` created only from the editor on request.
-- **Runner command-line modes** (no tray, no display, no mutex; outcome in `runner.log`): `--install-autostart --user DOMAIN\name`
-  registers the task through the Task Scheduler COM API, built in memory from the runner's own path, then reads it back;
-  `--remove-autostart` deletes it. Exit codes are `AutostartTask.Exit` (0 ok, 10-20 failures, each with a message). The editor
-  starts install mode through UAC, but removes the task with `schtasks /Delete` so it never elevates a possibly untrusted copy.
-  Auto-start is refused unless `FolderTrust.CheckExecutable` says only administrators can change the runner and everything
-  in its folder, and unless the signed-in user is an administrator.
-- **Trust checks:** `Glance.Core.Security.FolderTrust` is the one engine for "may an elevated process start this?"
+- **The service never renders.** It never reads a theme, an image, a font or a video, and never starts a process. The user's tray app or
+  editor renders with `DisplayPusher` and sends finished 480x320 RGB565 frames; `RemoteFrameDisplay` is just another `IFrameDisplay`.
+  `DisplayConnector.Open()` (used by `DisplayPusher`'s public constructor) picks the service, or USB directly when there is no service.
+  Keep it that way: anything that makes SYSTEM parse user files brings back the class of bug the service exists to remove.
+- **Who may draw:** only a client in the active console session (`DisplayAccess`, per request; session from `GetNamedPipeClientSessionId`).
+  `STATUS` is open to any connected client. There is no `EXIT` or file command on the service pipe; stopping goes through the SCM.
+- **Pipe rules** (`ServicePipeSecurity`, tested): deny NETWORK; the server account full control; Administrators and INTERACTIVE read/write
+  only (no `CreateNewInstance`, `ChangePermissions`, `TakeOwnership`). Clients check the server end's owner (`PipeServerCheck`: SYSTEM or
+  Administrators, so a squatter is never sent a frame or believed) and connect at `TokenImpersonationLevel.Anonymous` so no server can act
+  as them. The tray's control pipe is per session, current-user only, and its client uses `PipeOptions.CurrentUserOnly` + Anonymous.
+- **Display server behaviour** (`DisplayServer`, tested over real pipes with `FakeDisplay`): opens the device on the first frame and applies
+  the last brightness; `BLANK` blanks and releases at once; 20 s without a frame blanks and releases (clients refresh every 10 s), so
+  AIDA64 can take the display when no Glance client draws; a USB error is returned to the client and closes the device; sign-out or
+  console disconnect of the drawing session blanks at once; a power event that finds the device busy is paid by the next request or tick.
+- **Sensors:** LibreHardwareMonitor (needs admin + the PawnIO driver for CPU/motherboard data) runs in the service. `SensorHub` (Core) in
+  the tray and the editor prefers the service's feed and falls back to basic local sensors; the feed counts as gone after 5 s without data.
+  Drive-space sensors come from `DriveSensors`.
+- **Tray control pipe commands** (one line each, reply `OK ...`): `STATUS`, `RELOAD`, `PAUSE`, `RESUME`, `EXIT`, `NEXT`, `PREV`, `PAGE <n>`
+  (0 releases), `BRIGHTNESS <0-7>`, `LIVE <base64 folder> <base64 theme json>` (show the editor's unsaved theme; `-` for no folder),
+  `LIVE_CLEAR`. Build and parse them only with `Glance.Core.Control.ControlCommand` (shared by both sides and tested).
+- Single tray app per session (mutex `Local\Glance.Runner`). It starts at sign-in from a shortcut in the common Startup folder (installer
+  option). There is no scheduled task any more; the editor's Background service window only offers to remove Glance 0.1's leftover
+  "Glance Runner" task (`schtasks /Delete` through UAC).
+- **Service control:** `ServiceControl` (Core) queries and starts the service without elevation (the installer's service DACL,
+  `ServiceNames.ServiceSddl`, gives interactive users "start"); stopping runs Windows' `sc.exe stop GlanceService` through one UAC prompt.
+- **Service entry:** `Glance.Service/NativeService.cs` uses `StartServiceCtrlDispatcher`/`RegisterServiceCtrlHandlerEx` directly because
+  `ServiceBase` cannot accept pre-shutdown. Power events are handled synchronously in the handler (bounded); stop and pre-shutdown report
+  stop-pending, blank on a worker and report stopped. `--console` runs the same code in a console (elevated prompt) for development.
+- **Service log:** `%ProgramData%\Glance\service.log`, only written when `FolderTrust.CheckFolder` says the folder is admin-only (the service
+  creates it with a protected DACL). The tray app logs to `%AppData%\Glance\runner.log` as the user.
+- **Trust checks:** `Glance.Core.Security.FolderTrust` is the one engine for "may an elevated process start or trust this?"
   (owner and ACL allow-list, no links, fixed local drive, complete chain to the drive root). Use it, do not add another.
-- The runner's environment comes from the user (autostart passes it on). `StartupHookSupport` is off for the runner and the
-  sensor host; profiler and diagnostics variables (`CORECLR_*`, `DOTNET_DiagnosticPorts`) cannot be blocked in-process and
-  are only logged as a warning. See the H1 notes in `docs/reviews/review-autostart-task.md`.
-- **Settings and themes:** `%AppData%\Glance` (`settings.json`, `Themes\<name>\theme.json` + `assets\`). On first use, the old
-  `%AppData%\MiniLcd` folder is copied over (the app used to be called MiniLcd).
+- **No Glance process runs elevated with a user's environment** (review H6/H1). Nothing has `requireAdministrator` (a test checks every
+  manifest); the installer only starts Windows tools while elevated. `StartupHookSupport` stays off for the service and the tray app.
+- **Settings and themes:** `%AppData%\Glance` (`settings.json`, `Themes\<name>\theme.json` + `assets\`), read only by that user's processes.
+  On first use, the old `%AppData%\MiniLcd` folder is copied over (the app used to be called MiniLcd).
 
 ## The display (read `docs/PROTOCOL.md`)
 
@@ -96,16 +121,19 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
 - **Only whole-screen updates work.** Partial rectangles time out and draw nothing (measured on the real display). A full frame takes ~400 ms, so ~2.5 updates/s max.
   `DisplayPusher` therefore skips frames identical to the last one and force-refreshes every 10 s. Do not build features that assume faster updates.
 - On exit/pause the display is blanked (black frame, backlight 0), otherwise it keeps its last picture. Reload/error recovery deliberately does not blank (flicker).
-- **Shutdown, restart, sign-out and sleep** also blank it (the USB port often stays powered, so the last frame would stay lit). `SessionPowerWatcher`
+- **Shutdown, restart, sign-out and sleep** also blank it (the USB port often stays powered, so the last frame would stay lit), on two lines:
+  the **service** (pre-shutdown, power event and session change, through `ServiceControlMap` -> `DisplayServer.HandlePower`/`SessionLeft`,
+  bounded by `PowerBlank.OwnerBudgetFor`; the pre-shutdown timeout is 5 s, set by the installer) and the **user side** (tray app or editor),
+  whose pusher blanks through the service on its way out. On the user side, `SessionPowerWatcher`
   (Core) runs a hidden top-level window on its own thread and turns `WM_ENDSESSION`/`WM_POWERBROADCAST` into `PowerEvent`s; the handler runs
   before the message is answered (Windows waits for it) but never longer than `PowerBlank.BudgetFor` (4 s session end, 1.5 s sleep), with a
   shutdown block reason set during a session end and always removed. `DisplayPowerPolicy` (pure, tested) decides: session end/quit -> blank once,
-  stop and never reopen (also while asleep, so an installer can close the runner); suspend -> blank and hold; resume -> reopen (the runner's
+  stop and never reopen (also while asleep, so an installer can close the tray app); suspend -> blank and hold; resume -> reopen (the tray app's
   `Supervise` does it, the editor retries for about a minute). Owners update the policy first, then blank with `PowerBlank.Run`: a bounded
   lock wait, then the loop's own `DisplayPusher.Stop(true, timeout)` with what is left of `OwnerBudgetFor(e)`. If that returns false the
   pusher is remembered as still closing and the display is not reopened until `IsClosed`. If the owner's lock is busy the owner pays the blank itself.
   Every open checks `MayDrive` before and right after opening; that includes the restart of a dead loop. The editor keeps all of this in
-  `PusherSlot` (Core, tested with `FakeDisplay`); the runner's `Supervise` checks the policy before its `ShouldReopen` restart.
+  `PusherSlot` (Core, tested with `FakeDisplay`); the tray app's `Supervise` checks the policy before its `ShouldReopen` restart.
   A missed wake notice heals after 30 s awake (`NoteAwakeTick`), or at once on tray Resume/Reload or the `RESUME` command.
   In the editor, Avalonia closes the window on an OS shutdown, so `Closing` usually does the session-end blank (off the UI thread;
   `Program.Main` waits for it); the watcher covers sleep and is the backup. Out of scope: Modern Standby timing (`PBT_APMSUSPEND` can come late),
@@ -114,8 +142,8 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
   transfer failed) and close; it returns false if a transfer is still stuck, and `IsClosed` turns true when the loop lets go.
   Use `DisplayPusher.QuickStopTimeout` (2 s) for sleep/shutdown. `LastError` is USB trouble (owners reopen via `DisplayPusher.ShouldReopen`);
   `LastRenderError` is a theme that fails to draw (shown, never a reason to reopen). Tests drive it with `FakeDisplay` and short `PusherTiming`.
-- AIDA64 uses the same device; only one program can hold it.
-- The display and runner pages: `DisplayPusher.NextPageIndex` is the pure rotation logic (shared with the virtual display window).
+- AIDA64 uses the same device; only one program can hold it. The service lets go of it 20 s after the last frame (tray paused, editor not sending).
+- Pages on the display: `DisplayPusher.NextPageIndex` is the pure rotation logic (shared with the virtual display window).
 
 ## Core concepts
 
@@ -130,9 +158,11 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
 - **`ThemePackage`** reads/writes `.glance` (zip with `theme.json` + `assets/`). Import is defensive on purpose (path traversal, drive letters, size/entry caps, only `theme.json` and `assets/*`). Keep it that way.
 - **Undo/redo** is snapshot based (`Theme.ToSnapshot/ApplySnapshot`), debounced; all pages and widgets are hooked (`HookAll`).
 - **Video** is decoded by an `ffmpeg` child process (`-re` is required or it plays several times too fast); FFmpeg is optional and found automatically (app folder, PATH, winget machine and user folders).
-  In an elevated process (the runner) `Ffmpeg.Find` only accepts a copy that only administrators can change
-  (`FolderTrust.CheckExecutable(exe, TrustScope.FolderFiles)`: the exe, the files next to it, its folder and every folder above it, no links); rejections go to `runner.log`. The editor's
-  "Install for all users" runs winget with `--scope machine` elevated and then resets the package folder's permissions,
+  Video is decoded only in user-side processes (tray app, editor), as the user; the service never starts ffmpeg. `Ffmpeg.Find` keeps its
+  elevated rule for any elevated caller: it only accepts a copy that only administrators can change
+  (`FolderTrust.CheckExecutable(exe, TrustScope.FolderFiles)`: the exe, the files next to it, its folder and every folder above it, no links). The editor's
+  FFmpeg button and the setup check install per user (no prompt). `SetupChecks.MachineInstallScript` (machine scope, resets the package
+  folder's permissions) is kept but no longer offered,
   because winget moves the files there from the user's temp folder with the user's access still on them.
 
 ## Conventions and gotchas
@@ -145,21 +175,26 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
 - **File encoding:** read and write source with `[IO.File]::ReadAllText` / `WriteAllText` and `new UTF8Encoding($false)`.
   `Get-Content -Raw` + `Set-Content` in Windows PowerShell 5.1 corrupts non-ASCII characters (it once turned `°` into `Â°`).
 - PowerShell 5.1 quirks: no `&&`; here-string terminators must start at column 0; avoid nested quotes inside `$(...)` in one-liners.
-- Elevation: the runner needs admin for sensors, the editor must not run elevated (the installer and tray "Open editor" start it de-elevated).
+- Elevation: only the service has administrator rights (LocalSystem, environment from the SCM). The tray app and the editor are `asInvoker`
+  and must never run elevated (the installer starts them with `runasoriginaluser`). Never add a `requireAdministrator` manifest (a test fails).
 - Do not block the UI thread with USB, process or registry work (setup checks run in `Task.Run`).
 - Rendering races: the editor mutates the theme while a pusher renders it; renderers catch `InvalidOperationException` and retry next frame.
 
 ## Verifying changes
 
 ```powershell
-dotnet test src/Glance.Tests -c Release      # ~270 tests, about 5 seconds, no hardware needed
+dotnet test src/Glance.Tests -c Release      # ~620 tests, about 10 seconds, no hardware or service needed
 ```
 
 - `src/Glance.Tests` (xUnit) covers the hardware-free logic: page rotation, setup diagnoses, `.glance` import safety, undo,
   theme snapshots and old-file migration, presets and templates (every preset on a typical fake PC and on a PC with no sensors),
   the AIDA64 importer and sensor mapping, pixel-level rendering checks (bars, thresholds, alignment, gauges), colour conversion and the sensor pipe.
   `TestSupport.cs` has `Fake.Typical()` (a realistic LibreHardwareMonitor-style sensor list) and helpers to render a theme to a bitmap.
-- Tests never use the real pipe names (`SensorPipeServer`/`PipeSensorClient` take a name) so they cannot collide with a running runner.
+- Tests never use the real pipe names (`SensorPipeServer`, `PipeSensorClient`, `DisplayServer`, `RemoteFrameDisplay` and `ControlPipeClient` take a
+  name) so they cannot collide with a running service or tray app. `DisplayServiceTests` runs the display server and client over real pipes with
+  `FakeDisplay`, fake session lookups and a fake clock; the server then runs as the test user, so tests pass that user as the trusted pipe owner.
+- **Not testable here (needs an installed service):** the service entry (`NativeService`), its real start before sign-in, PRESHUTDOWN timing,
+  the installer's `sc.exe` steps, upgrade from 0.1.1. `ServiceLayoutTests` only check that the installer text matches the tested rules.
 - CI (`.github/workflows/ci.yml`) builds the solution and runs the tests on every push.
 - When you fix a bug or add logic, add a test. A good habit: break the code on purpose and check a test fails (a "mutation check");
   this found a real gap once (the stale-sensor-feed rule was untested).
@@ -177,4 +212,10 @@ dotnet test src/Glance.Tests -c Release      # ~270 tests, about 5 seconds, no h
 - Installer and exes are unsigned (SmartScreen will warn); no GitHub release has been published.
 - Full-screen video is limited to ~2.5 fps by USB; GIFs and small animations look better.
 - UI code (`Glance.App`) has no automated tests; its logic should live in `Glance.Core` where it can be tested.
+- The service has never been installed and run on a real PC by an agent (that needs admin rights and a real install); see the manual
+  test plan in `docs/design/runner-service.md`. Before anyone signs in the display stays dark (decision for the user: an admin-chosen
+  boot theme would need rendering in SYSTEM again).
+- `AutostartTask` (Core) still holds the 0.1 install-path helpers (`BuildXml`, `ParseArgs`, `VerifyRegistered`, ...) and their tests;
+  only `TaskName`/`RemoveStartInfo` are used now (to remove a leftover task). Delete the rest in a cleanup. `RunnerEnvironment`
+  (the H1 warning) is unused for the same reason.
 - **TODO:** make the live display a widget, so people without the hardware can still see their screen (for example docked in the editor or a small always-on-top window). The virtual display window already renders the theme with live sensors, so reuse that renderer.

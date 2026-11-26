@@ -218,6 +218,30 @@ public class ServiceRulesTests
     // ---- service log ----------------------------------------------------------------------------------------------
 
     [Fact]
+    public void An_admin_only_folder_in_ProgramData_is_trusted_with_the_real_parent_permissions()
+    {
+        // The service creates %ProgramData%\Glance itself (SYSTEM, Administrators, Users read). Its parents are read from
+        // this PC: users may create folders in C:\ProgramData and C:\, which must not make the log folder untrusted.
+        var data = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+        var folder = Path.Combine(data, "Glance");
+        var own = new PathSecurity(folder, TrustRole.Folder, ServicePipeSecurity.LocalSystem.Value, new[]
+        {
+            new AclEntry(ServicePipeSecurity.LocalSystem.Value, true, 0x1F01FF),
+            new AclEntry(ServicePipeSecurity.Administrators.Value, true, 0x1F01FF),
+            new AclEntry(new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null).Value, true, 0x1200A9),
+        });
+        var parents = new List<PathSecurity>();
+        for (var d = Path.GetDirectoryName(folder); d is not null; d = Path.GetDirectoryName(d)) parents.Add(FolderTrust.ReadObject(d, TrustRole.Ancestor));
+
+        var verdict = FolderTrust.Evaluate(folder, targetIsFile: false, onFixedDrive: true, parents.Prepend(own));
+        Assert.True(verdict.Trusted, verdict.Reason);
+
+        // and the same folder with the default ProgramData permissions (users may add files) is not
+        var userWritable = own with { Entries = own.Entries!.Append(new AclEntry(new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null).Value, true, FolderTrust.WriteData | FolderTrust.AppendData)).ToList() };
+        Assert.False(FolderTrust.Evaluate(folder, false, true, parents.Prepend(userWritable)).Trusted);
+    }
+
+    [Fact]
     public void The_service_log_is_not_written_into_a_folder_a_user_can_change()
     {
         // a folder in the user's temp folder: the user owns it, exactly like a folder planted in %ProgramData%
