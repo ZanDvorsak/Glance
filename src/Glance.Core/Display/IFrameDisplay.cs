@@ -4,7 +4,7 @@ namespace Glance.Core.Display;
 /// The operations <see cref="DisplayPusher"/> needs from a physical display. <see cref="Usb.Ax206Display"/> is the real one;
 /// tests use a fake so the loop can be checked without hardware.
 /// </summary>
-public interface IFrameDisplay : IDisposable
+internal interface IFrameDisplay : IDisposable
 {
     int Width { get; }
     int Height { get; }

@@ -1247,9 +1247,10 @@ public sealed class MainWindow : Window
         if (_pusher is { IsAlive: false } dead) RestartDeadPusher(dead);
         if (_pusher is { } p)
         {
-            _displayDot.Fill = p.LastError is null ? Brush("#34D399") : Brush("#FF6B6B");
-            _displayText.Text = p.LastError is { } err ? "Display error" : $"Display {p.Fps:0.0} fps";
+            _displayDot.Fill = p.LastError is not null ? Brush("#FF6B6B") : p.LastRenderError is not null ? Brush("#FF9F43") : Brush("#34D399");
+            _displayText.Text = p.LastError is not null ? "Display error" : p.LastRenderError is not null ? "Theme error" : $"Display {p.Fps:0.0} fps";
             if (p.LastError is { } e2) _status.Text = "Display error: " + e2;
+            else if (p.LastRenderError is { } re) _status.Text = "Could not draw the theme: " + re;   // USB is fine; reopening would not help
         }
         else if (_liveToRunner)
         {
@@ -1312,13 +1313,16 @@ public sealed class MainWindow : Window
     {
         bool runner = RunnerClient.IsRunning;
         StopLive();
-        _pusher?.Dispose();               // blanks the screen as it closes
-        _pusher = null;
+        StopPusher(blank: true);          // blanks the screen as it closes
         _send.IsChecked = false;
         if (runner)
         {
             Task.Run(() => RunnerClient.Send("PAUSE"));   // the runner blanks it and stops drawing
             _status.Text = "Display off (the background runner is paused). Click Send to display to turn it back on.";
+        }
+        else if (DisplayStillClosing() is { } busy)
+        {
+            _status.Text = busy;          // the old loop blanks and closes it when its stuck transfer gives up
         }
         else
         {
@@ -1343,8 +1347,7 @@ public sealed class MainWindow : Window
     private void RestartDeadPusher(DisplayPusher dead)
     {
         var why = dead.LastError ?? "unknown error";
-        dead.Stop(blank: false);   // the loop has ended, so this returns at once
-        _pusher = null;
+        StopPusher(blank: false);  // the loop has ended, so this returns at once
         try
         {
             _pusher = new DisplayPusher(() => _theme, _hub, _settings.Brightness) { PinnedPage = DesiredPin };
@@ -1357,12 +1360,35 @@ public sealed class MainWindow : Window
         }
     }
 
+    private DisplayPusher? _closingPusher;   // stopped, but a stuck transfer still holds the device
+
+    /// <summary>Stops the editor's pusher. If a transfer is still stuck, remembers it so the display is not reopened before it lets go.</summary>
+    private void StopPusher(bool blank)
+    {
+        if (_pusher is { } p && !p.Stop(blank)) _closingPusher = p;
+        _pusher = null;
+    }
+
+    /// <summary>Null when the display may be opened now; otherwise why not (a stopped pusher still holds it).</summary>
+    private string? DisplayStillClosing()
+    {
+        if (_closingPusher is { IsClosed: false }) return "The display is still finishing its last transfer; try again in a few seconds.";
+        _closingPusher = null;
+        return null;
+    }
+
     private void ToggleSend(bool on)
     {
-        _pusher?.Dispose(); _pusher = null;
+        StopPusher(blank: true);
         StopLive();
         if (!on) { _status.Text = "Stopped sending."; return; }
         if (RunnerClient.IsRunning) { StartLive(); return; }
+        if (DisplayStillClosing() is { } busy)
+        {
+            _send.IsChecked = false;   // runs ToggleSend(false), which sets its own status; ours goes after it
+            _status.Text = busy;
+            return;
+        }
         try
         {
             _pusher = new DisplayPusher(() => _theme, _hub, _settings.Brightness) { PinnedPage = DesiredPin };

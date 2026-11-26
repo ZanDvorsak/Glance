@@ -324,3 +324,97 @@ On the branch, the slow-fake-transfer test confirms that `Stop` never disposes d
 On `main` (code): `Open()` ends with `var d = new Ax206Display(h); d.ReadDimensions(); return d;` with no cleanup if `ReadDimensions` throws, and the pusher constructor calls `_lcd = Ax206Display.Open(); _lcd.SetBrightness(brightness);` with no cleanup either. On the branch, the "failing first `SetBrightness` disposes the device" test passes.
 
 **Not provable here:** behaviour on the physical display, such as a real stall, unplugging it or replugging it.
+
+---
+
+## Fixes after review
+
+Written by the branch's author after the review. The findings above are unchanged.
+
+**Method.** For each bug, the test was written first and run against the branch as it was (`f613c25`), and its failing output
+was captured. Then the fix was made and the same test was run again. Tests that use new API (`LastRenderError`, `IsClosed`, the public
+`Stop(bool, TimeSpan)`, `ShouldReopen`, `PusherTiming`) got that API first as stubs that kept the old behaviour (`LastRenderError`
+never set, `ShouldReopen` applying the old "any `LastError`" rule, timings at their old values). That way each test failed at run
+time for the real reason, not at compile time. All new tests are in `src/Glance.Tests/DisplayLoopReviewTests.cs`.
+
+Where a finding was a **test gap** rather than a bug (Low 2, Low 3), the "before" column says so honestly: the code was already
+right, so the proof is a mutation check instead.
+
+### Results
+
+| Finding | Test | Before the fix | After the fix |
+|---|---|---|---|
+| Medium 2 (skip a blank that cannot succeed) | `Stop_skips_the_black_frame_when_the_display_has_just_failed` | **Failed:** `Assert.Equal() Failure: Values differ / Expected: 0 / Actual: 1` (a black frame was still sent to a display whose last transfer had just failed) | Passed (13 ms) |
+| Medium 2 (caller chooses the bound) | `Stop_that_times_out_returns_false_and_the_loop_closes_the_display_after_its_transfer` (uses the now public `Stop(bool, TimeSpan)`) | Passed with the stub (making it public is an API change, not a behaviour change) | Passed (1 s) |
+| Medium 3 (render errors are not USB errors) | `A_render_error_is_not_reported_as_a_usb_error_and_never_asks_for_a_reopen` | **Failed:** `Assert.Null() Failure: Value is not null / Expected: null / Actual: "sensor feed broke (NullReferenceException)"` (the render error arrived in `LastError`, which the runner treats as USB trouble) | Passed (503 ms). It also checks that `ShouldReopen` says no over 60 simulated seconds of render errors. |
+| Medium 3 (the reopen rule itself) | `ShouldReopen_reopens_a_dead_loop_at_once_and_a_failing_usb_link_after_the_grace_period` | Passed (it pins down the rule that was moved from the runner into Core; not a bug) | Passed |
+| Low 1 (null pages) | `Loading_a_theme_drops_null_pages` | **Failed:** `System.NullReferenceException : Object reference not set to an instance of an object.` (`"Pages": [null, {"Name":"A"}, ...]` survived `Load`) | Passed (15 ms) |
+| Low 1 (empty theme freezes silently) | `A_theme_left_without_pages_is_reported_instead_of_freezing_silently` | **Failed:** `an empty theme was never reported` | Passed (151 ms) |
+| Low 2 (race test too slow to catch H4) | `Undo_redo_racing_a_fast_loop_never_faults_it` | The code was right, so this test passed. Mutation check, with the original H4 bug restored (old `ApplySnapshot` with `Clear()` plus live-list page indexing): the **old 200 ms test passed 4 of 5 runs** (it caught the bug once, `Actual: 1`); the **new test failed 5 of 5** (`Assert.Equal() Failure / Expected: 0 / Actual: 32`). Repeated on the final code: failed 3 of 3, `Actual: 32`. | Passed, 5 of 5 alone and in every full run |
+| Low 2 (`StablePages` alone) | `StablePages_copies_the_list_and_drops_empty_slots` | Passed (test gap, not a bug) | Passed |
+| Low 3 (`Stop` timing out) | `Stop_that_times_out_returns_false_and_the_loop_closes_the_display_after_its_transfer` | Passed (the behaviour was right; only the test was missing). It checks: `false` within the 100 ms bound, no dispose during the transfer, `IsClosed` false, then the loop closes the device after the transfer, blanks once, and a second `Stop` does nothing. | Passed (1 s) |
+| Low 5 (repeating `InvalidOperationException`) | `An_InvalidOperationException_on_every_frame_is_reported_and_backed_off` | **Failed:** `a repeating InvalidOperationException was never reported` | Passed (1 s): reported after 10 in a row, then at most 6 attempts in 900 ms with a 300 ms back-off |
+
+Raw outputs: the "before" run had 5 failed and 4 passed of these 9 tests. The "after" run had 9 of 9 passed.
+
+### What changed, per finding
+
+- **Medium 2.** The caller now chooses the bound:
+  - `Stop(bool blank, TimeSpan timeout)` is public.
+  - `DisplayPusher.QuickStopTimeout` (2 s) is the documented choice for sleep and shutdown. `Stop(bool)` keeps the 18 s default.
+  - `Close()` skips `Blank()` when the loop's last device call failed (`_deviceFailing`).
+  - Expected stop times, from the code (not measured):
+
+    | Display state | Expected time |
+    |---|---|
+    | Working | about 0.5-1 s |
+    | Stalled, loop between frames | returns at once, no blank |
+    | Stalled, loop inside a transfer | `false` at the caller's bound (2 s); the loop closes the device when the transfer gives up |
+
+- **Medium 3.** The loop has two phases:
+  - **Draw** (theme, page copy, renderer). A failure here sets `LastRenderError`.
+  - **Send.** Anything the device throws sets `LastError` (USB).
+  - The rule "reopen when the loop is dead, or USB has failed for longer than 6 s" moved to `DisplayPusher.ShouldReopen`, so it can
+    be tested. The runner's `Supervise` uses it. It shows render errors in the status and logs each distinct message once.
+  - The editor shows render errors as an orange "Theme error" with the message in the status bar. It never reopens for them.
+- **Low 1.** `Theme.Normalize` drops `null` pages before anything else, so `Load` and `ApplySnapshot` both get it. If the page copy
+  stays empty longer than `NoPagesReportMs` (1 s), the loop sets `LastRenderError = "The theme has no pages to show."`. `null` widgets
+  are left to review M3.
+- **Low 2.** New internal `PusherTiming` record (frame interval, back-off, no-pages delay, `InvalidOperationException` limit), passed to
+  the internal constructor. The old 200 ms race test was removed. The new one runs with no frame wait and a cheap empty theme, so it
+  samples the race often enough. Most display tests now use short back-offs.
+- **Low 3.** Covered by the new test above.
+- **Low 4.** Callers keep a pusher whose `Stop` returned `false` in a `_closingPusher` field, and do not open the display until its
+  new `IsClosed` turns true:
+  - Runner: `Supervise` waits and shows "the display is finishing its last transfer". `DisposePusher` logs the timeout.
+  - Editor: Send and Turn off show "still finishing its last transfer; try again in a few seconds".
+- **Low 5.** In the draw phase, `InvalidOperationException` (except `ObjectDisposedException`) is tolerated silently up to
+  `InvalidOperationLimit` (10) times in a row. After that it is reported in `LastRenderError` and backed off. The count resets after a
+  good frame.
+- **Low 7.** When the runner reopens, it copies the real reason into `_lastError` first: the USB error, or "the display loop
+  failed"/"stopped". The status then shows that instead of "not found".
+- **Nits:**
+  - `_cts` is disposed once `Stop` sees the loop has finished. A later `Stop` ignores the `ObjectDisposedException` from `Cancel`.
+  - `UnexpectedErrors` is now a read-only property, and `IFrameDisplay` is `internal`.
+  - `Faulted` is only set when no stop was requested, and the runner's log line uses it.
+  - The slow-transfer test uses a 3000 ms fake transfer against a `>= 2000 ms` check.
+  - The comments on `StablePages` and `ApplySnapshot` now state their limit: the list is never empty, but it is not atomic, and
+    `Theme` is still not safe for other background readers (see the caveat in the proof section). The proper fix is an immutable
+    snapshot, which is left for later.
+  - `AGENTS.md` now says ~270 tests in about 5 s and describes the `Stop` contract and the two error properties.
+
+### Not done here
+
+- **Medium 1** (`RestartDeadPusher` and the shutdown branch's power gate): as agreed, this is handled when the branches are integrated.
+  The editor now has a small `StopPusher`/`DisplayStillClosing` pair. At integration it should be folded into the shutdown branch's
+  `ReleasePusher`/`TryStartPusher`.
+- **Low 6** (UI-thread blocking, `StopAsync`): unchanged. It is tracked as review M7/L8. Callers can now pass a shorter bound.
+- **Nit:** `Glance.Core.Usb` still depends on `Glance.Core.Display` for the interface. That is harmless, since the interface is now internal.
+
+### Final verification
+
+- `dotnet build src/Glance.sln -c Release --no-incremental`: 0 errors, no new warnings.
+- `dotnet test src/Glance.Tests -c Release`: **272/272 passed**, about 5 s, 3 full runs in a row. That is 264, minus the removed 200 ms
+  race test, plus 9 new tests.
+- The display tests alone (`DisplayPusherTests` plus `DisplayLoopReviewTests`, 19 tests) passed 5 of 5 runs.
+- Not verified: anything on the physical display, and the runner's and editor's UI wiring. Nothing was started.

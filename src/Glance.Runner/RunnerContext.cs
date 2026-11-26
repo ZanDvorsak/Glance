@@ -35,6 +35,8 @@ internal sealed class RunnerContext : ApplicationContext
     private Theme _theme = Theme.CreateDefault(null);
     private Theme? _live;                 // unsaved theme streamed from the editor
     private DisplayPusher? _pusher;
+    private DisplayPusher? _closingPusher;  // stopped, but a stuck transfer still holds the device
+    private string? _loggedRenderError;     // each distinct theme error is logged once, not every frame
     private DateTime? _failingSince;
     private string? _lastError;
     private bool _paused;
@@ -145,30 +147,50 @@ internal sealed class RunnerContext : ApplicationContext
             if (_paused) { DisposePusher(); SetStatus("Display paused"); return; }
             if (_pusher is null)
             {
-                try { _pusher = new DisplayPusher(() => Current, _sensors, _brightness) { PinnedPage = _pinPage }; _failingSince = null; _lastError = null; Log("Display opened"); }
-                catch (Exception ex) { _lastError = ex.Message; }
+                if (_closingPusher is { IsClosed: false })
+                    _lastError = "the display is finishing its last transfer";   // still claimed; opening now would fail with "busy"
+                else
+                {
+                    _closingPusher = null;
+                    try { _pusher = new DisplayPusher(() => Current, _sensors, _brightness) { PinnedPage = _pinPage }; _failingSince = null; _lastError = null; Log("Display opened"); }
+                    catch (Exception ex) { _lastError = ex.Message; }
+                }
             }
-            else if (!_pusher.IsAlive)
+            else
             {
-                // the loop ended without being stopped; treat it like a failing display and reopen it on the next tick
-                Log("Display loop stopped; reopening: " + (_pusher.LastError ?? "unknown error"));
-                DisposePusher(blank: false);
+                // reopen only for USB trouble or a dead loop; a theme that fails to draw is shown and logged once instead
+                bool alive = _pusher.IsAlive;
+                if (DisplayPusher.ShouldReopen(alive, _pusher.LastError, ref _failingSince, DateTime.UtcNow, TimeSpan.FromSeconds(6)))
+                {
+                    _lastError = _pusher.LastError ?? (_pusher.Faulted ? "the display loop failed" : "the display loop stopped");
+                    Log((alive ? "Display kept failing; reopening: " : "Display loop stopped; reopening: ") + _lastError);
+                    DisposePusher(blank: false);
+                }
+                else if (_pusher.LastRenderError is { } renderError && renderError != _loggedRenderError)
+                {
+                    Log("Could not draw the theme: " + renderError);
+                    _loggedRenderError = renderError;
+                }
             }
-            else if (_pusher.LastError is not null)
-            {
-                _failingSince ??= DateTime.UtcNow;
-                if (DateTime.UtcNow - _failingSince > TimeSpan.FromSeconds(6)) { Log("Display kept failing; reopening: " + _pusher.LastError); DisposePusher(blank: false); }
-            }
-            else _failingSince = null;
 
             SetStatus(_pusher is null
                 ? "Waiting for the display: " + (_lastError ?? "not found")
+                : _pusher.LastRenderError is { } drawError ? "Could not draw the theme: " + drawError
                 : _live is not null ? $"Live preview from the editor, {_pusher.Fps:0.0} fps" : $"Showing \"{_theme.Name}\"{(Current.Pages.Count > 1 ? $" (page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count})" : "")}, {_pusher.Fps:0.0} fps");
         }
     }
 
     /// <param name="blank">Turn the screen black as it closes. Not wanted when it is reopened immediately (reload, error recovery).</param>
-    private void DisposePusher(bool blank = true) { _pusher?.Stop(blank); _pusher = null; _failingSince = null; }
+    private void DisposePusher(bool blank = true)
+    {
+        if (_pusher is { } p && !p.Stop(blank))
+        {
+            // a transfer is still stuck; the loop closes the display when it gives up. Supervise waits for that before reopening.
+            _closingPusher = p;
+            Log("The display did not stop in time; it will close when its last transfer gives up");
+        }
+        _pusher = null; _failingSince = null;
+    }
 
     private void SetPaused(bool paused)
     {

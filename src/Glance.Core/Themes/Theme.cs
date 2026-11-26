@@ -41,6 +41,8 @@ public partial class Theme : ObservableObject
     /// <summary>Makes a freshly deserialized theme valid: migrates old single-page files and guarantees one page.</summary>
     private void Normalize()
     {
+        // "Pages": [null] in a hand-edited or imported file would otherwise leave a theme with nothing to draw
+        for (int i = Pages.Count - 1; i >= 0; i--) if (Pages[i] is null) Pages.RemoveAt(i);
         if (LegacyWidgets is { Count: > 0 } legacy)
         {
             if (Pages.Count == 0) Pages.Add(new ThemePage { Name = "Page 1" });
@@ -99,6 +101,10 @@ public partial class Theme : ObservableObject
         Name = t.Name; Width = t.Width; Height = t.Height; BackgroundColor = t.BackgroundColor; AutoRotate = t.AutoRotate;
         // Replace page by page instead of Clear() + Add: a display pusher may be drawing this same theme on another thread,
         // and the list must never be empty while it looks (Normalize guarantees the snapshot has at least one page).
+        // LIMIT: this is "never empty", not atomic or thread-safe. For a moment the list can mix old and new pages, and it
+        // still shrinks while another thread may be reading it, so a background reader that indexes Pages directly can still
+        // go out of range. DisplayPusher copies the list first (StablePages); any other background reader must do the same
+        // until background renderers get an immutable snapshot.
         for (int i = 0; i < t.Pages.Count; i++)
         {
             if (i < Pages.Count) Pages[i] = t.Pages[i];

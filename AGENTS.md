@@ -85,6 +85,10 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
 - **Only whole-screen updates work.** Partial rectangles time out and draw nothing (measured on the real display). A full frame takes ~400 ms, so ~2.5 updates/s max.
   `DisplayPusher` therefore skips frames identical to the last one and force-refreshes every 10 s. Do not build features that assume faster updates.
 - On exit/pause the display is blanked (black frame, backlight 0), otherwise it keeps its last picture. Reload/error recovery deliberately does not blank (flicker).
+- While a `DisplayPusher` runs, only its loop touches the device. `Stop(blank, timeout)` asks the loop to blank (skipped if the last
+  transfer failed) and close; it returns false if a transfer is still stuck, and `IsClosed` turns true when the loop lets go.
+  Use `DisplayPusher.QuickStopTimeout` (2 s) for sleep/shutdown. `LastError` is USB trouble (owners reopen via `DisplayPusher.ShouldReopen`);
+  `LastRenderError` is a theme that fails to draw (shown, never a reason to reopen). Tests drive it with `FakeDisplay` and short `PusherTiming`.
 - AIDA64 uses the same device; only one program can hold it.
 - The display and runner pages: `DisplayPusher.NextPageIndex` is the pure rotation logic (shared with the virtual display window).
 
@@ -119,7 +123,7 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
 ## Verifying changes
 
 ```powershell
-dotnet test src/Glance.Tests -c Release      # ~240 tests, about 2 seconds, no hardware needed
+dotnet test src/Glance.Tests -c Release      # ~270 tests, about 5 seconds, no hardware needed
 ```
 
 - `src/Glance.Tests` (xUnit) covers the hardware-free logic: page rotation, setup diagnoses, `.glance` import safety, undo,

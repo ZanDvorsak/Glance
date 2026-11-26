@@ -14,6 +14,8 @@ internal sealed class FakeDisplay : IFrameDisplay
 
     public int BlitDelayMs { get; set; }
     public Exception? BrightnessError { get; set; }
+    /// <summary>Thrown by every Blit (after <see cref="BlitDelayMs"/>), like a display that stopped answering.</summary>
+    public Exception? BlitError { get; set; }
     public bool SizeThrows { get; set; }
     public readonly ManualResetEventSlim BlitStarted = new();
     public readonly List<string> Calls = new();
@@ -35,6 +37,7 @@ internal sealed class FakeDisplay : IFrameDisplay
         _inTransfer = true;
         BlitStarted.Set();
         if (BlitDelayMs > 0) Thread.Sleep(BlitDelayMs);
+        if (BlitError is { } e) { _inTransfer = false; throw e; }
         Interlocked.Increment(ref _blits);
         _inTransfer = false;
         Log("blit");
@@ -77,7 +80,10 @@ public class DisplayPusherTests
 {
     private static readonly ISensorSource NoSensors = new FakeSource(Array.Empty<SensorInfo>());
 
-    private static bool WaitUntil(Func<bool> condition, int timeoutMs = 5000)
+    /// <summary>A short error back-off, so recovery tests do not wait out the real 1 s.</summary>
+    private static readonly PusherTiming Quick = new(ErrorBackoffMs: 50);
+
+    internal static bool WaitUntil(Func<bool> condition, int timeoutMs = 5000)
     {
         var sw = Stopwatch.StartNew();
         while (sw.ElapsedMilliseconds < timeoutMs)
@@ -89,7 +95,7 @@ public class DisplayPusherTests
     }
 
     /// <summary>A theme whose picture changes every frame, so the pusher keeps sending (identical frames are skipped).</summary>
-    private static Theme Ticking()
+    internal static Theme Ticking()
     {
         var t = new Theme();
         t.Widgets.Add(new Widget { Kind = WidgetKind.Clock, X = 0, Y = 0, Text = "HH:mm:ss.fff", FontSize = 40 });
@@ -102,16 +108,17 @@ public class DisplayPusherTests
         var lcd = new FakeDisplay();
         var theme = Ticking();
         var fail = true;
-        var p = new DisplayPusher(() => Volatile.Read(ref fail) ? throw new ArgumentOutOfRangeException("index") : theme, NoSensors, 7, lcd);
+        var p = new DisplayPusher(() => Volatile.Read(ref fail) ? throw new ArgumentOutOfRangeException("index") : theme, NoSensors, 7, lcd, Quick);
         try
         {
-            Assert.True(WaitUntil(() => p.LastError is not null), "the error never showed up in LastError");
-            Assert.Contains("ArgumentOutOfRangeException", p.LastError);
+            Assert.True(WaitUntil(() => p.LastRenderError is not null), "the error never showed up in LastRenderError");
+            Assert.Contains("ArgumentOutOfRangeException", p.LastRenderError);
+            Assert.Null(p.LastError);   // not a USB problem
             Assert.True(p.IsAlive);
             Assert.False(p.Faulted);
 
             Volatile.Write(ref fail, false);
-            Assert.True(WaitUntil(() => p.LastError is null && lcd.Blits > 0), "the loop did not recover");
+            Assert.True(WaitUntil(() => p.LastRenderError is null && lcd.Blits > 0), "the loop did not recover");
             Assert.True(p.IsAlive);
         }
         finally { p.Stop(blank: false); }
@@ -124,15 +131,16 @@ public class DisplayPusherTests
         var theme = Ticking();
         theme.Widgets.Add(new Widget { Kind = WidgetKind.Sensor, SensorId = "/amdcpu/0/load/0" });
         var sensors = new ThrowingSource();
-        var p = new DisplayPusher(() => theme, sensors, 7, lcd);
+        var p = new DisplayPusher(() => theme, sensors, 7, lcd, Quick);
         try
         {
-            Assert.True(WaitUntil(() => p.LastError is not null), "the error never showed up in LastError");
-            Assert.Contains("sensor feed broke", p.LastError);
+            Assert.True(WaitUntil(() => p.LastRenderError is not null), "the error never showed up in LastRenderError");
+            Assert.Contains("sensor feed broke", p.LastRenderError);
+            Assert.Null(p.LastError);
             Assert.True(p.IsAlive);
 
             sensors.Throw = false;
-            Assert.True(WaitUntil(() => p.LastError is null && lcd.Blits > 0), "the loop did not recover");
+            Assert.True(WaitUntil(() => p.LastRenderError is null && lcd.Blits > 0), "the loop did not recover");
         }
         finally { p.Stop(blank: false); }
     }
@@ -159,25 +167,8 @@ public class DisplayPusherTests
         finally { p.Stop(blank: false); }
     }
 
-    [Fact]
-    public void Undo_redo_running_while_the_display_renders_does_not_fault_the_loop()
-    {
-        var lcd = new FakeDisplay();
-        var theme = Ticking();
-        theme.Pages.Add(new ThemePage { Name = "Two", DurationSeconds = 1 });
-        theme.Pages.Add(new ThemePage { Name = "Three", DurationSeconds = 1 });
-        var three = theme.ToSnapshot();
-        var one = new Theme { Name = "one" }.ToSnapshot();
-        var p = new DisplayPusher(() => theme, NoSensors, 7, lcd) { PinnedPage = 2 };
-        try
-        {
-            var sw = Stopwatch.StartNew();
-            for (int i = 0; sw.ElapsedMilliseconds < 1500; i++) theme.ApplySnapshot(i % 2 == 0 ? one : three);
-            Assert.True(p.IsAlive);
-            Assert.Equal(0, p.UnexpectedErrors);
-        }
-        finally { p.Stop(blank: false); }
-    }
+    // The undo/redo race test lives in DisplayLoopReviewTests (Undo_redo_racing_a_fast_loop_never_faults_it): at the shipped
+    // 200 ms frame interval it almost never caught the original bug, so it now runs the loop without a frame wait.
 
     [Fact]
     public void ApplySnapshot_never_leaves_the_theme_without_pages()
@@ -205,7 +196,7 @@ public class DisplayPusherTests
     public void Stop_waits_for_a_slow_transfer_instead_of_closing_the_display_under_it()
     {
         // one transfer longer than the old 2 s wait in Stop
-        var lcd = new FakeDisplay { BlitDelayMs = 2600 };
+        var lcd = new FakeDisplay { BlitDelayMs = 3000 };
         var p = new DisplayPusher(Ticking, NoSensors, 7, lcd);
         Assert.True(lcd.BlitStarted.Wait(5000), "the loop never started a transfer");
 
