@@ -63,7 +63,7 @@ public sealed class ServiceWindow : Window
         bool running = RunnerClient.IsRunning;
         _dot.Background = new SolidColorBrush(Color.Parse(running ? "#34D399" : "#6B7280"));
         _state.Text = running ? "Runner is running" : "Runner is not running";
-        _detail.Text = running ? (RunnerClient.Send("STATUS") is { } s && s.StartsWith("OK ") ? s[3..] : "Running.") : "The display is only updated while the editor is open and sending.";
+        _detail.Text = running ? (RunnerClient.Send(ControlCommand.Status) is { } s && s.StartsWith("OK ") ? s[3..] : "Running.") : "The display is only updated while the editor is open and sending.";
         _startStop.Content = running ? "Stop the runner" : "Start the runner now";
         _startStop.IsEnabled = !_busy && (running || SensorHub.FindRunnerExe() is not null);
 
@@ -77,7 +77,7 @@ public sealed class ServiceWindow : Window
         _busy = true; _message.IsVisible = false;
         try
         {
-            if (RunnerClient.IsRunning) { RunnerClient.Send("EXIT"); await Task.Delay(1200); }
+            if (RunnerClient.IsRunning) { RunnerClient.Send(ControlCommand.Exit); await Task.Delay(1200); }
             else if (!RunnerClient.Launch()) Say("Could not start the runner (not found, or the Windows prompt was declined).");
             else await Task.Delay(2500);
         }

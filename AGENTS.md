@@ -73,8 +73,8 @@ Glance.Runner (admin, tray)                      Glance.App (normal user, editor
 - **Sensors:** LibreHardwareMonitor (needs admin + the PawnIO driver for CPU/motherboard data). `SensorHub` in the editor prefers the
   runner's feed and falls back to basic local sensors; the feed counts as gone after 5 s without data. Drive-space sensors come from `DriveSensors`.
 - **Control pipe commands** (one line each, reply `OK ...`): `STATUS`, `RELOAD`, `PAUSE`, `RESUME`, `EXIT`, `NEXT`, `PREV`, `PAGE <n>` (0 releases),
-  `BRIGHTNESS <0-7>`, `LIVE <base64 folder> <base64 theme json>` (show the editor's unsaved theme), `LIVE_CLEAR`.
-  Pipes are limited to the current Windows user.
+  `BRIGHTNESS <0-7>`, `LIVE <base64 folder> <base64 theme json>` (show the editor's unsaved theme; `-` for no folder), `LIVE_CLEAR`.
+  Build and parse them only with `Glance.Core.Control.ControlCommand` (shared by both sides and tested). Pipes are limited to the current Windows user.
 - Single runner per session (mutex `Local\Glance.Runner`). Auto-start is a scheduled task named `Glance Runner` created only from the editor on request.
 - **Settings and themes:** `%AppData%\Glance` (`settings.json`, `Themes\<name>\theme.json` + `assets\`). On first use, the old
   `%AppData%\MiniLcd` folder is copied over (the app used to be called MiniLcd).
