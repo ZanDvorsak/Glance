@@ -1,14 +1,15 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <!-- The Windows service (LocalSystem). It owns the USB display and the sensors; themes are drawn by the user's apps. -->
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net8.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PlatformTarget>x64</PlatformTarget>
-    <ApplicationManifest>app.manifest</ApplicationManifest>
-    <!-- Runs elevated with the user's environment: ignore DOTNET_STARTUP_HOOKS (written into runtimeconfig.json, which sits in the admin-only folder). -->
+    <!-- Its environment comes from the Service Control Manager, not from a user; still, never load startup hooks. -->
     <StartupHookSupport>false</StartupHookSupport>
+    <ApplicationIcon>..\..\assets\glance.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>

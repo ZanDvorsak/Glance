@@ -4,22 +4,22 @@ namespace Glance.Core.Control;
 public sealed record LiveSend(string Snapshot, int Generation);
 
 /// <summary>
-/// Decides when the editor sends its live theme to the runner and what the status bar says about it.
+/// Decides when the editor sends its live theme to the tray app and what the status bar says about it.
 /// <list type="bullet">
 /// <item>Only one send is in flight at a time, and the next one always carries the newest snapshot, so an older edit can never arrive last.</item>
-/// <item>A snapshot counts as sent only when the runner answered <c>OK</c>; until then every tick retries it.</item>
+/// <item>A snapshot counts as sent only when the tray app answered <c>OK</c>; until then every tick retries it.</item>
 /// <item>"No answer" and "rejected" get different messages; after a failure, the next success restores the normal status.</item>
 /// </list>
 /// Not thread safe: call it from one thread (the editor's UI thread).
 /// </summary>
 public sealed class LiveSendGate
 {
-    public const string ShowingText = "Showing your edits on the display through the background runner.";
-    public const string NoAnswerText = "The background runner did not answer in time, so the display may still show the old theme. Glance keeps trying.";
-    public const string RejectedPrefix = "The background runner rejected your edits";
-    public const string RestartHint = "If you just updated Glance, restart the background runner.";
+    public const string ShowingText = "Showing your edits on the display through the Glance tray app.";
+    public const string NoAnswerText = "The Glance tray app did not answer in time, so the display may still show the old theme. Glance keeps trying.";
+    public const string RejectedPrefix = "The Glance tray app rejected your edits";
+    public const string RestartHint = "If you just updated Glance, restart the Glance tray app.";
 
-    private string? _sent;          // the last snapshot the runner accepted
+    private string? _sent;          // the last snapshot the tray app accepted
     private LiveSend? _inFlight;
     private string? _warning;       // the warning currently shown, if any
     private int _generation;
@@ -39,7 +39,7 @@ public sealed class LiveSendGate
     }
 
     /// <summary>
-    /// Records the runner's reply (null when it could not be reached or did not answer in time).
+    /// Records the tray app's reply (null when it could not be reached or did not answer in time).
     /// Returns the new status text, or null to leave the status bar alone.
     /// </summary>
     public string? Complete(LiveSend send, string? reply)

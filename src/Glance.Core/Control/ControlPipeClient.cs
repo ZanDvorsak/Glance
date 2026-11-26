@@ -3,11 +3,14 @@ using System.Text;
 
 namespace Glance.Core.Control;
 
-/// <summary>Sends one <see cref="ControlCommand"/> over the runner's control pipe and waits for the one-line reply.</summary>
+/// <summary>Sends one <see cref="ControlCommand"/> over the tray app's control pipe and waits for the one-line reply.</summary>
 public static class ControlPipeClient
 {
     /// <summary>How long to wait for the runner to accept the connection.</summary>
     public const int ConnectTimeoutMs = 800;
+
+    /// <summary>How the editor connects to its tray app: only to a pipe its own user serves.</summary>
+    public const PipeOptions Options = PipeOptions.CurrentUserOnly;
 
     /// <summary>How long to wait for the reply to a short command (the editor calls some of these from the UI thread).</summary>
     public const int ReplyTimeoutMs = 800;
@@ -28,7 +31,9 @@ public static class ControlPipeClient
     {
         try
         {
-            using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut);
+            // CurrentUserOnly: .NET checks that this user owns the server end, so another account that took the name gets nothing.
+            // Anonymous: whoever serves the pipe can never act as this user (ImpersonateNamedPipeClient).
+            using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, Options, System.Security.Principal.TokenImpersonationLevel.Anonymous);
             pipe.Connect(connectTimeoutMs);
             // No StreamWriter, and the reader leaves the pipe open: disposing a StreamWriter flushes the pipe, which throws once
             // the pipe is closed (by the reader) or broken (by the runner), and the catch below then turned every reply into null.

@@ -117,7 +117,7 @@ public class SetupDiagnosisTests
     {
         var r = Diagnose(found: true, runner: true);
         Assert.Equal(CheckStatus.Ok, r.Status);
-        Assert.Contains("runner", r.Detail, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("service or the tray app", r.Detail);   // runner-service: the elevated runner is gone
     }
 
     [Fact]

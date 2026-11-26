@@ -21,8 +21,12 @@ internal sealed class FakeDisplay : IFrameDisplay
     public readonly List<string> Calls = new();
     public int? BlankThread, DisposeThread;
 
-    public int Width => SizeThrows ? throw new InvalidOperationException("no size") : 96;
-    public int Height => 64;
+    private readonly int _width = 96, _height = 64;
+    public FakeDisplay() { }
+    public FakeDisplay(int width, int height) { _width = width; _height = height; }
+
+    public int Width => SizeThrows ? throw new InvalidOperationException("no size") : _width;
+    public int Height => _height;
     public int Blits => Volatile.Read(ref _blits);
     public int Blanks => Volatile.Read(ref _blanks);
     public int Disposes => Volatile.Read(ref _disposes);

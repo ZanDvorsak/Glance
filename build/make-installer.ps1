@@ -6,7 +6,7 @@ param([switch]$Sign)   # sign the finished installer (see build\sign.ps1)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 
-if (-not (Test-Path (Join-Path $repo 'dist\Glance\Glance.App.exe'))) {
+if (-not (Test-Path (Join-Path $repo 'dist\Glance\Glance.App.exe')) -or -not (Test-Path (Join-Path $repo 'dist\Glance\Glance.Service.exe'))) {
     throw 'dist\Glance is missing. Run .\build\publish.ps1 first (without -FrameworkDependent for an installer).'
 }
 

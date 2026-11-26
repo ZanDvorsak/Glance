@@ -27,9 +27,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Glance.Core\Glance.Core.csproj" />
-    <!-- Built alongside so the app can offer to launch the elevated helper. -->
-    <!-- Pass -p:SkipHost=true while the helper is running (it locks its own output files). -->
-    <ProjectReference Include="..\Glance.SensorHost\Glance.SensorHost.csproj" ReferenceOutputAssembly="false" Condition="'$(SkipHost)' != 'true'" />
   </ItemGroup>
 
 </Project>

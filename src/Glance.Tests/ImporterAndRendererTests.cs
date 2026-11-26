@@ -372,7 +372,7 @@ public class SensorPipeTests
         var server = new SensorPipeServer(name);
         server.Start();
         server.Publish(new[] { new SensorInfo("/a", "hw", "A", "Load", 12.5f, "%"), new SensorInfo("/b", "hw", "B", "Fan", 800, "RPM") });
-        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromSeconds(2));
+        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromSeconds(2), trustedOwners: new[] { System.Security.Principal.WindowsIdentity.GetCurrent().User! });   // the test server runs as this user, not as the service
 
         Assert.True(await WaitFor(() => client.HasData, 6000), "the client never received data");
         Assert.Equal(new[] { "/a", "/b" }, client.Snapshot.Select(s => s.Id).ToArray());
@@ -392,7 +392,7 @@ public class SensorPipeTests
         // the connection stays open but no new snapshots arrive (a hung runner): old values must not look live
         var name = "glance-test-" + Guid.NewGuid().ToString("N");
         using var server = new System.IO.Pipes.NamedPipeServerStream(name, System.IO.Pipes.PipeDirection.Out);
-        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromMilliseconds(800));
+        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromMilliseconds(800), trustedOwners: new[] { System.Security.Principal.WindowsIdentity.GetCurrent().User! });
         await server.WaitForConnectionAsync(new CancellationTokenSource(6000).Token);
         using var writer = new StreamWriter(server) { AutoFlush = true };
         await writer.WriteLineAsync("[{\"Id\":\"/a\",\"Hardware\":\"hw\",\"Name\":\"A\",\"Type\":\"Load\",\"Value\":1,\"Unit\":\"%\"}]");

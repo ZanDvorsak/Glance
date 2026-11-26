@@ -4,8 +4,8 @@
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
-        <!-- Needed to read CPU and motherboard sensors. -->
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+        <!-- The tray app runs with the user's normal rights; the Glance service (LocalSystem) reads the sensors and owns USB. -->
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
       </requestedPrivileges>
     </security>
   </trustInfo>

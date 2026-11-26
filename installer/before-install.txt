@@ -11,5 +11,13 @@ Glance needs two things that are not part of this installer:
    CPU and motherboard temperatures, fans and voltages need the PawnIO driver (https://pawnio.eu/).
    Without it, Glance still shows GPU, drive, memory and network sensors.
 
-Glance's background runner asks for administrator rights because reading those sensors requires them.
-Your themes and settings are stored in %AppData%\Glance and are kept when you uninstall.
+What this installer sets up
+   - The Glance service ("Glance display service"), a Windows service that starts with Windows. It reads the hardware
+     sensors and drives the display, and turns the display off when Windows shuts down or sleeps. It never opens your
+     themes or files.
+   - The Glance tray app, which starts when you sign in (you can turn that off on the next page). It draws your saved
+     theme with your normal rights and sends it to the service.
+   - The Glance editor.
+
+If Glance 0.1 is installed, its background runner is closed and its "start at sign-in" task is removed; the service
+replaces both. Your themes and settings are stored in %AppData%\Glance and are kept when you uninstall.

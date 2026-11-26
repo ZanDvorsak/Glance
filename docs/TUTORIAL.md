@@ -3,11 +3,16 @@
 A walk through the basics: get a screen onto the display, change it, and keep it running. Everything here
 works with the real display, and most of it also works without one (see [Virtual display](#9-try-it-without-the-display)).
 
-Glance has two parts that work together:
+Glance has three parts that work together:
 
-- **The editor** (`Glance.App.exe`): where you design themes. It runs as a normal user.
-- **The runner** (`Glance.Runner.exe`, a tray app): owns the display, reads your hardware sensors and keeps your theme on screen
-  when the editor is closed. It runs as administrator because Windows only lets administrators read CPU and motherboard sensors.
+- **The editor** (`Glance.App.exe`): where you design themes. It runs with your normal rights.
+- **The tray app** (`Glance.Runner.exe`): keeps your saved theme on screen when the editor is closed. It draws the theme with your
+  normal rights and starts when you sign in.
+- **The Glance service** (installed by the installer): a Windows service that owns the display and reads your hardware sensors.
+  It is the only part with administrator rights, because Windows only lets administrators read CPU and motherboard sensors.
+  It never opens your themes or files; the tray app and the editor send it finished pictures.
+
+A portable copy (the zip) has no service: the tray app and the editor then drive the display directly, with the basic sensors only.
 
 ## 1. First start and the setup check
 
@@ -19,9 +24,9 @@ Start `Glance.App.exe`. On the first start (or any time from the **Setup check**
 |---|---|
 | USB display | The display is not plugged in, uses another driver (it needs **libusb-win32**, install it with [Zadig](https://zadig.akeo.ie/)), or another program (AIDA64) is holding it. |
 | Sensor driver (PawnIO) | CPU and motherboard sensors cannot be read until [PawnIO](https://pawnio.eu/) is installed. |
-| Hardware sensors | The runner is not running, so only basic sensors are available (CPU temperature may show 0 °C). |
-| Background runner | Not started yet, see [step 8](#8-keep-it-running-without-the-editor). |
-| FFmpeg | Only needed for video backgrounds. GIFs and images work without it. The background runner only uses FFmpeg installed for all users; if the row says it is installed for your user only, click **Install for all users** (Windows asks for permission). |
+| Hardware sensors | The Glance service is not running (or not installed), so only basic sensors are available (CPU temperature may show 0 °C). |
+| Glance service | Stopped, not installed (portable copy), or running without the tray app; see [step 8](#8-keep-it-running-without-the-editor). |
+| FFmpeg | Only needed for video backgrounds. GIFs and images work without it. **Install FFmpeg** installs it for your user; no prompt needed. |
 
 The page updates by itself, so you can plug in the display or install a driver and watch the dot turn green.
 
@@ -41,7 +46,7 @@ Pick an accent colour and card style at the top, then **Use this theme**. Your c
 - **Middle**: pages and the live preview of the display. This is exactly what the display will show.
 - **Right**: theme settings (or the properties of the selected widget) and the sensor list.
 - **Top bar**: New, Open, Save, Save as, Import AIDA64, Export, Undo/Redo, backlight, **Display off** and **Send to display**.
-- **Bottom bar**: Setup check, Background service, and whether the runner owns the display and where sensors come from.
+- **Bottom bar**: Setup check, Background service, and whether the tray app shows your theme and where sensors come from.
 
 The window can be made smaller; the top and bottom bars wrap and the right column scrolls.
 
@@ -82,10 +87,10 @@ Pick an accent and card style, filter by category, then **Add to screen**. The w
 
 - **Background**: in the theme settings, choose an image, a **GIF** or a **video** (video needs FFmpeg). Fit and opacity are adjustable.
   The display can only update about 2.5 times a second, so full-screen video is choppy; GIFs and small animations look better.
-- **Pages**: **+ Page** adds another screen. Each page has a **Shown for (s)** time and, with **Rotate pages automatically** on, the runner cycles through them.
+- **Pages**: **+ Page** adds another screen. Each page has a **Shown for (s)** time and, with **Rotate pages automatically** on, the display cycles through them.
   **Keep the display on this page while editing** pins the display to the page you are working on.
 - **Send to display** shows your current (even unsaved) theme on the real display. **Backlight** sets the brightness and **Display off** turns the screen black.
-- **Save** writes the theme to your Glance folder; the runner picks up saved changes by itself.
+- **Save** writes the theme to your Glance folder; the tray app picks up saved changes by itself.
 
 ## 8. Keep it running without the editor
 
@@ -93,10 +98,17 @@ Click **Background service** in the bottom bar:
 
 ![Background service](images/08-service.png)
 
-The runner is a small tray app that keeps your saved theme on the display, even with the editor closed. It asks for administrator rights once.
-Tick **Start automatically when I sign in to Windows** to create a scheduled task, so it starts at every login without a prompt.
-When the runner exits it blanks the display. It also turns the display off when Windows shuts down, restarts, signs out or goes to sleep,
-and brings your theme back after the PC wakes up.
+(The screenshot shows the earlier version of this window.)
+
+- **Glance service**: whether it runs, and what the display is doing. **Start the service** needs no prompt; **Stop the service**
+  asks Windows for permission, because stopping it turns the display and sensors off for whoever is at the PC.
+- **Tray app**: keeps your saved theme on the display, even with the editor closed. The installer sets it to start when you sign in
+  (turn that off in Task Manager > Startup apps). **Start the tray app** / **Stop the tray app** do it now.
+- When the tray app exits or pauses, the display turns black. The service also turns the display off when Windows shuts down,
+  restarts or goes to sleep, and when you sign out; your theme comes back after the PC wakes up.
+- If Glance 0.1's "start at sign-in" task is still set up, the window offers to remove it.
+- On a PC with several users, the display shows the theme of the person at the screen (the console session).
+  Before anyone signs in the display stays dark.
 
 ## 9. Try it without the display
 
@@ -113,15 +125,21 @@ You can also pick another screen size in the **Screen** menu, which is handy for
 ## Troubleshooting
 
 - **The display stays black or shows nothing**: check the Setup check. Close AIDA64 (only one program can use the display) and make sure the driver is libusb-win32.
-- **The display stays lit after shutting down the PC**: Glance turns it off when Windows shuts down, restarts, signs out or sleeps, but only if
-  the runner (or the editor, while it is sending) is running at that moment. If it is still lit, check `runner.log` in your Glance folder for a
-  line like `Windows SessionEnding: BlankAndStop`. Some PCs keep USB powered when off; turning that off in the BIOS/UEFI also works.
-  Locking the PC or letting the monitor turn off does not turn the display off, and on laptops with Modern Standby it can stay lit for a
-  while after the screen goes dark, until Windows really goes to sleep.
-- **The display stays black after the PC wakes up**: the runner reopens it within a few seconds, and on its own after about 30 s even if
+- **The display stays lit after shutting down the PC**: the Glance service turns it off when Windows shuts down, restarts, signs out or
+  sleeps, and the tray app (or the editor, while it is sending) does too. If it is still lit, check the service log,
+  `%ProgramData%\Glance\service.log`, for a line like `Windows SessionEnding: BlankAndStop`, and `runner.log` in your Glance folder
+  (the tray app's log). Some PCs keep USB powered when off; turning that off in the BIOS/UEFI also works. Locking the PC or letting
+  the monitor turn off does not turn the display off, and on laptops with Modern Standby it can stay lit for a while after the screen
+  goes dark, until Windows really goes to sleep.
+- **The display stays black after the PC wakes up**: the tray app reopens it within a few seconds, and on its own after about 30 s even if
   Windows did not report the wake-up. To bring it back at once, use **Reload theme** or **Resume display** in the tray menu. If the display
-  itself did not come back, unplug and replug it. The editor (when it sends without the runner) keeps trying for about a minute.
-- **CPU temperature is 0 °C or sensors are missing**: the runner is not running or PawnIO is not installed. Start the runner from **Background service**.
+  itself did not come back, unplug and replug it. The editor (when it sends without the tray app) keeps trying for about a minute.
+- **The tray menu says "Another user is at the console"**: on a PC with several signed-in users, only the person at the screen
+  (the console session) can use the display. Switch back to your session and it shows your theme again.
+- **CPU temperature is 0 °C or sensors are missing**: the Glance service is not running (or this is a portable copy without it), or PawnIO
+  is not installed. Start the service from **Background service**, or install Glance with the installer.
+- **AIDA64 cannot open the display**: pause or stop the Glance tray app (and close the editor's **Send to display**). The service lets
+  go of the display about 20 seconds after it stops receiving pictures.
 - **Updates look slow**: the display accepts about 2.5 full frames per second, so fast animation is not possible. Glance skips frames that did not change.
 - **Colours look wrong**: report it with your display model; Glance sends RGB565 big-endian frames, which this display family expects.
 - **Things overlap in a small window**: make the window a bit larger, or use the scrollbar in the right column. The minimum width is 1280 px.

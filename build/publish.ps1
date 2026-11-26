@@ -6,9 +6,9 @@
       .\build\publish.ps1 -FrameworkDependent  # small (~30 MB), needs the .NET 8 Desktop Runtime installed
       .\build\publish.ps1 -NoZip               # just the folder
 
-  The editor and the runner are published into the SAME folder, so the shared files exist only once.
-  The editor finds the runner (and the runner finds the editor) next to itself, and the "start at login"
-  task points at the runner in this folder, so keep it somewhere stable (an installer puts it in Program Files).
+  The editor, the tray app and the service are published into the SAME folder, so the shared files exist only once.
+  The editor finds the tray app (and the tray app finds the editor) next to itself. The installer registers
+  Glance.Service.exe in this folder as a Windows service, so install it with the installer (Program Files).
 #>
 param(
     [string]$Configuration = 'Release',
@@ -37,7 +37,7 @@ if (Test-Path $out) { Remove-Item $out -Recurse -Force }
 New-Item -ItemType Directory -Force $out | Out-Null
 
 $selfContained = if ($FrameworkDependent) { 'false' } else { 'true' }
-foreach ($project in 'Glance.App', 'Glance.Runner') {
+foreach ($project in 'Glance.App', 'Glance.Runner', 'Glance.Service') {
     Write-Host "Publishing $project ..." -ForegroundColor Cyan
     $args = @('publish', (Join-Path $src "$project\$project.csproj"), '-c', $Configuration, '-r', $Runtime,
               '--self-contained', $selfContained, '-p:DebugType=None', '-p:DebugSymbols=false', '-p:SkipHost=true', '-o', $out)

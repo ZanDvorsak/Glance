@@ -32,55 +32,6 @@ public class AutostartReviewFixTests
     private const int FullControl = 0x1F01FF, Modify = 0x1301BF, ReadExecute = 0x1200A9;
     private const string Exe = @"C:\Program Files\Glance\Glance.Runner.exe";
 
-    private static readonly Func<string, string?> ToSid = n => n switch
-    {
-        @"PC\Ana" => Ana, @"PC\Bob" => Bob,
-        _ when n.StartsWith("S-1-", StringComparison.Ordinal) => n,
-        _ => null,
-    };
-
-    /// <summary>The task as Task Scheduler returns it (schtasks /Query /XML ONE on a real PC, account anonymised).</summary>
-    private const string RealFormat = """
-        <?xml version="1.0" encoding="UTF-16"?>
-        <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-          <RegistrationInfo>
-            <Description>Shows your Glance theme on the USB display and provides hardware sensors.</Description>
-            <URI>\Glance Runner</URI>
-          </RegistrationInfo>
-          <Principals>
-            <Principal id="Author">
-              <UserId>S-1-5-21-1-2-3-1001</UserId>
-              <LogonType>InteractiveToken</LogonType>
-              <RunLevel>HighestAvailable</RunLevel>
-            </Principal>
-          </Principals>
-          <Settings>
-            <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-            <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-            <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-            <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-            <StartWhenAvailable>true</StartWhenAvailable>
-            <IdleSettings>
-              <StopOnIdleEnd>true</StopOnIdleEnd>
-              <RestartOnIdle>false</RestartOnIdle>
-            </IdleSettings>
-          </Settings>
-          <Triggers>
-            <LogonTrigger>
-              <UserId>PC\Ana</UserId>
-            </LogonTrigger>
-          </Triggers>
-          <Actions Context="Author">
-            <Exec>
-              <Command>C:\Program Files\Glance\Glance.Runner.exe</Command>
-              <WorkingDirectory>C:\Program Files\Glance</WorkingDirectory>
-            </Exec>
-          </Actions>
-        </Task>
-        """;
-
-    private static string Real(string from, string to) => RealFormat.Replace(from, to);
-
     // ---------------------------------------------------------------- H1: the user's environment reaches the runner
 
     [Fact]
@@ -103,7 +54,7 @@ public class AutostartReviewFixTests
 
     [Theory]
     [InlineData(@"src\Glance.Runner\Glance.Runner.csproj")]
-    [InlineData(@"src\Glance.SensorHost\Glance.SensorHost.csproj")]
+    [InlineData(@"src\Glance.Service\Glance.Service.csproj")]   // Glance.SensorHost was removed (runner-service); the service keeps the rule
     public void H1_elevated_programs_turn_startup_hooks_off(string project)
     {
         var doc = XDocument.Load(Path.Combine(RepoRoot(), project));
@@ -115,68 +66,6 @@ public class AutostartReviewFixTests
         for (var d = AppContext.BaseDirectory; d is not null; d = Path.GetDirectoryName(d))
             if (File.Exists(Path.Combine(d, "src", "Glance.sln"))) return d;
         throw new DirectoryNotFoundException("Repository root not found.");
-    }
-
-    // ---------------------------------------------------------------- M1: the existing task is checked
-
-    private static TrustVerdict TrustProgramFiles(string exe) =>
-        exe.StartsWith(@"C:\Program Files\", StringComparison.OrdinalIgnoreCase) ? TrustVerdict.Yes : TrustVerdict.No($"{exe} is writable.");
-
-    [Fact]
-    public void M1_a_task_pointing_at_a_writable_copy_is_flagged()
-    {
-        var old = Real(@"C:\Program Files\Glance", @"C:\Users\Ana\Downloads\Glance");
-        var s = AutostartTask.Assess(true, old, Exe, TrustProgramFiles);
-        Assert.Equal(AutostartState.Untrusted, s.State);
-        Assert.Equal(@"C:\Users\Ana\Downloads\Glance\Glance.Runner.exe", s.Command);
-        Assert.Contains(@"Downloads\Glance", s.Message);
-    }
-
-    [Fact]
-    public void M1_a_task_pointing_at_another_trusted_copy_is_flagged()
-    {
-        var other = Real(@"C:\Program Files\Glance", @"C:\Program Files\Glance Old");
-        var s = AutostartTask.Assess(true, other, Exe, TrustProgramFiles);
-        Assert.Equal(AutostartState.OtherCopy, s.State);
-        Assert.Contains("Glance Old", s.Message);
-    }
-
-    [Fact]
-    public void M1_a_task_that_is_not_a_plain_runner_start_is_flagged()
-    {
-        var withArgs = RealFormat.Replace("</WorkingDirectory>", "</WorkingDirectory><Arguments>--x</Arguments>");
-        Assert.Equal(AutostartState.NotGlance, AutostartTask.Assess(true, withArgs, Exe, TrustProgramFiles).State);
-        Assert.Equal(AutostartState.NotGlance, AutostartTask.Assess(true, "<garbage", Exe, TrustProgramFiles).State);
-        Assert.Equal(AutostartState.NotGlance, AutostartTask.Assess(true, null, Exe, TrustProgramFiles).State);
-    }
-
-    [Fact]
-    public void M1_this_install_in_Task_Scheduler_format_is_fine_and_no_task_is_not_installed()
-    {
-        Assert.Equal(AutostartState.Ok, AutostartTask.Assess(true, RealFormat, Exe, TrustProgramFiles).State);
-        Assert.Equal(AutostartState.NotInstalled, AutostartTask.Assess(false, null, Exe, TrustProgramFiles).State);
-    }
-
-    // ---------------------------------------------------------------- M2: a standard user would get a task that never starts
-
-    [Fact]
-    public void M2_a_standard_user_elevated_by_another_admin_is_refused()
-    {
-        Assert.Equal(AutostartTask.Exit.UserNotAdmin, AutostartTask.CheckInstallUser(Ana, Ana, Bob, requestedIsAdmin: false));
-        Assert.Equal(AutostartTask.Exit.UserNotAdmin, AutostartTask.CheckInstallUser(Ana, Ana, Bob, requestedIsAdmin: null));
-        Assert.Equal(AutostartTask.Exit.Ok, AutostartTask.CheckInstallUser(Ana, Ana, Bob, requestedIsAdmin: true));
-        Assert.Equal(AutostartTask.Exit.Ok, AutostartTask.CheckInstallUser(Ana, Ana, Ana, requestedIsAdmin: null)); // split-token admin
-        Assert.Equal(AutostartTask.Exit.NotSessionUser, AutostartTask.CheckInstallUser(Ana, Bob, Ana, requestedIsAdmin: true));
-        Assert.Equal(AutostartTask.Exit.NotSessionUser, AutostartTask.CheckInstallUser(Ana, null, Ana, requestedIsAdmin: true));
-    }
-
-    [Fact]
-    public void M2_only_an_administrator_can_use_autostart()
-    {
-        Assert.True(AutostartTask.UserCanAutostart(TokenElevation.Limited, inAdministratorsRole: false)); // UAC split token
-        Assert.True(AutostartTask.UserCanAutostart(TokenElevation.Full, inAdministratorsRole: true));     // already elevated
-        Assert.True(AutostartTask.UserCanAutostart(TokenElevation.Default, inAdministratorsRole: true));  // UAC turned off
-        Assert.False(AutostartTask.UserCanAutostart(TokenElevation.Default, inAdministratorsRole: false)); // standard user
     }
 
     // ---------------------------------------------------------------- M3: one trust engine with the FfmpegTrust rules
@@ -283,33 +172,6 @@ public class AutostartReviewFixTests
         Assert.Null(FolderTrust.PathProblem(@"C:\"));
     }
 
-    // ---------------------------------------------------------------- L1: "already removed" is not a failure
-
-    [Fact]
-    public void L1_task_not_found_counts_as_removed()
-    {
-        Assert.Equal(AutostartTask.Exit.Ok, AutostartTask.ClassifyRemoveError(new FileNotFoundException("gone")));
-        Assert.Equal(AutostartTask.Exit.Ok, AutostartTask.ClassifyRemoveError(new COMException("gone", unchecked((int)0x80070002))));
-        Assert.Equal(AutostartTask.Exit.RemoveFailed, AutostartTask.ClassifyRemoveError(new UnauthorizedAccessException()));
-        Assert.Equal(AutostartTask.Exit.RemoveFailed, AutostartTask.ClassifyRemoveError(new COMException("other", unchecked((int)0x80004005))));
-    }
-
-    [WindowsFact]
-    public void L1_what_Task_Scheduler_really_throws_for_a_missing_task_counts_as_removed()
-    {
-        // Read-only: asks for a task that does not exist; nothing is created, changed or deleted.
-        var type = Type.GetTypeFromProgID("Schedule.Service");
-        Assert.NotNull(type);
-        dynamic service = Activator.CreateInstance(type!)!;
-        service.Connect();
-        dynamic root = service.GetFolder("\\");
-        Exception? thrown = null;
-        try { root.GetTask("Glance test missing " + Guid.NewGuid().ToString("N")); }
-        catch (Exception ex) { thrown = ex; }
-        Assert.NotNull(thrown);
-        Assert.Equal(AutostartTask.Exit.Ok, AutostartTask.ClassifyRemoveError(thrown!));
-    }
-
     // ---------------------------------------------------------------- L2: turning auto-start off never elevates the runner
 
     [Fact]
@@ -359,47 +221,6 @@ public class AutostartReviewFixTests
         Assert.False(EvalExe(deleteMiddle, exe).Trusted);
     }
 
-    // ---------------------------------------------------------------- L5: read-back checks more than the action
-
-    [Fact]
-    public void L5_the_Task_Scheduler_format_is_accepted() =>
-        Assert.Null(AutostartTask.VerifyRegistered(RealFormat, Exe, Ana, ToSid));
-
-    [Theory]
-    [InlineData(@"<WorkingDirectory>C:\Program Files\Glance</WorkingDirectory>", @"<WorkingDirectory>C:\Users\Ana</WorkingDirectory>")]
-    [InlineData("<UserId>S-1-5-21-1-2-3-1001</UserId>", "<UserId>S-1-5-21-1-2-3-1002</UserId>")]
-    [InlineData(@"<UserId>PC\Ana</UserId>", @"<UserId>PC\Bob</UserId>")]
-    [InlineData("<LogonType>InteractiveToken</LogonType>", "<LogonType>Password</LogonType>")]
-    [InlineData("<RunLevel>HighestAvailable</RunLevel>", "<RunLevel>LeastPrivilege</RunLevel>")]
-    [InlineData("</LogonTrigger>", "</LogonTrigger><TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary></TimeTrigger>")]
-    [InlineData("<LogonTrigger>", "<BootTrigger/><LogonTrigger>")]
-    public void L5_a_changed_working_folder_principal_or_trigger_is_rejected(string from, string to) =>
-        Assert.NotNull(AutostartTask.VerifyRegistered(Real(from, to), Exe, Ana, ToSid));
-
-    [Fact]
-    public void L5_a_task_built_by_this_code_passes_its_own_read_back() =>
-        Assert.Null(AutostartTask.VerifyRegistered(AutostartTask.BuildXml(Exe, @"PC\Ana"), Exe, Ana, ToSid));
-
-    // ---------------------------------------------------------------- nits
-
-    [Fact]
-    public void N3_a_switch_is_not_taken_as_the_user_name()
-    {
-        Assert.Equal(AutostartMode.Invalid, AutostartTask.ParseArgs(new[] { "--user", "--install-autostart" }).Mode);
-        Assert.Equal(AutostartMode.Invalid, AutostartTask.ParseArgs(new[] { "--install-autostart", "--user", "--remove-autostart" }).Mode);
-    }
-
-    [Fact]
-    public void N2_each_user_problem_has_its_own_exit_code_and_message()
-    {
-        var codes = new[] { AutostartTask.Exit.InvalidUser, AutostartTask.Exit.UserLookupFailed, AutostartTask.Exit.NotSessionUser, AutostartTask.Exit.UserNotAdmin };
-        Assert.Equal(codes.Length, codes.Distinct().Count());
-        var messages = codes.Select(AutostartTask.DescribeExit).ToList();
-        Assert.Equal(codes.Length, messages.Distinct().Count());
-        Assert.All(messages, m => Assert.DoesNotContain("exited with code", m));
-        Assert.Contains("administrator", AutostartTask.DescribeExit(AutostartTask.Exit.UserNotAdmin));
-    }
-
     // ---------------------------------------------------------------- test gaps: the real reader and command line
 
     [Theory]
@@ -447,40 +268,4 @@ public class AutostartReviewFixTests
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
-
-    [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern IntPtr CommandLineToArgvW(string cmdLine, out int argc);
-
-    [DllImport("kernel32.dll")]
-    private static extern IntPtr LocalFree(IntPtr mem);
-
-    private static string[] SplitLikeWindows(string commandLine)
-    {
-        var argv = CommandLineToArgvW(commandLine, out var argc);
-        try { return Enumerable.Range(0, argc).Select(i => Marshal.PtrToStringUni(Marshal.ReadIntPtr(argv, i * IntPtr.Size))!).ToArray(); }
-        finally { LocalFree(argv); }
-    }
-
-    [WindowsFact]
-    public void Install_arguments_survive_Windows_argument_splitting()
-    {
-        foreach (var user in new[] { @"PC\Ana", @"PC\Ana Marija", @"R&D\ana", @"PC\o'neil", @"PC\100%", @"CORP\ana@x", @"PC\Žan Čuk", "ana", @"AzureAD\AnaNovak" })
-        {
-            var args = SplitLikeWindows("\"C:\\Program Files\\Glance\\Glance.Runner.exe\" " + AutostartTask.InstallArguments(user)).Skip(1).ToArray();
-            var r = AutostartTask.ParseArgs(args);
-            Assert.Equal(AutostartMode.Install, r.Mode);
-            Assert.Equal(user, r.User);
-        }
-        Assert.Equal(AutostartMode.Remove, AutostartTask.ParseArgs(SplitLikeWindows("x.exe " + AutostartTask.RemoveArguments()).Skip(1).ToArray()).Mode);
-    }
-
-    [Theory]
-    [InlineData(false, false, false, true, true)]
-    [InlineData(false, false, false, null, true)]   // trust not known yet
-    [InlineData(false, false, false, false, false)] // untrusted copy cannot turn it on
-    [InlineData(false, false, true, false, true)]   // ... but can turn it off
-    [InlineData(true, false, true, true, false)]    // busy
-    [InlineData(false, true, true, true, false)]    // no runner
-    public void Window_rule_for_the_checkbox(bool busy, bool noRunner, bool installed, bool? trusted, bool enabled) =>
-        Assert.Equal(enabled, AutostartTask.CheckboxEnabled(!noRunner, busy, installed, trusted));
 }

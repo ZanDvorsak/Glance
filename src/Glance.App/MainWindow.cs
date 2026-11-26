@@ -73,7 +73,6 @@ public sealed class MainWindow : Window
     private readonly Ellipse _sensorDot = new() { Width = 8, Height = 8, Fill = Brushes.Gray };
     private readonly Ellipse _displayDot = new() { Width = 8, Height = 8, Fill = Brushes.Gray };
     private readonly ToggleButton _send = new() { Content = "Send to display" };
-    private readonly Button _helperBtn = new() { Content = "Start background service", IsVisible = false };
     private readonly Button _ffmpegBtn = new() { Content = "Install FFmpeg for video", IsVisible = false };
     private readonly TextBlock _previewCaption = new() { HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 12, 0, 0) };
 
@@ -84,7 +83,7 @@ public sealed class MainWindow : Window
     private WriteableBitmap? _wb;
     private SKBitmap? _bmp;
     private SKCanvas? _canvas;
-    private readonly PusherSlot _display;          // the editor's own display, when no runner owns it
+    private readonly PusherSlot _display;          // the editor's own display (through the service, or USB), when no tray app draws
     private DisplayPusher? _pusher => _display.Current;
     private bool _installingFfmpeg;
 
@@ -499,15 +498,11 @@ public sealed class MainWindow : Window
     {
         Border Chip(Control dot, Control text) => new() { Classes = { "chip" }, Child = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 7, Children = { dot, text } } };
 
-        _helperBtn.Click += (_, _) =>
-        {
-            _status.Text = SensorHub.LaunchHost() ? "Sensor helper starting (approve the Windows prompt)..." : "Could not start the sensor helper (not found, or the prompt was declined).";
-        };
         _ffmpegBtn.Click += async (_, _) => await InstallFfmpegAsync();
 
         // the status text gets the leftover width (and is trimmed with an ellipsis); the buttons and chips wrap instead of overlapping
         var right = new WrapPanel { VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right };
-        foreach (var c in new Control[] { _ffmpegBtn, _helperBtn, StatusBtn("Setup check", (_, _) => OpenSetupCheck()), StatusBtn("Background service", async (_, _) => await new ServiceWindow().ShowDialog(this)), Chip(_displayDot, _displayText), Chip(_sensorDot, _sensorText) })
+        foreach (var c in new Control[] { _ffmpegBtn, StatusBtn("Setup check", (_, _) => OpenSetupCheck()), StatusBtn("Background service", async (_, _) => await new ServiceWindow().ShowDialog(this)), Chip(_displayDot, _displayText), Chip(_sensorDot, _sensorText) })
         {
             c.Margin = new Thickness(8, 2, 0, 2);
             right.Children.Add(c);
@@ -938,7 +933,7 @@ public sealed class MainWindow : Window
             // 1) import into a throw-away folder and show it before touching the themes folder
             var sensors = _hub.Snapshot;
             var preview = Core.Import.AidaImporter.Import(path, temp, sensors);
-            var ok = await new ImportPreviewWindow(Path.GetFileName(path), preview, _hub, _hub.IsElevated).ShowDialog<bool>(this);
+            var ok = await new ImportPreviewWindow(Path.GetFileName(path), preview, _hub, _hub.FromService).ShowDialog<bool>(this);
             if (!ok) { _status.Text = "Import cancelled."; return; }
 
             // 2) confirmed: import again into the real themes folder
@@ -1033,7 +1028,7 @@ public sealed class MainWindow : Window
 
     private SetupWindow? _setup;
 
-    private SetupContext CurrentSetupContext() => new(_hub.IsElevated, _hub.Snapshot.Count, Autostart.IsInstalled());
+    private SetupContext CurrentSetupContext() => new(_hub.FromService, _hub.Snapshot.Count, Glance.Core.Service.ServiceControl.Query(), RunnerClient.IsRunning);
 
     private void OpenSetupCheck()
     {
@@ -1370,8 +1365,7 @@ public sealed class MainWindow : Window
     {
         _sensors.Refresh(_hub.Snapshot);
         _sensorText.Text = _hub.Status;
-        _sensorDot.Fill = _hub.IsElevated ? Brush("#34D399") : Brush("#FF9F43");
-        _helperBtn.IsVisible = !_hub.IsElevated && SensorHub.FindHostExe() is not null;
+        _sensorDot.Fill = _hub.FromService ? Brush("#34D399") : Brush("#FF9F43");
 
         // video widgets need FFmpeg; offer a one-click install when one is present and it is missing
         bool needFfmpeg = Ffmpeg.Find() is null && _theme.Widgets.Any(w => w.Kind == WidgetKind.Image && Ffmpeg.IsVideo(w.ImagePath));
@@ -1389,10 +1383,10 @@ public sealed class MainWindow : Window
         }
         else if (_liveToRunner)
         {
-            if (!RunnerClient.IsRunning) { _send.IsChecked = false; _status.Text = "The background runner stopped, so live sending ended."; }
-            else { _displayDot.Fill = Brush("#34D399"); _displayText.Text = "Display via runner (live)"; }
+            if (!RunnerClient.IsRunning) { _send.IsChecked = false; _status.Text = "The Glance tray app stopped, so live sending ended."; }
+            else { _displayDot.Fill = Brush("#34D399"); _displayText.Text = "Display via tray app (live)"; }
         }
-        else if (RunnerClient.IsRunning) { _displayDot.Fill = Brush("#4F8CFF"); _displayText.Text = "Runner owns display"; }
+        else if (RunnerClient.IsRunning) { _displayDot.Fill = Brush("#4F8CFF"); _displayText.Text = "Tray app shows your theme"; }
         else { _displayDot.Fill = Brushes.Gray; _displayText.Text = "Display idle"; }
     }
 
@@ -1400,23 +1394,24 @@ public sealed class MainWindow : Window
     {
         if (_installingFfmpeg) return;
         _installingFfmpeg = true;
-        _status.Text = "Installing FFmpeg for all users via winget (Gyan.FFmpeg); Windows asks for permission. This can take a minute.";
+        _status.Text = "Installing FFmpeg for your user via winget (Gyan.FFmpeg). This can take a minute.";
         try
         {
-            // machine scope: the elevated background runner only starts an ffmpeg.exe that normal users cannot change
-            using var proc = Process.Start(SetupChecks.WingetInstallStartInfo(SetupChecks.FfmpegId, machineScope: true))!;
+            // per-user is enough: video is decoded by your own editor and tray app, never by the Glance service
+            using var proc = Process.Start(SetupChecks.WingetInstallStartInfo(SetupChecks.FfmpegId, machineScope: false))!;
+            var drain = Task.WhenAll(proc.StandardOutput.ReadToEndAsync(), proc.StandardError.ReadToEndAsync());   // a full pipe would stall winget
             await proc.WaitForExitAsync();
+            await drain;
             Ffmpeg.Reset();
             _renderer.ClearImageCache();
-            var forRunner = await Task.Run(Ffmpeg.FindForElevated); // reads folder permissions: keep it off the UI thread
-            _status.Text = SetupChecks.FfmpegInstallOutcome(forRunner, Ffmpeg.Find(), proc.ExitCode);
+            _status.Text = Ffmpeg.Find() is not null ? "FFmpeg is installed. Video backgrounds are ready." : $"FFmpeg was not found after the install (winget exit code {proc.ExitCode}).";
         }
-        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == SetupChecks.UacCancelled) { _status.Text = "FFmpeg install cancelled: Windows did not get permission."; }
+        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 2) { _status.Text = "winget was not found. Install the App Installer from the Microsoft Store, then try again."; }
         catch (Exception ex) { _status.Text = "FFmpeg install failed: " + ex.Message; }
         finally { _installingFfmpeg = false; }
     }
 
-    // ---- live streaming to the background runner (when it is active, it owns the display) ------------------------
+    // ---- live streaming to the tray app (when it runs, it draws the display) ---------------------------------------
 
     private bool _liveToRunner;
     private readonly LiveSendGate _liveGate = new();   // one send at a time, newest snapshot, retried until the runner says OK
@@ -1454,7 +1449,7 @@ public sealed class MainWindow : Window
         if (runner)
         {
             Task.Run(() => RunnerClient.Send(ControlCommand.Pause));   // the runner blanks it and stops drawing
-            _status.Text = "Display off (the background runner is paused). Click Send to display to turn it back on.";
+            _status.Text = "Display off (the tray app is paused). Click Send to display to turn it back on.";
         }
         else if (_display.StillClosing() is { } busy)
         {
@@ -1462,7 +1457,7 @@ public sealed class MainWindow : Window
         }
         else
         {
-            Task.Run(Ax206Display.TryBlank).ContinueWith(t => Dispatcher.UIThread.Post(() =>
+            Task.Run(Glance.Core.Service.DisplayConnector.TryBlank).ContinueWith(t => Dispatcher.UIThread.Post(() =>
                 _status.Text = t.Result is { } err ? "Could not turn the display off: " + err : "Display off. Click Send to display to turn it back on."));
         }
     }
