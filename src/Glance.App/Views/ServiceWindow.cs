@@ -17,6 +17,7 @@ public sealed class ServiceWindow : Window
     private readonly CheckBox _auto = new() { Content = "Start automatically when I sign in to Windows" };
     private readonly Ellipse_ _dot = new();
     private bool _busy, _syncing;
+    private Glance.Core.Security.TrustVerdict? _trust; // null until the folder check has finished
 
     private sealed class Ellipse_ : Border
     {
@@ -26,7 +27,7 @@ public sealed class ServiceWindow : Window
     public ServiceWindow()
     {
         Title = "Background service";
-        Width = 520; Height = 470; CanResize = false;
+        Width = 520; Height = 580; CanResize = false;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
 
         var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, Children = { _dot, _state } };
@@ -39,7 +40,8 @@ public sealed class ServiceWindow : Window
         var autoNote = new TextBlock
         {
             Text = "Auto-start uses a Windows scheduled task set to run with the highest privileges, so there is no prompt at every sign-in. " +
-                   "Creating or removing it asks for permission once.",
+                   "Creating or removing it asks for permission once. It is only available when Glance is installed in a folder " +
+                   "that only administrators can change, such as Program Files.",
             TextWrapping = TextWrapping.Wrap, Opacity = 0.6, FontSize = 12,
         };
 
@@ -56,6 +58,23 @@ public sealed class ServiceWindow : Window
         timer.Start();
         Closed += (_, _) => timer.Stop();
         Sync();
+        _ = CheckFolderTrust();
+    }
+
+    /// <summary>
+    /// Auto-start runs the runner as administrator at every sign-in, so it is only offered when the runner's folder can
+    /// only be changed by administrators (an installed copy, not a zip under Downloads or a dev build).
+    /// </summary>
+    private async Task CheckFolderTrust()
+    {
+        if (SensorHub.FindRunnerExe() is not { } exe) return;
+        var verdict = await Task.Run(() => Autostart.CheckRunnerFolder(exe));
+        _trust = verdict;
+        if (!verdict.Trusted)
+            Say(Autostart.IsInstalled()
+                ? Autostart.UntrustedMessage(verdict) + " Auto-start is still turned on from before; turning it off is recommended."
+                : Autostart.UntrustedMessage(verdict));
+        Sync();
     }
 
     private void Sync()
@@ -68,8 +87,10 @@ public sealed class ServiceWindow : Window
         _startStop.IsEnabled = !_busy && (running || SensorHub.FindRunnerExe() is not null);
 
         _syncing = true;
-        try { _auto.IsChecked = Autostart.IsInstalled(); } finally { _syncing = false; }
-        _auto.IsEnabled = !_busy && SensorHub.FindRunnerExe() is not null;
+        bool installed = Autostart.IsInstalled();
+        try { _auto.IsChecked = installed; } finally { _syncing = false; }
+        // An untrusted folder can still turn auto-start off, but not on.
+        _auto.IsEnabled = !_busy && SensorHub.FindRunnerExe() is not null && (installed || _trust?.Trusted != false);
     }
 
     private async Task ToggleRunning()
@@ -91,7 +112,7 @@ public sealed class ServiceWindow : Window
         try
         {
             var exe = SensorHub.FindRunnerExe();
-            var err = await Task.Run(() => want ? (exe is null ? "Runner not found." : Autostart.Install(exe)) : Autostart.Remove());
+            var err = exe is null ? "Runner not found." : await Task.Run(() => want ? Autostart.Install(exe) : Autostart.Remove(exe));
             if (err is not null) Say(err);
         }
         finally { _busy = false; Sync(); }
