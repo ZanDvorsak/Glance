@@ -1271,8 +1271,8 @@ public sealed class MainWindow : Window
             await proc.WaitForExitAsync();
             Ffmpeg.Reset();
             _renderer.ClearImageCache();
-            _status.Text = Ffmpeg.Find() is not null ? "FFmpeg installed. Video backgrounds are ready."
-                : $"FFmpeg install finished with code {proc.ExitCode}. " + SetupChecks.FfmpegMachineInstallHelp;
+            var forRunner = await Task.Run(Ffmpeg.FindForElevated); // reads folder permissions: keep it off the UI thread
+            _status.Text = SetupChecks.FfmpegInstallOutcome(forRunner, Ffmpeg.Find(), proc.ExitCode);
         }
         catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == SetupChecks.UacCancelled) { _status.Text = "FFmpeg install cancelled: Windows did not get permission."; }
         catch (Exception ex) { _status.Text = "FFmpeg install failed: " + ex.Message; }

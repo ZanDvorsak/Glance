@@ -9,6 +9,12 @@ public sealed class ThemeRenderer : IDisposable
 {
     private readonly Dictionary<string, AnimatedImage?> _images = new();
     private readonly Dictionary<string, VideoSource> _videos = new();
+
+    /// <summary>Creates video sources; tests swap it to avoid starting ffmpeg.</summary>
+    internal Func<string, int, int, ImageFit, VideoSource> VideoFactory { get; set; } = (path, w, h, fit) => new VideoSource(path, w, h, fit);
+
+    /// <summary>The clock used to pace video retries (milliseconds); tests swap it.</summary>
+    internal Func<long> Now { get; set; } = () => Environment.TickCount64;
     private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
     private readonly Dictionary<(string, bool, bool), SKTypeface> _faces = new();
     private readonly Dictionary<string, SKTypeface?> _fileFaces = new();
@@ -349,7 +355,7 @@ public sealed class ThemeRenderer : IDisposable
     private VideoSource GetVideo(string path, int w, int h, ImageFit fit)
     {
         var key = $"{path}|{w}x{h}|{fit}";
-        if (!_videos.TryGetValue(key, out var v)) _videos[key] = v = new VideoSource(path, w, h, fit);
+        if (!_videos.TryGetValue(key, out var v)) _videos[key] = v = VideoFactory(path, w, h, fit);
         v.LastUsedTicks = Environment.TickCount64;
         return v;
     }

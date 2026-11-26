@@ -18,13 +18,23 @@ public sealed class VideoSource : IDisposable
     public string? Error { get; private set; }
     public SKImage? Latest => _latest;
 
+    /// <summary>True when no usable ffmpeg.exe was found, so nothing is playing (the renderer may try again later).</summary>
+    public bool FfmpegMissing { get; }
+
+    /// <summary>When the renderer created this source (its own clock), to pace retries.</summary>
+    public long CreatedTicks { get; init; }
+
     public VideoSource(string path, int width, int height, ImageFit fit, int fps = 15)
+        : this(path, width, height, fit, fps, Ffmpeg.Find, () => Ffmpeg.LastRejection) { }
+
+    internal VideoSource(string path, int width, int height, ImageFit fit, int fps, Func<string?> findFfmpeg, Func<string?> lastRejection)
     {
         Width = Math.Max(2, width); Height = Math.Max(2, height);
-        var ffmpeg = Ffmpeg.Find();
+        var ffmpeg = findFfmpeg();
         if (ffmpeg is null)
         {
-            Error = Ffmpeg.LastRejection is not null ? "FFmpeg is only in a folder normal users can change (see runner.log)" : "FFmpeg not found";
+            FfmpegMissing = true;
+            Error = lastRejection() is not null ? "FFmpeg is only in a folder normal users can change (see runner.log)" : "FFmpeg not found";
             return;
         }
 

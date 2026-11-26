@@ -100,6 +100,13 @@ public static class SetupChecks
         "\"winget uninstall --id Gyan.FFmpeg --scope user\", then click Install again, or run " +
         "\"winget install --id Gyan.FFmpeg --scope machine\" in a terminal opened as administrator.";
 
+    /// <summary>The editor's status line after the FFmpeg install button finished.</summary>
+    /// <param name="usableByRunner">What the elevated runner would use (<c>Ffmpeg.FindForElevated()</c>).</param>
+    /// <param name="usableByEditor">What the editor itself would use (<c>Ffmpeg.Find()</c>).</param>
+    public static string FfmpegInstallOutcome(string? usableByRunner, string? usableByEditor, int exitCode) =>
+        usableByEditor is not null ? "FFmpeg installed. Video backgrounds are ready."
+            : $"FFmpeg install finished with code {exitCode}. " + FfmpegMachineInstallHelp;
+
     /// <summary>Win32 error code when the user says No to the UAC prompt.</summary>
     public const int UacCancelled = 1223;
 

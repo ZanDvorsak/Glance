@@ -7,51 +7,37 @@ public static class Ffmpeg
     public static bool IsVideo(string? path) =>
         path is not null && VideoExtensions.Contains(Path.GetExtension(path).ToLowerInvariant());
 
-    private static readonly object Gate = new();
-    private static string? _cached;
-    private static DateTime _checked;
-    private static readonly HashSet<string> Reported = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>The finder the app uses: real elevation, real candidates, real file system and ACLs.</summary>
+    internal static readonly FfmpegFinder Default = new(() => Environment.IsPrivilegedProcess, Candidates, File.Exists, FfmpegTrust.Check);
 
     /// <summary>
     /// Raised (once per path and reason) when an elevated process skips an ffmpeg.exe because a normal user could
     /// replace it. The runner writes these to runner.log.
     /// </summary>
-    public static event Action<string>? Rejected;
+    public static event Action<string>? Rejected { add => Default.Rejected += value; remove => Default.Rejected -= value; }
 
     /// <summary>Why the last search of an elevated process found nothing usable, or null.</summary>
-    public static string? LastRejection { get; private set; }
+    public static string? LastRejection => Default.LastRejection;
 
     /// <summary>
     /// Finds ffmpeg.exe: next to the app, on PATH, or in the usual winget locations. Null if missing.
     /// In an elevated process (the runner) only a copy that non-admin users cannot change is returned, because starting
     /// a user-replaceable exe as administrator would hand admin rights to any program the user runs.
     /// </summary>
-    public static string? Find()
-    {
-        lock (Gate)
-        {
-            if (_cached is not null && File.Exists(_cached)) return _cached;
-            if (_cached is null && DateTime.UtcNow - _checked < TimeSpan.FromSeconds(5)) return null; // don't hammer the disk
-            _checked = DateTime.UtcNow;
-            LastRejection = null;
-            return _cached = Search(Environment.IsPrivilegedProcess, Report);
-        }
-    }
+    public static string? Find() => Default.Find();
 
     /// <summary>
     /// The copy an elevated process (the background runner) would use, or null. Lets the non-elevated editor tell the user
     /// when FFmpeg exists only in a folder the runner refuses. Not cached.
     /// </summary>
-    public static string? FindForElevated() => Search(requireAdminOnly: true, onRejected: null);
+    public static string? FindForElevated() => Default.Search(requireAdminOnly: true).Path;
 
-    private static void Report(string path, string reason)
-    {
-        var message = $"FFmpeg at {path} is not used: {reason}. The runner runs as administrator, so it only starts FFmpeg " +
-                      "from a folder that only administrators can change (install it for all users).";
-        LastRejection = message;
-        if (Reported.Add(path + "|" + reason))
-            try { Rejected?.Invoke(message); } catch { /* logging must never break the search */ }
-    }
+    /// <summary>Forget the cached lookup (e.g. right after installing).</summary>
+    public static void Reset() => Default.Reset();
+
+    internal static string RejectionMessage(string path, string reason) =>
+        $"FFmpeg at {path} is not used: {reason}. The runner runs as administrator, so it only starts FFmpeg " +
+        "from a folder that only administrators can change (install it for all users).";
 
     /// <summary>Every place ffmpeg.exe is looked for, in order (existing or not).</summary>
     public static IEnumerable<string> Candidates()
@@ -71,32 +57,85 @@ public static class Ffmpeg
         {
             if (string.IsNullOrEmpty(root)) continue;
             yield return Path.Combine(root, "WinGet", "Links", "ffmpeg.exe");
-            var pkgs = Path.Combine(root, "WinGet", "Packages");
-            var found = new List<string>();
-            try
-            {
-                if (Directory.Exists(pkgs))
-                    foreach (var p in Directory.EnumerateDirectories(pkgs, "*FFmpeg*"))
-                        try { found.AddRange(Directory.EnumerateFiles(p, "ffmpeg.exe", SearchOption.AllDirectories)); } catch { }
-            }
-            catch { }
-            foreach (var f in found) yield return f;
+            foreach (var f in WingetPackageFiles(Path.Combine(root, "WinGet", "Packages"))) yield return f;
         }
     }
 
-    internal static string? Search(bool requireAdminOnly, Action<string, string>? onRejected)
+    /// <summary>ffmpeg.exe files inside winget's <c>*FFmpeg*</c> package folders under <paramref name="packagesRoot"/>.</summary>
+    internal static List<string> WingetPackageFiles(string packagesRoot)
     {
-        foreach (var candidate in Candidates().Distinct(StringComparer.OrdinalIgnoreCase))
+        var found = new List<string>();
+        try
         {
-            if (!File.Exists(candidate)) continue;
-            if (!requireAdminOnly) return candidate;
-            var verdict = FfmpegTrust.Check(candidate);
-            if (verdict.Trusted) return candidate;
-            onRejected?.Invoke(candidate, verdict.Reason);
+            if (Directory.Exists(packagesRoot))
+                foreach (var p in Directory.EnumerateDirectories(packagesRoot, "*FFmpeg*"))
+                    try { found.AddRange(Directory.EnumerateFiles(p, "ffmpeg.exe", SearchOption.AllDirectories)); } catch { }
         }
-        return null;
+        catch { }
+        return found;
+    }
+}
+
+/// <summary>The result of one search: the path to start (or null) and every candidate that was refused, with why.</summary>
+public sealed record FfmpegSearchResult(string? Path, IReadOnlyList<(string Path, string Reason)> Rejections);
+
+/// <summary>
+/// The ffmpeg lookup with its inputs injected (elevation, candidates, file existence, trust check), so the switch that
+/// turns the admin-only rule on can be tested. <see cref="Ffmpeg"/> holds the real one.
+/// </summary>
+internal sealed class FfmpegFinder
+{
+    private readonly Func<bool> _isElevated;
+    private readonly Func<IEnumerable<string>> _candidates;
+    private readonly Func<string, bool> _exists;
+    private readonly Func<string, TrustVerdict> _check;
+    private readonly object _gate = new();
+    private readonly HashSet<string> _reported = new(StringComparer.OrdinalIgnoreCase);
+    private string? _cached;
+    private DateTime _checked;
+
+    public FfmpegFinder(Func<bool> isElevated, Func<IEnumerable<string>> candidates, Func<string, bool> exists, Func<string, TrustVerdict> check)
+    {
+        _isElevated = isElevated; _candidates = candidates; _exists = exists; _check = check;
     }
 
-    /// <summary>Forget the cached lookup (e.g. right after installing).</summary>
-    public static void Reset() { lock (Gate) { _cached = null; _checked = default; } }
+    public event Action<string>? Rejected;
+
+    public string? LastRejection { get; private set; }
+
+    public string? Find()
+    {
+        lock (_gate)
+        {
+            if (_cached is not null && _exists(_cached)) return _cached;
+            if (_cached is null && DateTime.UtcNow - _checked < TimeSpan.FromSeconds(5)) return null; // don't hammer the disk
+            _checked = DateTime.UtcNow;
+            LastRejection = null;
+            var result = Search(_isElevated());
+            foreach (var (path, reason) in result.Rejections)
+            {
+                var message = Ffmpeg.RejectionMessage(path, reason);
+                LastRejection = message;
+                if (_reported.Add(path + "|" + reason))
+                    try { Rejected?.Invoke(message); } catch { /* logging must never break the search */ }
+            }
+            return _cached = result.Path;
+        }
+    }
+
+    public FfmpegSearchResult Search(bool requireAdminOnly)
+    {
+        var rejections = new List<(string, string)>();
+        foreach (var candidate in _candidates().Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (!_exists(candidate)) continue;
+            if (!requireAdminOnly) return new(candidate, rejections);
+            var verdict = _check(candidate);
+            if (verdict.Trusted) return new(candidate, rejections);
+            rejections.Add((candidate, verdict.Reason));
+        }
+        return new(null, rejections);
+    }
+
+    public void Reset() { lock (_gate) { _cached = null; _checked = default; } }
 }
