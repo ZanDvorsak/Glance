@@ -268,3 +268,94 @@ The one property that cannot be proven here is the `Flush(true)` ordering after 
 - The editor and the runner were not started; the runner's reaction to the new event sequence was checked by reading `RunnerContext.cs:139-149` and
   with a stand-alone watcher configured the same way.
 - Behaviour on non-NTFS targets (an export to a FAT32/exFAT USB stick or a network share): the code still works there, but the rename is not guaranteed atomic.
+
+---
+
+## Fixes after review
+
+Written by the author of the change, not the reviewer. The findings above are unchanged.
+
+**Commits** (on top of `8cbd1e8`, which added this review):
+
+| Commit | What |
+|---|---|
+| `d5f9359` | Seam, no behaviour change: `AppSettings.Read`/`TrySave`/`AppendLog`, `SettingsRead`, `ThemeFile.Load` and a settable `AtomicFile.RetryBudget`, all doing what the branch already did, so the new tests compile and run red. |
+| `7a5ad32` | Tests: `src/Glance.Tests/AtomicSaveReviewTests.cs` (new, 19 test methods, 22 cases), `TestTiming.cs` (retry budget 400 ms for the test assembly), shorter waits in `AtomicSaveTests`; the `"null"` corrupt case moved to the N2 test. |
+| `edbf3c3` | The fixes, the editor and runner wiring, and the updated design note. |
+
+**Method**, as for the first round: the tests were run against `7a5ad32` (the branch's behaviour behind the new entry
+points) and the failures captured, then against `edbf3c3`.
+
+**Before** (`7a5ad32`, `dotnet test src/Glance.Tests -c Release`): **Failed 18, Passed 563, Total 581** (13.1 s).
+All 18 failures are in `AtomicSaveReviewTests`; nothing else failed.
+**After** (`edbf3c3`): **Passed 581 / 581**, three runs in a row, 9-10 s. Build `dotnet build src/Glance.sln -c Release
+-p:SkipHost=true`: succeeded; the new test files add no warnings (both test classes are marked Windows-only for the
+file-lock and ACL calls, and the CS8619 at `AtomicSaveTests.cs:21` is fixed).
+
+### Per finding
+
+| Finding | Test | Before (`7a5ad32`) | After (`edbf3c3`) |
+|---|---|---|---|
+| **M1** editor saves defaults over unreadable settings | `M1_settings_that_could_not_be_read_are_never_saved_over` (file locked 1.5 s while read, then the editor's first-run save) | **Fail**: `Expected: "{"LastTheme":"C:\\themes\\mine\\theme.jso"...` / `Actual: "{"LastTheme":null,"Brightness":7,"PinDisp"...` (the reviewer's probe, reproduced) | Pass: `State = Unreadable`, `TrySave` returns false and logs "Settings not saved", the file still holds the user's settings |
+| **L2** backup copy fails the save | `L2_a_theme_save_still_succeeds_when_the_backup_copy_cannot_be_made` (old `theme.json` denies read, allows delete) | **Fail**: `UnauthorizedAccessException: Access to the path '...\theme.json' is denied.` at `File.Copy` | Pass: saved, no `.bak`, no temp files |
+| **L2** "fails mid write" did not reach the swap | `L2_a_theme_save_that_fails_mid_write_fails_at_the_swap_not_at_the_backup` | **Fail**: `Assert.DoesNotContain() Failure: Sub-string found` `...\theme.json.bak.73a153090c694855...` (the error came from the backup copy) | Pass: the error names `theme.json` (the swap), previous file kept |
+| **L3** waits on permanent errors | `L3_a_save_over_a_read_only_file_fails_at_once` | **Fail**: `took 428 ms` (the whole budget) | Pass: fails at once, old file kept |
+| **L4** a handle with full sharing blocks the swap | `L4_a_settings_save_succeeds_while_another_program_holds_the_file_with_full_sharing` | **Fail**: `Assert.True() Failure` (save returned false) | Pass |
+| | `L4_a_theme_save_succeeds_while_another_program_holds_the_file_with_full_sharing` | **Fail**: `UnauthorizedAccessException: Access to the path is denied.` at `FileSystem.MoveFile` | Pass: saved, `.bak` holds the previous version |
+| **L4** a blocked settings save is dropped silently | `L4_a_settings_save_that_cannot_happen_is_reported_not_dropped` (holder without `FILE_SHARE_DELETE`) | **Fail**: `Assert.Contains() Failure: Filter not matched in collection` `Collection: []` (nothing logged) | Pass: false, logged with the path, file unchanged |
+| **L5** temp files from a crash stay | `L5_a_save_removes_old_temporary_files_left_by_a_crash_and_nothing_else` | **Fail**: `Collections differ`: both two-hour-old temp files still there | Pass: the two stale ones are gone; a fresh one, `theme.json.notes.tmp` and another file's temp are kept |
+| | `L5_reading_settings_removes_old_temporary_files_left_by_a_crash` | **Fail**: `Expected: ["settings.json"]` / `Actual: ["settings.json", "settings.json.d42c...tmp"]` | Pass |
+| **L6** caller not told about corrupt settings | `L6_a_corrupt_settings_file_is_reported_to_the_caller_with_where_it_was_kept` | **Fail**: `Expected: Corrupt` / `Actual: Loaded` | Pass: `State = Corrupt`, `KeptAs` exists, `Problem` names it (shown in the editor's status bar) |
+| **L7** `.bak` never read | `L7_a_damaged_theme_file_falls_back_to_the_backup_and_says_so` | **Fail**: `JsonException: Expected end of string, but instead reached end of data. Path: $.Name` | Pass: the backup's theme, `BaseFolder` = the theme folder, `FromBackup`, a message, logged |
+| N2 wrong content | `N2_valid_json_that_is_not_settings_is_kept_aside_as_wrong_content_without_waiting` x4 (`"Brightness": "high"`, `null`, an array, a string) | **Fail** x4: `Expected: WrongContent` / `Actual: Loaded` | Pass x4: kept aside, logged as "not Glance settings", no wait |
+| N4 corrupt copies unbounded | `N4_only_the_newest_five_corrupt_settings_copies_are_kept` | **Fail**: `Expected: 5` / `Actual: 7` | Pass |
+| N4 log unbounded | `N4_the_log_is_started_afresh_when_it_gets_too_big` | **Fail**: `Assert.True() Failure` (the log kept growing) | Pass: rolled to `.old`, new log small |
+| N6 `IsBusy` too broad | `N6_a_read_does_not_wait_on_errors_that_are_not_sharing_or_lock_violations` (disk full, path too long, access denied) | **Fail**: `took 1286 ms` (three budgets) | Pass: all three fail at once |
+
+Guards added with the same commit, passing before and after: `N6_a_read_still_waits_out_a_sharing_violation`,
+`L7_a_damaged_theme_file_without_a_backup_still_reports_the_error`, `L7_a_good_theme_file_is_read_as_it_is`, and the
+test gap below.
+
+**Test gap: a theme reader during saves.** `A_theme_reader_during_many_saves_never_sees_the_file_missing_or_partial`:
+200 `Theme.Save` calls while another thread reads the way the runner does (`ThemeFile.Load`) every 2 ms. It asserts
+that no read fails, none falls back to the backup and every read is a whole theme, that no save fails, and that only
+`theme.json` and `theme.json.bak` are left. It passes before and after, so it is a guard, not a bug proof. Two things
+found while writing it, both recorded in the test:
+- a raw `Theme.Load` (`File.ReadAllText`) sometimes gets a **sharing violation** during the swap (the rename opens the
+  old file exclusively for an instant). That is neither missing nor partial, and it is what `ReadWithRetry` exists for;
+- a reader that re-opens the file with no pause at all can **starve the rename** past the budget (with 400 ms in
+  tests). The runner reads once per change, so the test pauses 2 ms between reads.
+
+### Findings without a unit test
+
+| Finding | What changed | How it was checked |
+|---|---|---|
+| **M1** (editor side) | `MainWindow` reads with `AppSettings.Read()`; `_settings` is the result's settings (a stand-in when unreadable). When the window opens, the status bar shows `SettingsRead.Problem` (unreadable or damaged settings) and/or the theme-from-backup message. After a theme save or an AIDA import, a settings save that failed adds a note ("Settings were not saved: they could not be read when Glance started ..." or "... see glance.log"). | The rule itself is in Core and tested (M1 above). The editor was built, not run. |
+| **L1** runner never retries | `RunnerContext` reads with `AppSettings.Read(Log)` in the constructor and on every reload. `Unreadable` sets `_rereadSettingsAt` = now + 10 s; the 2 s supervisor timer then calls `Reload()`, which keeps the settings it has until a read succeeds. | Read and built; the runner has no tests and was not started. The Core part ("unreadable" is reported, not turned into the defaults) is covered by `Settings_that_stay_unreadable_...` and the M1 test. |
+| **L3** (runner) waits under `_gate` | `Reload` reads settings and the theme before `lock (_gate)` and only assigns them inside it. `Reload` runs on the UI thread only, which is also the only writer of `_settings`. | Read and built. |
+| **L3** (editor) waits on the UI thread | Not moved. `Theme.Save` changes the open theme's widget paths at its end, which must happen on the UI thread (the property panel and the pusher read them), so a `Task.Run` would need the save split in two. With N6 the wait now only happens while another program really holds the file (up to one second), and read-only or other permanent errors fail at once. | The L3 test above. |
+| **L4** (POSIX rename) | `AtomicFile` creates the temp file with `GENERIC_WRITE | DELETE`, writes and flushes it, then renames it through the same handle with `SetFileInformationByHandle(FileRenameInfoEx, POSIX_SEMANTICS | REPLACE_IF_EXISTS)`; falls back to `MoveFileEx(REPLACE_EXISTING | WRITE_THROUGH)` on `ERROR_INVALID_PARAMETER`/`ERROR_NOT_SUPPORTED`/`ERROR_INVALID_FUNCTION`. | The two L4 "succeeds" tests pass only with the POSIX rename (mutation below). With POSIX forced off, every other test still passes, so the fallback works too. A handle **without** `FILE_SHARE_DELETE` still blocks the rename; that case is reported (third L4 test). |
+| **N5** rename durability | POSIX path: the handle is flushed again after the rename; fallback: `MOVEFILE_WRITE_THROUGH`. The design note no longer says more than that. | Cannot be tested without a power cut. |
+| **N1** unused variable | `text` in the old `TryLoad` is gone (the reading code was rewritten). | Build. |
+| **N8** design note | `docs/design/fix-atomic-saves.md`, section "The fix", rewritten for the code as it now is, including the watcher events (`Renamed`; with the fallback also `Deleted` first). | — |
+| **N9** test time | `AtomicFile.RetryBudget` is an internal settable property; `TestTiming` sets 400 ms for the test assembly by a module initializer, and the brief/long locks in the tests are 100 ms / 1.5 s. | Suite: 13.1 s before, 9-10 s after (about 8 s on `main`). Each atomic-save test now takes at most about 0.45 s; the slowest tests in the suite are the display and power tests (2-3 s each). |
+
+**Mutation checks** (applied to a working copy, filtered tests run, files restored and verified unchanged by `git diff`):
+
+| Mutation | Caught by |
+|---|---|
+| POSIX rename disabled (always use the `MoveFileEx` fallback) | both L4 "succeeds while another program holds the file" tests; the other 58 atomic-save and theme tests still pass |
+| Stand-in guard in `AppSettings.Save(path)` removed | `M1_settings_that_could_not_be_read_are_never_saved_over` |
+
+### Not changed
+
+- **L7, the choice:** the backup is **used**, not dropped. `ThemeFile.Load` falls back to `theme.json.bak` when
+  `theme.json` does not parse; nothing on disk changes. The runner shows the backup and logs it; the editor opens it,
+  keeps the real `theme.json` path, and the status bar says the backup is shown and that saving repairs `theme.json`.
+  This is an automatic open with a message rather than a yes/no question: the editor has no generic confirmation
+  dialog, and opening the backup changes nothing until the user saves. After that save, the damaged file becomes the
+  new `.bak`.
+- **N3** (race in `KeepAside`) and **N7** (a read-only `.bak` silently goes stale): not asked for in this round; left as they are.
+- **xUnit1031** warnings (`Task.Wait` in tests): the tests wait on helper threads on purpose; left as they are.
+- Not verified: the editor and the runner were not started; nothing was tried with a real crash, a power cut, or a
+  FAT/network target (only the `MoveFileEx` fallback path was exercised, by the mutation, on NTFS).
