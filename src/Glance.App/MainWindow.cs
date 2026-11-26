@@ -800,11 +800,12 @@ public sealed class MainWindow : Window
         }
         try
         {
-            _theme.Save(path);
-            _undo.Rebase(_theme.ToSnapshot());   // saving rewrites image paths; that is not an undo step
+            var moved = _theme.Save(path);
+            _undo.AfterSave(_theme.ToSnapshot(), moved);   // a plain save is not an undo step; a move to another folder clears the history
+            UpdateUndoButtons();
             _themePath = path; _settings.LastTheme = path; _settings.Save();
             _renderer.ClearImageCache();
-            _status.Text = "Saved " + path;
+            _status.Text = "Saved " + path + (moved ? " (undo history cleared: the theme now lives in a new folder)" : "");
         }
         catch (Exception ex) { _status.Text = "Save failed: " + ex.Message; }
     }
