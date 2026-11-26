@@ -62,7 +62,8 @@ internal sealed class RemoteFrameDisplay : IFrameDisplay
 
     private static NamedPipeClientStream OpenVerified(string pipeName, IEnumerable<SecurityIdentifier>? trustedOwners, int connectTimeoutMs)
     {
-        var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+        // Anonymous: the server can never act as this user (ImpersonateNamedPipeClient), even if it is a squatter
+        var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous, TokenImpersonationLevel.Anonymous);
         try
         {
             pipe.Connect(connectTimeoutMs);              // TimeoutException when no service pipe exists

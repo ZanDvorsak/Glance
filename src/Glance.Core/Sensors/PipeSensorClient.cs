@@ -44,7 +44,7 @@ public sealed class PipeSensorClient : ISensorSource, IDisposable
         {
             try
             {
-                using var pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.In);
+                using var pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.In, PipeOptions.None, System.Security.Principal.TokenImpersonationLevel.Anonymous);   // the server can never act as this user
                 await pipe.ConnectAsync(1000, _cts.Token);
                 Glance.Core.Service.PipeServerCheck.Verify(pipe, _trustedOwners);   // fake values from a squatter are never shown
                 using var reader = new StreamReader(pipe);

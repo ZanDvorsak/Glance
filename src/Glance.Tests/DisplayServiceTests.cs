@@ -347,10 +347,47 @@ public sealed class DisplayServiceTests : IDisposable
     {
         using var server = new NamedPipeServerStream(_pipe, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
         var wait = server.WaitForConnectionAsync();
-        using var client = new NamedPipeClientStream(".", _pipe, PipeDirection.InOut);
+        // the way Glance clients connect: anonymous, so the server cannot act as them; the session lookup must still work
+        using var client = new NamedPipeClientStream(".", _pipe, PipeDirection.InOut, PipeOptions.None, TokenImpersonationLevel.Anonymous);
         await client.ConnectAsync(3000);
         await wait;
         Assert.Equal(ThisSession, NativeSessions.ClientSessionOf(server));
+    }
+
+    // ---- a squatter must not be able to act as the connecting user ---------------------------------------------------
+
+    /// <summary>
+    /// Serves one connection as a squatter would: reads what the client sends, then tries to act as the client
+    /// (ImpersonateNamedPipeClient). Returns the account it managed to act as, or null.
+    /// </summary>
+    private async Task<string?> ImpersonateFirstClient(Action connect, int bytesToRead)
+    {
+        using var server = new NamedPipeServerStream(_pipe, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        var accepted = server.WaitForConnectionAsync();
+        var client = Task.Run(() => { try { connect(); } catch { /* the client gives up: no reply */ } });
+        await accepted.WaitAsync(TimeSpan.FromSeconds(5));
+        var buf = new byte[bytesToRead];
+        await server.ReadAsync(buf).AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        string? actedAs = null;
+        try { server.RunAsClient(() => { using var id = WindowsIdentity.GetCurrent(); actedAs = id.User?.Value; }); }
+        catch { actedAs = null; }   // impersonation refused: what we want
+        server.Disconnect();
+        await client.WaitAsync(TimeSpan.FromSeconds(10));
+        return actedAs;
+    }
+
+    [Fact]
+    public async Task A_squatter_on_the_display_pipe_cannot_act_as_the_user()
+    {
+        var actedAs = await ImpersonateFirstClient(() => RemoteFrameDisplay.Connect(_pipe, new[] { Me }, 3000, TimeSpan.FromSeconds(1)), DisplayWire.HeaderBytes);
+        Assert.NotEqual(Me.Value, actedAs);
+    }
+
+    [Fact]
+    public async Task A_squatter_on_the_tray_control_pipe_cannot_act_as_the_user()
+    {
+        var actedAs = await ImpersonateFirstClient(() => Glance.Core.Control.ControlPipeClient.Send(_pipe, Glance.Core.Control.ControlCommand.Status), 3);
+        Assert.NotEqual(Me.Value, actedAs);
     }
 
     // ---- the sensor feed --------------------------------------------------------------------------------------------

@@ -28,8 +28,9 @@ public static class ControlPipeClient
     {
         try
         {
-            // CurrentUserOnly: .NET checks that this user owns the server end, so another account that took the name gets nothing
-            using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.CurrentUserOnly);
+            // CurrentUserOnly: .NET checks that this user owns the server end, so another account that took the name gets nothing.
+            // Anonymous: whoever serves the pipe can never act as this user (ImpersonateNamedPipeClient).
+            using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.CurrentUserOnly, System.Security.Principal.TokenImpersonationLevel.Anonymous);
             pipe.Connect(connectTimeoutMs);
             // No StreamWriter, and the reader leaves the pipe open: disposing a StreamWriter flushes the pipe, which throws once
             // the pipe is closed (by the reader) or broken (by the runner), and the catch below then turned every reply into null.
