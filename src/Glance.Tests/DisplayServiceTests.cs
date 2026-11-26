@@ -13,7 +13,7 @@ namespace Glance.Tests;
 /// test user here, so the tests trust that user as the pipe's owner where the product trusts SYSTEM or Administrators.
 /// Pipe names are random, never the real ones, so a Glance service on this PC is never touched.
 /// </summary>
-public sealed class DisplayServiceTests : IDisposable
+public sealed partial class DisplayServiceTests : IDisposable
 {
     private static readonly SecurityIdentifier Me = WindowsIdentity.GetCurrent().User!;
     private static readonly int ThisSession = Process.GetCurrentProcess().SessionId;
@@ -38,7 +38,7 @@ public sealed class DisplayServiceTests : IDisposable
     private int Opens { get { lock (_devices) return _devices.Count; } }
     private FakeDisplay Device(int i) { lock (_devices) return _devices[i]; }
 
-    private DisplayServer StartServer(TimeSpan? idle = null)
+    private DisplayServer StartServer(TimeSpan? idle = null, TimeSpan? idleTimeout = null)
     {
         var server = new DisplayServer(OpenFake, new DisplayServerOptions
         {
@@ -48,6 +48,7 @@ public sealed class DisplayServiceTests : IDisposable
             ConsoleSession = () => _console,
             NowMs = () => Interlocked.Read(ref _now),
             IdleBlankAfter = idle ?? TimeSpan.FromSeconds(20),
+            IdleTimeout = idleTimeout ?? TimeSpan.FromSeconds(30),
             Log = m => { lock (_log) _log.Add(m); },
         });
         server.Start();

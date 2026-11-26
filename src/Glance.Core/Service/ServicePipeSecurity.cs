@@ -43,6 +43,7 @@ public static class ServicePipeSecurity
     public static PipeSecurity CurrentUserOnly()
     {
         var security = new PipeSecurity();
+        security.AddAccessRule(new PipeAccessRule(Network, PipeAccessRights.FullControl, AccessControlType.Deny));   // L1: no logons from other PCs
         security.AddAccessRule(new PipeAccessRule(WindowsIdentity.GetCurrent().User!, PipeAccessRights.FullControl, AccessControlType.Allow));
         return security;
     }

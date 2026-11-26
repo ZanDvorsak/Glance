@@ -11,18 +11,32 @@ namespace Glance.Core.Service;
 public static class DisplayConnector
 {
     /// <summary>The service first, then USB. Used by <see cref="DisplayPusher"/>'s public constructor.</summary>
-    internal static IFrameDisplay Open() => Open(ServiceNames.DisplayPipe, null, () => Ax206Display.Open());
+    internal static IFrameDisplay Open() => Open(ServiceNames.DisplayPipe, null, () => Ax206Display.Open(), () => ServiceControl.Query());
 
     /// <summary>
-    /// Rules: a service that answers is used. No service pipe, or one that is not served by SYSTEM/Administrators (a squatter):
-    /// open USB directly. A service that refuses (another session is using the display) or fails: throw, never fall back to
-    /// USB, because the service holds the device.
+    /// Rules (review L3):
+    /// <list type="bullet">
+    /// <item>A service that answers is used.</item>
+    /// <item>No answer, or a pipe not served by SYSTEM/Administrators: open USB directly only when the Glance service is not
+    /// installed or is stopped. When Windows says it is running or starting, it is busy or not ready yet: throw, and the caller
+    /// tries again, instead of taking the device away from the service.</item>
+    /// <item>A service that refuses (another session is using the display) or fails: throw, never fall back to USB.</item>
+    /// </list>
     /// </summary>
     internal static IFrameDisplay Open(string pipeName, IEnumerable<SecurityIdentifier>? trustedOwners, Func<IFrameDisplay> usb)
+        => Open(pipeName, trustedOwners, usb, () => ServiceState.NotInstalled);
+
+    internal static IFrameDisplay Open(string pipeName, IEnumerable<SecurityIdentifier>? trustedOwners, Func<IFrameDisplay> usb, Func<ServiceState> serviceState)
     {
+        Exception noAnswer;
         try { return RemoteFrameDisplay.Connect(pipeName, trustedOwners); }
-        catch (TimeoutException) { return usb(); }              // no service pipe: the service is not installed or not running
-        catch (UnauthorizedAccessException) { return usb(); }   // not the service (or not ours to use): never send it frames
+        catch (TimeoutException ex) { noAnswer = ex; }              // no pipe, every instance busy, or the service still starting
+        catch (UnauthorizedAccessException ex) { noAnswer = ex; }    // not the service: never send it frames
+        ServiceState state;
+        try { state = serviceState(); } catch { state = ServiceState.Unknown; }
+        if (state is ServiceState.Running or ServiceState.Starting)
+            throw new DisplayServiceException("The Glance service is running but did not answer yet (" + noAnswer.Message.TrimEnd('.') + "); trying again.", denied: false);
+        return usb();
     }
 
     /// <summary>Whether the Glance service answers on its display pipe (served by SYSTEM or Administrators).</summary>
@@ -40,8 +54,12 @@ public static class DisplayConnector
             remote.BlankOrThrow();
             return null;
         }
-        catch (TimeoutException) { return Ax206Display.TryBlank(); }
-        catch (UnauthorizedAccessException) { return Ax206Display.TryBlank(); }
+        catch (Exception ex) when (ex is TimeoutException or UnauthorizedAccessException)
+        {
+            // only take the device ourselves when no Glance service owns it
+            return ServiceControl.Query() is ServiceState.Running or ServiceState.Starting
+                ? "The Glance service did not answer; try again in a moment." : Ax206Display.TryBlank();
+        }
         catch (Exception ex) { return ex.Message; }
     }
 }

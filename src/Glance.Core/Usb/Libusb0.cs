@@ -1,5 +1,10 @@
 using System.Runtime.InteropServices;
 
+// Review M4: every native library Glance.Core imports by name lives in System32 (libusb0.dll comes with the libusb-win32 driver,
+// kernel32/advapi32/user32 with Windows). Never search the application folder, the current folder or PATH for them; in the
+// service that search runs as SYSTEM.
+[assembly: DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+
 namespace Glance.Core.Usb;
 
 /// <summary>Minimal P/Invoke wrapper over libusb-win32 (libusb0.dll, libusb-0.1 API). x64 only.</summary>

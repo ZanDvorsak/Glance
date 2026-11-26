@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Security.Principal;
 using Glance.Core.Display;
 using Glance.Core.Sensors;
@@ -30,15 +31,24 @@ internal sealed class ServiceRuntime : IServiceBody
     {
         using (var me = WindowsIdentity.GetCurrent()) Log($"Glance service {typeof(ServiceRuntime).Assembly.GetName().Version} starting as {me.Name}");
 
-        // the display pipe first: it is quick, and it should exist before anyone can sign in
+        // L5: the pre-shutdown timeout through the service API (a registry write is only read at the next boot); log what Windows uses
+        if (ServiceControl.SetPreshutdownTimeout(ServiceNames.PreshutdownTimeoutMs) is { } err) Log("Could not set the pre-shutdown timeout: " + err);
+        Log($"Pre-shutdown timeout: {ServiceControl.QueryPreshutdownTimeout()?.ToString() ?? "unknown"} ms");
+
+        var system = WindowsIdentity.GetCurrent().User!;
+
+        // the pipes first: they are quick, and should exist before anyone can sign in (a squatter has less time, L10)
         _display = DisplayServer.ForUsb(new DisplayServerOptions { Log = Log, StatusNote = _logProblem });
         TryServeDisplay();
+        _sensorPipe = new SensorPipeServer(ServiceNames.SensorPipe, ServicePipeSecurity.Build(system), Log);
+        _sensorPipe.Start();   // serves "[]" until the sensors are ready
+
+        // M3: Glance 0.1's logon task would start the tray app elevated; remove it if the installer could not
+        _ = Task.Run(RemoveLegacyTask);
 
         try
         {
             _sensors = new LocalSensorSource();
-            _sensorPipe = new SensorPipeServer(ServiceNames.SensorPipe, ServicePipeSecurity.Build(WindowsIdentity.GetCurrent().User!));
-            _sensorPipe.Start();
             _sensorPipe.Publish(_sensors.HardwareSnapshot);
             _sensors.Updated += () => _sensorPipe.Publish(_sensors.HardwareSnapshot);
             Log($"Sensors ready ({_sensors.HardwareSnapshot.Count})");
@@ -48,12 +58,33 @@ internal sealed class ServiceRuntime : IServiceBody
         _tick = new Timer(_ => OnTick(), null, 2000, 2000);
     }
 
+    private void RemoveLegacyTask()
+    {
+        try
+        {
+            if (RunHidden(LegacyTask.QueryStartInfo()) != 0) return;   // not there
+            int code = RunHidden(LegacyTask.ServiceDeleteStartInfo());
+            Log(code == 0 ? $"Removed Glance 0.1's \"{LegacyTask.Name}\" sign-in task (it would start the tray app with administrator rights)"
+                          : $"Could not remove Glance 0.1's \"{LegacyTask.Name}\" sign-in task (schtasks exit code {code})");
+        }
+        catch (Exception ex) { Log("Checking for Glance 0.1's sign-in task failed: " + ex.Message); }
+    }
+
+    private static int RunHidden(ProcessStartInfo psi)
+    {
+        using var p = Process.Start(psi)!;
+        var drain = Task.WhenAll(p.StandardOutput.ReadToEndAsync(), p.StandardError.ReadToEndAsync());
+        if (!p.WaitForExit(15000)) { try { p.Kill(); } catch { } return -1; }
+        drain.Wait(2000);
+        return p.ExitCode;
+    }
+
     /// <summary>Creates the display pipe. If another program holds the name (squatting while the service was stopped), retry later.</summary>
     private void TryServeDisplay()
     {
         if (_displayServing || _display is null) return;
         try { _display.Start(); _displayServing = true; Log("Display pipe ready"); }
-        catch (Exception ex) { Log($"The display pipe {ServiceNames.DisplayPipe} could not be created (another program may hold the name): {ex.Message}"); }
+        catch (Exception ex) { Log($"The display pipe {ServiceNames.DisplayPipe} could not be created: {ex.Message}"); }
     }
 
     private void OnTick()

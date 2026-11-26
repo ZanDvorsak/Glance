@@ -19,7 +19,13 @@ public sealed class DisplayServerOptions
     public TimeSpan IdleBlankAfter { get; init; } = TimeSpan.FromSeconds(20);
     public Func<long> NowMs { get; init; } = () => Environment.TickCount64;
     /// <summary>How many clients may be connected at once (tray, editor, status queries).</summary>
-    public int MaxConnections { get; init; } = 8;
+    public int MaxConnections { get; init; } = 16;
+    /// <summary>At most this many connections from one Windows session at a time.</summary>
+    public int PerSessionLimit { get; init; } = 4;
+    /// <summary>A connection that sends no complete request for this long is closed.</summary>
+    public TimeSpan IdleTimeout { get; init; } = TimeSpan.FromSeconds(30);
+    /// <summary>Whether a client came over the network (SMB), even through \localhost.</summary>
+    public Func<NamedPipeServerStream, bool> IsRemote { get; init; } = NativeSessions.IsRemoteClient;
     /// <summary>Added to <see cref="DisplayServer.StatusText"/>, for example why the service log is not written.</summary>
     public string? StatusNote { get; init; }
 }
@@ -60,34 +66,48 @@ public sealed class DisplayServer : IDisposable
     /// <summary>The session whose frames are on the display, or null.</summary>
     public int? DrivingSession { get { lock (_gate) return _driving; } }
 
-    /// <summary>One line for the editor's Background service window and the tray.</summary>
-    public string StatusText
+    /// <summary>One line for the editor's Background service window and the tray, as seen by the person at the console.</summary>
+    public string StatusText => StatusFor(_o.ConsoleSession());
+
+    /// <summary>
+    /// The status as <paramref name="session"/> may see it. Other users only learn whether the display is in use and whether
+    /// Windows is asleep; which session draws, the brightness and USB errors are for the person at the console (review N5).
+    /// </summary>
+    private string StatusFor(int? session)
     {
-        get
-        {
-            string power = Power.Ended ? "stopping" : Power.Suspended ? "Windows is asleep" : "awake";
-            int? driving; string? error; int brightness; bool open;
-            lock (_gate) { driving = _driving; error = _lastError; brightness = _brightness; open = _device is not null; }
-            var display = open ? $"showing session {driving}" : "display released";
-            return $"{display}; brightness {brightness}; {power}" + (error is null ? "" : "; last error: " + error) + (_o.StatusNote is { } note ? "; " + note : "");
-        }
+        string power = Power.Ended ? "stopping" : Power.Suspended ? "Windows is asleep" : "awake";
+        int? driving; string? error; int brightness; bool open;
+        lock (_gate) { driving = _driving; error = _lastError; brightness = _brightness; open = _device is not null; }
+        if (session is null || session != _o.ConsoleSession()) return (open ? "display in use" : "display released") + "; " + power;
+        var display = open ? $"showing session {driving}" : "display released";
+        return $"{display}; brightness {brightness}; {power}" + (error is null ? "" : "; last error: " + error) + (_o.StatusNote is { } note ? "; " + note : "");
     }
 
     /// <summary>
-    /// Creates the first pipe instance now (so a squatted name is noticed at once) and starts accepting clients.
+    /// Creates the first pipe instance now, with the first-instance flag, so a name another program took is refused at once
+    /// (review M1), and starts accepting clients.
     /// </summary>
-    /// <exception cref="UnauthorizedAccessException">Another process already owns the pipe name.</exception>
+    /// <exception cref="PipeNameTakenException">Another program serves the pipe name.</exception>
     public void Start()
     {
         _firstInstance = CreateInstance();
         _ = Task.Run(AcceptLoop);
     }
 
+    private int _instances;   // our live pipe instances (waiting or connected); 0 means the name may have been lost
+
     private NamedPipeServerStream CreateInstance()
     {
         var security = _o.Security ?? ServicePipeSecurity.Build(WindowsIdentity.GetCurrent().User!);
-        return NamedPipeServerStreamAcl.Create(_o.PipeName, PipeDirection.InOut, _o.MaxConnections, PipeTransmissionMode.Byte,
-            PipeOptions.Asynchronous, 0, 0, security);
+        var server = ServicePipeFactory.Create(_o.PipeName, PipeDirection.InOut, _o.MaxConnections, security, first: Volatile.Read(ref _instances) == 0);
+        Interlocked.Increment(ref _instances);
+        return server;
+    }
+
+    private void Release(NamedPipeServerStream pipe)
+    {
+        try { pipe.Dispose(); } catch { /* best effort */ }
+        Interlocked.Decrement(ref _instances);
     }
 
     private async Task AcceptLoop()
@@ -104,30 +124,48 @@ public sealed class DisplayServer : IDisposable
                 next = null;
                 _ = Task.Run(() => Serve(connected, token));
             }
-            catch (OperationCanceledException) { next?.Dispose(); return; }
+            catch (OperationCanceledException) { if (next is not null) Release(next); return; }
             catch (Exception ex)
             {
-                next?.Dispose(); next = null;
+                if (next is not null) { Release(next); next = null; }
                 Log("Display pipe error: " + ex.Message);
                 try { await Task.Delay(1000, token); } catch (OperationCanceledException) { return; }
             }
         }
-        next?.Dispose();
+        if (next is not null) Release(next);
     }
+
+    private readonly Dictionary<int, int> _perSession = new();
 
     private async Task Serve(NamedPipeServerStream pipe, CancellationToken token)
     {
+        int? counted = null;
         try
         {
+            // a client over the network path (SMB, also \localhost) gets a made-up session id from Windows: refuse it outright (L1)
+            if (_o.IsRemote(pipe)) { Log("Refused a display client that came over the network"); return; }
             int? session = _o.ClientSession(pipe);
+            int key = session ?? -1;
+            lock (_perSession)
+            {
+                _perSession.TryGetValue(key, out var n);
+                if (n >= _o.PerSessionLimit) { Log($"Session {key} has too many display connections open; closed one"); return; }   // M2
+                _perSession[key] = n + 1;
+                counted = key;
+            }
             while (!token.IsCancellationRequested)
             {
                 DisplayRequest? request;
-                try { request = await DisplayWire.ReadRequestAsync(pipe, token); }
-                catch (InvalidDataException ex)
+                using (var idle = CancellationTokenSource.CreateLinkedTokenSource(token))
                 {
-                    await pipe.WriteAsync(DisplayWire.EncodeReply(ReplyStatus.Error, "Bad request: " + ex.Message), token);
-                    return;   // the stream is out of step now: close it
+                    idle.CancelAfter(_o.IdleTimeout);   // M2: a connection that says nothing gives its pipe instance back
+                    try { request = await DisplayWire.ReadRequestAsync(pipe, idle.Token); }
+                    catch (OperationCanceledException) when (!token.IsCancellationRequested) { return; }
+                    catch (InvalidDataException ex)
+                    {
+                        await pipe.WriteAsync(DisplayWire.EncodeReply(ReplyStatus.Error, "Bad request: " + ex.Message), token);
+                        return;   // the stream is out of step now: close it
+                    }
                 }
                 if (request is null) return;
                 var (status, message) = Execute(request, session);
@@ -136,7 +174,11 @@ public sealed class DisplayServer : IDisposable
             }
         }
         catch { /* the client left or the service is stopping */ }
-        finally { pipe.Dispose(); }
+        finally
+        {
+            if (counted is { } k) lock (_perSession) { if (_perSession.TryGetValue(k, out var n)) { if (n <= 1) _perSession.Remove(k); else _perSession[k] = n - 1; } }
+            Release(pipe);
+        }
     }
 
     private (ReplyStatus, string) Execute(DisplayRequest request, int? session)
@@ -145,7 +187,7 @@ public sealed class DisplayServer : IDisposable
         switch (request.Op)
         {
             case DisplayOp.Status:
-                return (ReplyStatus.Ok, StatusText);
+                return (ReplyStatus.Ok, StatusFor(session));
 
             case DisplayOp.Hello:
                 int version = BinaryPrimitives.ReadInt32LittleEndian(request.Payload);
@@ -189,8 +231,19 @@ public sealed class DisplayServer : IDisposable
                         }
                         catch (Exception ex) { _lastError = ex.Message; return (ReplyStatus.Error, ex.Message); }
                     }
+                    Exception? failed = null;
                     try { _device!.Blit(0, 0, DisplayWire.FrameWidth, DisplayWire.FrameHeight, request.Payload); }
-                    catch (Exception ex) { return Failed(ex); }
+                    catch (Exception ex) { failed = ex; }
+                    // L2: a sleep or shutdown that came during this transfer could not take the device; blank it now, still within
+                    // its budget, instead of leaving the owed blank to a tick that never comes before Windows sleeps
+                    if (!Power.MayDrive)
+                    {
+                        _blankOwed = false;
+                        CloseLocked(blank: failed is null);
+                        Log("Blanked the display right after the transfer that held it (Windows is sleeping or shutting down)");
+                        return (ReplyStatus.Error, Power.Ended ? "The display is off: Windows is shutting down." : "The display is off while Windows sleeps.");
+                    }
+                    if (failed is not null) return Failed(failed);
                     _lastFrameMs = _o.NowMs();
                     _driving = session;
                     _lastError = null;
@@ -293,5 +346,11 @@ public sealed class DisplayServer : IDisposable
         }
     }
 
-    private void Log(string message) { try { _o.Log?.Invoke(message); } catch { /* never */ } }
+    private readonly LogLimiter _logLimiter = new(TimeSpan.FromMinutes(1));
+
+    /// <summary>Repeated lines (a busy pipe, a client reconnecting in a loop) are written once a minute with a count (M2).</summary>
+    private void Log(string message)
+    {
+        try { if (_logLimiter.Filter(message) is { } line) _o.Log?.Invoke(line); } catch { /* never */ }
+    }
 }

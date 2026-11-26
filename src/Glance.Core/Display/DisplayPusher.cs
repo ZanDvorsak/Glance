@@ -50,6 +50,9 @@ public sealed class DisplayPusher : IDisposable
     /// </summary>
     public static readonly TimeSpan QuickStopTimeout = TimeSpan.FromSeconds(2);
 
+    /// <summary>True when the frames go to the Glance service, false when this process drives the USB display itself.</summary>
+    public bool ViaService => _lcd is Service.RemoteFrameDisplay;
+
     /// <summary>Frames actually sent to the display per second (frames that were identical to the last one are skipped).</summary>
     public double Fps { get; private set; }
 

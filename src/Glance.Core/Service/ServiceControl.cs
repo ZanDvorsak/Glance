@@ -65,6 +65,45 @@ public static class ServiceControl
         finally { CloseServiceHandle(scm); }
     }
 
+    /// <summary>The pre-shutdown timeout Windows uses for a service (ms), or null when it cannot be read.</summary>
+    public static int? QueryPreshutdownTimeout(string name = ServiceNames.ServiceName)
+    {
+        if (!OperatingSystem.IsWindows()) return null;
+        int? result = null;
+        WithService(name, ServiceNames.ServiceQueryConfig, svc =>
+        {
+            if (QueryServiceConfig2W(svc, ServiceConfigPreshutdownInfo, out var info, Marshal.SizeOf<PreshutdownInfo>(), out _)) result = info.Timeout;
+            return null;
+        });
+        return result;
+    }
+
+    /// <summary>Sets the pre-shutdown timeout (the service itself, as SYSTEM). Returns an error message or null.</summary>
+    public static string? SetPreshutdownTimeout(int milliseconds, string name = ServiceNames.ServiceName)
+    {
+        if (!OperatingSystem.IsWindows()) return "Windows only.";
+        return WithService(name, ServiceChangeConfig | ServiceNames.ServiceQueryConfig, svc =>
+        {
+            var info = new PreshutdownInfo { Timeout = milliseconds };
+            return ChangeServiceConfig2W(svc, ServiceConfigPreshutdownInfo, ref info) ? null : $"error {Marshal.GetLastWin32Error()}";
+        }) ?? null;
+    }
+
+    /// <summary>Opens a service and runs <paramref name="action"/>; returns its result, or an error message if it cannot be opened.</summary>
+    private static string? WithService(string name, int access, Func<IntPtr, string?> action)
+    {
+        var scm = OpenSCManagerW(null, null, ScManagerConnect);
+        if (scm == IntPtr.Zero) return $"error {Marshal.GetLastWin32Error()} opening the service manager";
+        try
+        {
+            var svc = OpenServiceW(scm, name, access);
+            if (svc == IntPtr.Zero) return $"error {Marshal.GetLastWin32Error()} opening {name}";
+            try { return action(svc); }
+            finally { CloseServiceHandle(svc); }
+        }
+        finally { CloseServiceHandle(scm); }
+    }
+
     /// <summary>"sc.exe stop GlanceService" from System32, through the UAC prompt.</summary>
     public static ProcessStartInfo StopElevatedStartInfo(string name = ServiceNames.ServiceName) =>
         new(Path.Combine(Environment.SystemDirectory, "sc.exe"), "stop " + name)
@@ -73,7 +112,18 @@ public static class ServiceControl
             WorkingDirectory = Environment.SystemDirectory,
         };
 
-    private const int ScManagerConnect = 0x1;
+    private const int ScManagerConnect = 0x1, ServiceChangeConfig = 0x2, ServiceConfigPreshutdownInfo = 7;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PreshutdownInfo { public int Timeout; }
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+    private static extern bool ChangeServiceConfig2W(IntPtr service, int infoLevel, ref PreshutdownInfo info);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+    private static extern bool QueryServiceConfig2W(IntPtr service, int infoLevel, out PreshutdownInfo info, int bufferSize, out int needed);
     private const int ErrorAccessDenied = 5, ErrorServiceAlreadyRunning = 1056, ErrorServiceDoesNotExist = 1060;
 
     [StructLayout(LayoutKind.Sequential)]

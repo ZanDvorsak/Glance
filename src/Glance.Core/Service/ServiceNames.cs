@@ -27,15 +27,29 @@ public static class ServiceNames
     public const string LegacyRunnerPipe = "Glance.Runner.Control";
 
     /// <summary>
-    /// The tray's control pipe for the editor in the same Windows session. Per session, so two signed-in users do not collide;
-    /// clients connect with <c>PipeOptions.CurrentUserOnly</c>, so a squatter from another account gets no connection.
+    /// The tray's control pipe for the editor of the same user in the same Windows session. Per session and per user, so two
+    /// signed-in users never collide and a reused session id never reaches an older user's pipe. The server claims it with the
+    /// first-instance flag and clients connect with <c>PipeOptions.CurrentUserOnly</c>, so a squatter is refused on both sides (L8).
     /// </summary>
-    public static string TrayControlPipe(int sessionId) => LegacyRunnerPipe + "." + sessionId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    public static string TrayControlPipe(int sessionId, string userSid) =>
+        LegacyRunnerPipe + "." + sessionId.ToString(System.Globalization.CultureInfo.InvariantCulture) + "." + userSid;
 
-    /// <summary>The tray control pipe of the session this process runs in.</summary>
-    public static string TrayControlPipeForThisSession() => TrayControlPipe(System.Diagnostics.Process.GetCurrentProcess().SessionId);
+    /// <summary>The tray control pipe of this process's session and user.</summary>
+    public static string TrayControlPipeForThisSession()
+    {
+        using var me = WindowsIdentity.GetCurrent();
+        return TrayControlPipe(System.Diagnostics.Process.GetCurrentProcess().SessionId, me.User!.Value);
+    }
 
-    /// <summary>How long Windows waits for the service at shutdown before it moves on (written by the installer).</summary>
+    /// <summary>
+    /// The only privileges the service keeps (<c>sc.exe privs</c>, separated by slashes; review L7). LocalSystem otherwise holds
+    /// every privilege, which would turn any bug in the service into a takeover of the PC. Change notification is needed by
+    /// every process; global objects by the pipes and the sensor library. If CPU or motherboard sensors stop working after
+    /// install, the sensor library needs one more (see the manual test plan); add it here and in the installer.
+    /// </summary>
+    public const string RequiredPrivileges = "SeChangeNotifyPrivilege/SeCreateGlobalPrivilege";
+
+    /// <summary>How long Windows waits for the service at shutdown before it moves on (the service sets it at start, L5).</summary>
     public const int PreshutdownTimeoutMs = 5000;
 
     /// <summary>

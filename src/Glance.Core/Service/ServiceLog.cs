@@ -12,16 +12,25 @@ namespace Glance.Core.Service;
 /// </summary>
 public sealed class ServiceLog
 {
-    private readonly string _file;
+    private readonly string _file, _old;
+    private readonly long _maxBytes;
     private readonly object _lock = new();
 
     public static string DefaultFolder =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Glance");
 
     /// <param name="checkFolder">The trust check; <see cref="FolderTrust.CheckFolder"/> in production.</param>
-    public ServiceLog(string folder, Func<string, TrustVerdict> checkFolder)
+    /// <summary>Above this size the log moves to service.old.log and starts again.</summary>
+    public const long DefaultMaxBytes = 1024 * 1024;
+
+    /// <summary>Only the service itself (SYSTEM) or a developer's elevated console opens the log; anyone else would create the folder as themselves.</summary>
+    public static bool ShouldOpen(bool isSystem, bool elevatedConsole) => isSystem || elevatedConsole;
+
+    public ServiceLog(string folder, Func<string, TrustVerdict> checkFolder, long maxBytes = DefaultMaxBytes)
     {
         _file = Path.Combine(folder, "service.log");
+        _old = Path.Combine(folder, "service.old.log");
+        _maxBytes = maxBytes;
         TrustVerdict verdict;
         try { verdict = checkFolder(folder); }
         catch (Exception ex) { verdict = TrustVerdict.No("its permissions could not be read: " + ex.Message); }
@@ -59,7 +68,17 @@ public sealed class ServiceLog
     public void Write(string message)
     {
         if (DisabledReason is not null) return;
-        try { lock (_lock) File.AppendAllText(_file, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  {message}{Environment.NewLine}"); }
+        try
+        {
+            lock (_lock)
+            {
+                var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  {message}{Environment.NewLine}";
+                // M2: never grow without limit; keep the previous part as service.old.log
+                var info = new FileInfo(_file);
+                if (info.Exists && info.Length + line.Length > _maxBytes) File.Move(_file, _old, overwrite: true);
+                File.AppendAllText(_file, line);
+            }
+        }
         catch { /* logging must never break the service */ }
     }
 }

@@ -59,8 +59,7 @@ public class ServiceLayoutTests
         Assert.Contains("start= auto", iss);
         Assert.Contains("sdset " + ServiceNames.ServiceName + " " + ServiceNames.ServiceSddl, iss);
         Assert.Contains("failure " + ServiceNames.ServiceName, iss);
-        Assert.Contains("PreshutdownTimeout", iss);
-        Assert.Contains(ServiceNames.PreshutdownTimeoutMs.ToString(), iss);
+        // the pre-shutdown timeout is set by the service through the service API (review L5), not written by the installer
         Assert.Contains("start " + ServiceNames.ServiceName, iss);
         Assert.Contains("delete " + ServiceNames.ServiceName, iss);
     }

@@ -285,7 +285,9 @@ internal sealed class RunnerContext : ApplicationContext
         {
             try
             {
-                _serviceText = DisplayConnector.ServiceStatus() is { } s ? "running, " + s
+                var status = DisplayConnector.ServiceStatus();
+                if (status is not null) _ui.BeginInvoke(MoveToServiceIfOnUsb);
+                _serviceText = status is { } s ? "running, " + s
                     : ServiceControl.Query() switch
                     {
                         ServiceState.NotInstalled => "not installed (basic sensors, display over USB)",
@@ -300,6 +302,21 @@ internal sealed class RunnerContext : ApplicationContext
     }
 
     private static string Trim(string text) => text.Length > 90 ? text[..90] + "..." : text;
+
+    /// <summary>
+    /// L3: the display was opened over USB because the service was not there yet (portable use, or the service started later).
+    /// Once the service answers, hand the device to it, so shutdown blanking and AIDA64's release work as designed.
+    /// </summary>
+    private void MoveToServiceIfOnUsb()
+    {
+        lock (_gate)
+        {
+            if (_pusher is null || _pusher.ViaService) return;
+            Log("The Glance service is running now; handing the display to it");
+            DisposePusher(blank: false);
+        }
+        Supervise();
+    }
 
     /// <summary>The user asked for the display (Resume, Reload): that also clears a sleep state Windows never ended.</summary>
     private void ClearStaleSleep()
@@ -323,28 +340,49 @@ internal sealed class RunnerContext : ApplicationContext
 
     // ---- control pipe (from the editor) -------------------------------------------------------------------------
 
+    private int _controlInstances;   // live instances of our control pipe; 0 means the name must be claimed (first instance) again
+    private readonly LogLimiter _controlLog = new(TimeSpan.FromMinutes(1));
+
     private async Task ControlLoop()
     {
-        var security = ServicePipeSecurity.CurrentUserOnly();   // the editor runs as the same user; nobody else may connect
+        var security = ServicePipeSecurity.CurrentUserOnly();   // the editor runs as the same user; nobody else (and no network logon) may connect
         while (!_cts.IsCancellationRequested)
         {
+            NamedPipeServerStream? server = null;
             try
             {
-                var server = NamedPipeServerStreamAcl.Create(ControlPipeName, PipeDirection.InOut, 4, PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 0, 0, security);
+                // L8: claim the name with the first-instance flag, so another user who took it first is refused, not joined
+                server = ServicePipeFactory.Create(ControlPipeName, PipeDirection.InOut, 4, security, first: Volatile.Read(ref _controlInstances) == 0);
+                Interlocked.Increment(ref _controlInstances);
                 await server.WaitForConnectionAsync(_cts.Token);
-                _ = Task.Run(() => Handle(server));
+                var connected = server;
+                server = null;
+                _ = Task.Run(() => Handle(connected));
             }
-            catch (OperationCanceledException) { return; }
-            catch (Exception ex) { Log("Control pipe error: " + ex.Message); try { await Task.Delay(1000, _cts.Token); } catch { return; } }
+            catch (OperationCanceledException) { ReleaseControl(server); return; }
+            catch (Exception ex)
+            {
+                ReleaseControl(server);
+                if (_controlLog.Filter("Control pipe error: " + ex.Message) is { } line) Log(line);   // not once a second for ever
+                try { await Task.Delay(2000, _cts.Token); } catch { return; }
+            }
         }
+    }
+
+    private void ReleaseControl(NamedPipeServerStream? pipe)
+    {
+        if (pipe is null) return;
+        try { pipe.Dispose(); } catch { /* best effort */ }
+        Interlocked.Decrement(ref _controlInstances);
     }
 
     private async Task Handle(NamedPipeServerStream pipe)
     {
         try
         {
-            using var reader = new StreamReader(pipe, Encoding.UTF8);
-            using var writer = new StreamWriter(pipe, new UTF8Encoding(false)) { AutoFlush = true };
+            if (NativeSessions.IsRemoteClient(pipe)) return;   // L1: never from another PC, not even through \localhost
+            using var reader = new StreamReader(pipe, Encoding.UTF8, false, 1024, leaveOpen: true);
+            using var writer = new StreamWriter(pipe, new UTF8Encoding(false), 1024, leaveOpen: true) { AutoFlush = true };
             while (await reader.ReadLineAsync(_cts.Token) is { } line)
             {
                 string reply;
@@ -353,7 +391,7 @@ internal sealed class RunnerContext : ApplicationContext
             }
         }
         catch { /* client left */ }
-        finally { pipe.Dispose(); }
+        finally { ReleaseControl(pipe); }
     }
 
     private string Execute(string line)
@@ -402,19 +440,8 @@ internal sealed class RunnerContext : ApplicationContext
         Process.Start(new ProcessStartInfo(exe) { UseShellExecute = true, WorkingDirectory = Path.GetDirectoryName(exe)! });   // same (normal) rights as this app
     }
 
-    private static string? FindEditor()
-    {
-        const string exe = "Glance.App.exe";
-        var dir = AppContext.BaseDirectory;
-        if (File.Exists(Path.Combine(dir, exe))) return Path.Combine(dir, exe);
-        for (var d = dir; d is not null; d = Path.GetDirectoryName(d))
-        {
-            var proj = Path.Combine(d, "Glance.App", "bin");
-            if (!Directory.Exists(proj)) continue;
-            return Directory.EnumerateFiles(proj, exe, SearchOption.AllDirectories).OrderByDescending(File.GetLastWriteTimeUtc).FirstOrDefault();
-        }
-        return null;
-    }
+    /// <summary>Next to the tray app; in a development build also in the repository's editor output, never elsewhere (L9).</summary>
+    private static string? FindEditor() => DevPaths.FindSibling("Glance.App.exe", "Glance.App");
 
     private void Quit()
     {

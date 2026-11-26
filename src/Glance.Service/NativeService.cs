@@ -1,4 +1,6 @@
 using System.Runtime.InteropServices;
+using System.Security.Principal;
+using Glance.Core.Security;
 using Glance.Core.Service;
 
 namespace Glance.Service;
@@ -16,17 +18,17 @@ internal interface IServiceBody
 
 /// <summary>
 /// The Windows service entry point, written against the service API directly: .NET's <c>ServiceBase</c> cannot accept
-/// <c>SERVICE_CONTROL_PRESHUTDOWN</c>, which comes before shutdown and has its own timeout (set by the installer).
+/// <c>SERVICE_CONTROL_PRESHUTDOWN</c>, which comes before shutdown and has its own timeout (the service sets it at start).
 /// The mapping of control codes to display events lives in <see cref="ServiceControlMap"/> (Core, tested).
 /// </summary>
 internal static class NativeService
 {
     private const int ServiceWin32OwnProcess = 0x10;
     private const int Stopped = 1, StartPending = 2, StopPending = 3, Running = 4;
-    private const int NoError = 0, ErrorCallNotImplemented = 120, ErrorExceptionInService = 1064;
+    private const int NoError = 0, ErrorAccessDenied = 5, ErrorCallNotImplemented = 120, ErrorExceptionInService = 1064;
 
     private static IServiceBody? _body;
-    private static Func<IServiceBody>? _create;
+    private static Func<Action<string>, string?, IServiceBody>? _create;
     private static IntPtr _handle;
     private static int _checkPoint, _state;
     private static readonly object _statusLock = new();
@@ -35,8 +37,11 @@ internal static class NativeService
     private static readonly ServiceMainProc MainProc = ServiceMain;
     private static readonly HandlerEx Handler = HandleControl;
 
-    /// <summary>Runs the service until it is stopped. Returns false when this process was not started by the Service Control Manager.</summary>
-    public static bool Run(Func<IServiceBody> create)
+    /// <summary>
+    /// Runs the service until it is stopped. Returns false when this process was not started by the Service Control Manager.
+    /// <paramref name="create"/> gets the log and, if the log file cannot be written, why.
+    /// </summary>
+    public static bool Run(Func<Action<string>, string?, IServiceBody> create)
     {
         _create = create;
         var table = new[]
@@ -51,15 +56,33 @@ internal static class NativeService
     {
         _handle = RegisterServiceCtrlHandlerExW(ServiceNames.ServiceName, Handler, IntPtr.Zero);
         if (_handle == IntPtr.Zero) return;
-        Report(StartPending, 30000);   // the sensor library can take a while to open
+        Report(StartPending, 30000);   // the folder check and the sensor library can take a while
+
+        // L6: only now is it certain that Windows started this process as the service, so only now is the log opened
+        ServiceLog? log = null;
+        using (var me = WindowsIdentity.GetCurrent())
+            if (ServiceLog.ShouldOpen(me.IsSystem, elevatedConsole: false)) log = ServiceLog.OpenDefault();
+        Action<string> write = m => log?.Write(m);
+        AppDomain.CurrentDomain.UnhandledException += (_, e) => write("Unhandled error: " + e.ExceptionObject);
+        if (log?.DisabledReason is { } logProblem) EventLogWriter.Write(logProblem, error: false);
+
+        // H1: never run as SYSTEM from a folder that someone without administrator rights could change
+        if (ServiceStartGuard.Refusal(Environment.ProcessPath, exe => FolderTrust.CheckExecutable(exe, TrustScope.FolderTree)) is { } refusal)
+        {
+            write(refusal);
+            EventLogWriter.Write(refusal, error: true);
+            Report(Stopped, 0, ErrorAccessDenied);
+            return;
+        }
+
         try
         {
-            _body = _create!();
+            _body = _create!(write, log?.DisabledReason);
             _body.Start();
         }
         catch (Exception ex)
         {
-            try { _body?.Log("The service could not start: " + ex); } catch { }
+            write("The service could not start: " + ex);
             Report(Stopped, 0, ErrorExceptionInService);
             return;
         }
