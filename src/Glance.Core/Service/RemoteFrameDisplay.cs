@@ -83,19 +83,47 @@ internal sealed class RemoteFrameDisplay : IFrameDisplay
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (_broken) throw new IOException("The connection to the Glance service was lost.");
-            using var cts = new CancellationTokenSource(_replyTimeout);
             (ReplyStatus Status, string Message) reply;
-            try
-            {
-                _pipe.WriteAsync(bytes, cts.Token).AsTask().GetAwaiter().GetResult();
-                reply = DisplayWire.ReadReplyAsync(_pipe, cts.Token).GetAwaiter().GetResult();
-            }
+            try { reply = Exchange(bytes); }
             catch (OperationCanceledException) { _broken = true; throw new IOException("The Glance service did not answer in time."); }
             catch (InvalidDataException ex) { _broken = true; throw new IOException("The Glance service sent a broken reply: " + ex.Message); }
             catch (IOException) { _broken = true; throw; }
             if (reply.Status == ReplyStatus.Ok) return reply.Message;
             throw new DisplayServiceException(reply.Message, reply.Status == ReplyStatus.Denied);
         }
+    }
+
+    /// <summary>A last-resort bound on top of the reply timeout, in case cancelling the pipe I/O itself does not complete.</summary>
+    private static readonly TimeSpan CancelGrace = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Writes one request and reads its reply, under <see cref="_io"/>. Callers block here, often on a UI thread (the tray app
+    /// opens the display from its WinForms thread, the editor from Avalonia's). The async pipe I/O therefore runs on the thread
+    /// pool with no <see cref="SynchronizationContext"/>, so none of its continuations can be posted back to the blocked caller:
+    /// that was the deadlock that left the display black in Glance 0.2.0 (docs/design/fix-tray-deadlock.md). The token cancels
+    /// the I/O when the reply timeout runs out; if even that does not complete, the wait gives up a little later and the pipe
+    /// is closed, which ends the I/O.
+    /// </summary>
+    /// <exception cref="OperationCanceledException">No reply in time.</exception>
+    private (ReplyStatus Status, string Message) Exchange(byte[] bytes)
+    {
+        var cts = new CancellationTokenSource(_replyTimeout);
+        var io = Task.Run(async () =>
+        {
+            await _pipe.WriteAsync(bytes, cts.Token).ConfigureAwait(false);
+            return await DisplayWire.ReadReplyAsync(_pipe, cts.Token).ConfigureAwait(false);
+        });
+        bool finished;
+        try { finished = io.Wait(_replyTimeout + CancelGrace); }
+        catch (AggregateException) { finished = true; }   // its exception is rethrown unwrapped below
+        if (!finished)
+        {
+            try { _pipe.Dispose(); } catch { /* ends the stuck I/O; the connection is marked broken by the caller */ }
+            io.ContinueWith(_ => cts.Dispose(), TaskScheduler.Default);
+            throw new OperationCanceledException("The Glance service did not answer in time.");
+        }
+        cts.Dispose();
+        return io.GetAwaiter().GetResult();
     }
 
     public void Blit(int x, int y, int w, int h, byte[] rgb565Be)
