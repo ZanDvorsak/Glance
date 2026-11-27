@@ -206,7 +206,9 @@ public sealed class VideoSource : IDisposable
             (last, _latest) = (_latest, null);
         }
         last?.Release();
-        if (proc is not null) StopProcess(proc);
+        // killing a process can take a while and Dispose may be called on the editor's UI thread (review L2). If this
+        // process ends first, ffmpeg still stops at its next frame: its output pipe is gone.
+        if (proc is not null) ThreadPool.UnsafeQueueUserWorkItem(static p => StopProcess(p), proc, preferLocal: false);
     }
 
     private static void StopProcess(IVideoProcess proc)

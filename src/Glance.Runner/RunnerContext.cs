@@ -63,6 +63,7 @@ internal sealed class RunnerContext : ApplicationContext
     {
         _ = _ui.Handle; // force handle creation so other threads can marshal onto the UI thread
         Log("Tray app starting as " + WindowsIdentity.GetCurrent().Name);
+        ThemeRenderer.VideoProblem += Log;   // a video that cannot play, once per file and error
 
 
         _sensors = new SensorHub();   // the service's feed, or the basic sensors this user can read

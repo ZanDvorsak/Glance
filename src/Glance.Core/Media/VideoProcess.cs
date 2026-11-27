@@ -49,7 +49,8 @@ internal sealed class FfmpegProcess : IVideoProcess
 
     public int? ExitCode { get { try { return _proc.HasExited ? _proc.ExitCode : null; } catch { return null; } } }
 
-    public void Kill() { try { if (!_proc.HasExited) _proc.Kill(true); } catch { } }
+    // Kill() and not Kill(true): ffmpeg starts no child processes, and the tree walk lists every process on the PC (review L2)
+    public void Kill() { try { if (!_proc.HasExited) _proc.Kill(); } catch { } }
 
     public void Dispose() => _proc.Dispose();
 }
