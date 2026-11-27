@@ -923,7 +923,7 @@ public sealed class MainWindow : Window
         using (BeginFileWork("Saving " + path + "..."))
         {
             // pictures and videos are copied off the UI thread from a copy of the theme; the editor stays usable (M7)
-            try { job = await ThemeSaveJob.SaveAsync(live, path); }
+            try { job = await ThemeSaveJob.SaveAsync(live, path, a => Dispatcher.UIThread.InvokeAsync(a).GetTask()); }
             catch (Exception ex) { _status.Text = "Save failed: " + ex.Message; return false; }
         }
         if (!ReferenceEquals(live, _theme)) { _status.Text = "Saved " + path; return true; }   // another theme was opened from a window meanwhile

@@ -179,7 +179,11 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
 - **`ThemePackage`** reads/writes `.glance` (zip with `theme.json` + `assets/`). Import is defensive on purpose (path traversal, drive letters, size/entry caps, only `theme.json` and `assets/*`). Keep it that way.
 - **Undo/redo** is snapshot based (`Theme.ToSnapshot/ApplySnapshot`), debounced; all pages and widgets are hooked (`HookAll`).
 - **Video** is decoded by an `ffmpeg` child process (`-re` is required or it plays several times too fast); FFmpeg is optional and found automatically (app folder, PATH, winget machine and user folders).
-  Video is decoded only in user-side processes (tray app, editor), as the user; the service never starts ffmpeg. `Ffmpeg.Find` keeps its
+  Video is decoded only in user-side processes (tray app, editor), as the user; the service never starts ffmpeg.
+  `VideoSource` finds and starts ffmpeg on its own thread (never the UI thread); frames are reference counted, so draw them only
+  through an `AcquireFrame()` lease. While a video widget is resized, the renderer keeps the running decoder and stretches its frames;
+  a decoder for the new size starts once the size has been stable for 500 ms. A stopped ffmpeg is retried after 5 s
+  (`docs/design/fix-video-frames.md`). `Ffmpeg.Find` keeps its
   elevated rule for any elevated caller: it only accepts a copy that only administrators can change
   (`FolderTrust.CheckExecutable(exe, TrustScope.FolderFiles)`: the exe, the files next to it, its folder and every folder above it, no links). The editor's
   FFmpeg button and the setup check install per user (no prompt). `SetupChecks.MachineInstallScript` (machine scope, resets the package
@@ -199,11 +203,17 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
 - Elevation: only the service has administrator rights (LocalSystem, environment from the SCM). The tray app and the editor are `asInvoker`
   and must never run elevated (the installer starts them with `runasoriginaluser`). Never add a `requireAdministrator` manifest (a test fails).
 - Do not block the UI thread (editor or tray app) with USB, pipe, process, registry or big-file work (review M7,
-  `docs/design/fix-ui-thread.md`). Display open/close goes through a `SerialWork` (Core, ordered, never on the caller's thread);
-  file work through `Task.Run` (Save through `ThemeSaveJob`); slow yes/no checks through `BackgroundProbe`. Mark blocking helpers
-  `[WorkerThread]`. `UiThreadAuditTests` scans `Glance.App` and `Glance.Runner` for known blocking calls on the UI thread: add a
-  rule for a new blocking API, and give any call that must stay synchronous a `// ui-thread-ok: reason` comment. Avalonia
-  controls refuse other threads: read them on the UI thread before handing work over.
+  `docs/design/fix-ui-thread.md`). The editor's display open/close and the tray's display check go through a `SerialWork` (Core,
+  ordered, never on the caller's thread); the tray opens with `BackgroundOpener`; file work goes through `Task.Run` (Save through
+  `ThemeSaveJob`); slow yes/no checks through `BackgroundProbe`. Mark blocking helpers `[WorkerThread]`. Fire-and-forget tasks go
+  through `TaskObserver.Observe` (never a bare `_ =`). `UiThreadBlockingScanTests` scans `Glance.App` and `Glance.Runner` for known
+  blocking calls on the UI thread: add a rule for a new blocking API, and give any call that must stay synchronous a
+  `// ui-thread-ok: reason` comment. Avalonia controls refuse other threads: read them on the UI thread before handing work over.
+- **Every `await` in `Glance.Core` needs `ConfigureAwait(false)`** (CA2007 is a build error there, and `ConfigureAwaitGuardTests` scans
+  the source). The tray app and the editor call Core from their UI threads and block on it; an await that resumes on the caller's
+  context deadlocks (that left the display black in 0.2.0, `docs/design/fix-tray-deadlock.md`). Never block on a task
+  (`.Result`, `.Wait()`, `GetAwaiter().GetResult()`) without a timeout; test such code on `UiLikeContext` (tests), not only under xUnit.
+  The tray app opens the display with `BackgroundOpener`, never on its UI thread.
 - Rendering races: the editor mutates the theme while a pusher renders it; renderers catch `InvalidOperationException` and retry next frame.
 
 ## Verifying changes

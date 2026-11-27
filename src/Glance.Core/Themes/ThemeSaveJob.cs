@@ -74,12 +74,18 @@ public sealed class ThemeSaveJob
         return moved;
     }
 
-    /// <summary>Begin on the caller's thread, run on the thread pool, apply back on the caller's (UI) thread.</summary>
-    public static async Task<ThemeSaveJob> SaveAsync(Theme live, string path)
+    /// <summary>
+    /// Begin on the caller's (UI) thread, run on the thread pool, then <see cref="Apply"/> through <paramref name="onUiThread"/>,
+    /// which the caller provides (for example <c>Dispatcher.UIThread.InvokeAsync</c>). Core never resumes on a captured context
+    /// (docs/design/fix-tray-deadlock.md): the way back to the UI thread is always explicit.
+    /// </summary>
+    /// <param name="onUiThread">Runs an action on the thread that owns <paramref name="live"/> and completes when it has run.</param>
+    public static async Task<ThemeSaveJob> SaveAsync(Theme live, string path, Func<Action, Task> onUiThread)
     {
+        ArgumentNullException.ThrowIfNull(onUiThread);
         var job = Begin(live, path);
-        await Task.Run(job.Run);
-        job.Apply();   // the await came back to the caller's synchronization context
+        await Task.Run(job.Run).ConfigureAwait(false);
+        await onUiThread(() => job.Apply()).ConfigureAwait(false);
         return job;
     }
 }

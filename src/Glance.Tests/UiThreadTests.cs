@@ -37,6 +37,14 @@ internal sealed class TestUiThread : IDisposable
         public override SynchronizationContext CreateCopy() => this;
     }
 
+    /// <summary>Runs an action on the UI thread, like <c>Dispatcher.UIThread.InvokeAsync</c>; the task completes when it has run.</summary>
+    public Task Invoke(Action action)
+    {
+        var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _queue.Add((_ => { try { action(); done.SetResult(); } catch (Exception ex) { done.SetException(ex); } }, null));
+        return done.Task;
+    }
+
     /// <summary>Runs a UI event handler on the UI thread; returns how long the UI thread was held and the handler's task.</summary>
     public (TimeSpan Blocked, Task Done) Blocked(Func<Task> handler)
     {
@@ -261,8 +269,11 @@ public class UiThreadTests
 
             var live = Make();
             ThemeSaveJob? job = null;
-            var (after, done) = ui.Blocked(async () => job = await ThemeSaveJob.SaveAsync(live, Path.Combine(root, "b", "theme.json")));
+            int applyThread = 0;
+            Task OnUi(Action a) => ui.Invoke(() => { applyThread = Environment.CurrentManagedThreadId; a(); });
+            var (after, done) = ui.Blocked(async () => job = await ThemeSaveJob.SaveAsync(live, Path.Combine(root, "b", "theme.json"), OnUi));
             await done;
+            Assert.Equal(ui.ThreadId, applyThread);   // the live theme is only changed on its own thread, through the caller's callback
 
             _out.WriteLine($"direct save: UI held {before.TotalMilliseconds:0} ms; ThemeSaveJob: {after.TotalMilliseconds:0} ms");
             // copying 300 MB takes ~0.1-1 s depending on the disk; the point is that it lands on the UI thread
