@@ -85,7 +85,7 @@ public sealed class ServiceWindow : Window
             var (state, status, tray, trayExe) = await Task.Run(() =>
             {
                 var s = ServiceControl.Query();
-                return (s, s == ServiceState.Running ? DisplayConnector.ServiceStatus() : null, RunnerClient.IsRunning, AppPaths.FindTrayExe() is not null);
+                return (s, s == ServiceState.Running ? DisplayConnector.ServiceStatus() : null, RunnerClient.Probe() == TrayState.Answering, AppPaths.FindTrayExe() is not null);   // M13: a round trip, not a process name
             });
             Show(state, status, tray, trayExe);
         }

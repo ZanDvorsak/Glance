@@ -92,7 +92,8 @@ public sealed class MainWindow : Window
     // _displayWork (in order, one at a time); file work (open, save, imports) runs in Task.Run while _fileBusy disables the
     // file buttons; slow yes/no checks are BackgroundProbes read without waiting.
     private readonly SerialWork _displayWork = new();
-    private readonly BackgroundProbe<bool> _trayProbe = new BackgroundProbe<bool>(() => RunnerClient.IsRunning, false);
+    // M13: a STATUS round trip to this user's tray app (RunnerClient.Probe), never a process name; the only cache of the answer
+    private readonly BackgroundProbe<TrayState> _trayProbe = new BackgroundProbe<TrayState>(RunnerClient.Probe, TrayState.Unknown);
     private readonly BackgroundProbe<bool> _ffmpegFound = new BackgroundProbe<bool>(() => Ffmpeg.Find() is not null, true);
     private int _sendGeneration;            // bumped by every Send toggle; a slow open whose toggle is stale changes no UI
     private bool _restarting;               // a dead-loop restart is running on _displayWork
@@ -195,6 +196,8 @@ public sealed class MainWindow : Window
             // Always queued on _displayWork, behind a release or open still running (review M1): those already took the pusher
             // out of _display.Current, so an empty slot does not mean the display is dark.
             PendingExitBlank = _display.ReleaseOnExit(_displayWork);
+            // M5: LIVE_CLEAR (queued by StopLive) and anything before it reach the tray before the process ends (bounded)
+            PendingTrayClose = Task.Run(() => RunnerClient.CloseLink(TrayCloseBudget));
             if (OperatingSystem.IsWindows()) _powerWatcher?.Dispose();
             _renderer.Dispose();
             Observe(_displayWork.Run(_hub.Dispose), "Could not stop the sensors");   // after the blank: an open still running reads the sensors
@@ -259,7 +262,7 @@ public sealed class MainWindow : Window
             if (e.Property != RangeBase.ValueProperty) return;
             _settings.Brightness = (int)Math.Round(slider.Value);
             _pusher?.SetBrightness(_settings.Brightness);
-            if (_liveToRunner) { var b = _settings.Brightness; Task.Run(() => RunnerClient.Send(ControlCommand.Brightness(b))); }
+            if (_liveToRunner) RunnerClient.Post(ControlCommand.Brightness(_settings.Brightness));
         };
         var right = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, VerticalAlignment = VerticalAlignment.Center };
         right.Children.Add(new TextBlock { Text = "Backlight", VerticalAlignment = VerticalAlignment.Center, Foreground = Brush("#8C96A8"), Margin = new Thickness(8, 0, 0, 0) });
@@ -468,7 +471,7 @@ public sealed class MainWindow : Window
     private void ApplyPins()
     {
         if (_pusher is { } pusher) pusher.PinnedPage = DesiredPin;   // read once: a Windows sleep event can clear it from another thread
-        if (_liveToRunner) { var n = (DesiredPin ?? -1) + 1; Task.Run(() => RunnerClient.Send(ControlCommand.Page(n))); }   // PAGE 0 releases the pin
+        if (_liveToRunner) RunnerClient.Post(ControlCommand.Page((DesiredPin ?? -1) + 1));   // PAGE 0 releases the pin; in order with LIVE (M5)
     }
 
     private void AddPage()
@@ -1153,7 +1156,7 @@ public sealed class MainWindow : Window
 
     /// <summary>Asks the Service Control Manager and lists processes; the sensor hub is safe to read from any thread.</summary>
     [WorkerThread]
-    private SetupContext CurrentSetupContext() => new(_hub.FromService, _hub.Snapshot.Count, Glance.Core.Service.ServiceControl.Query(), RunnerClient.IsRunning);
+    private SetupContext CurrentSetupContext() => new(_hub.FromService, _hub.Snapshot.Count, Glance.Core.Service.ServiceControl.Query(), RunnerClient.Probe() == TrayState.Answering);
 
     private void OpenSetupCheck()
     {
@@ -1500,8 +1503,8 @@ public sealed class MainWindow : Window
         _ffmpegBtn.IsEnabled = !_installingFfmpeg;
         _ffmpegBtn.Content = _installingFfmpeg ? "Installing FFmpeg..." : "Install FFmpeg for video";
 
-        _trayProbe.Poke();                     // lists processes in the background; the answer is at most a tick old
-        bool trayRunning = _trayProbe.Value;
+        _trayProbe.Poke();                     // asks the tray in the background; the answer is at most a tick or two old
+        var tray = _trayProbe.Value;
 
         if (_pusher is { IsAlive: false } && !_restarting) Observe(RestartDeadPusherAsync(), "Could not restart the display");
         if (_pusher is { } p)
@@ -1513,10 +1516,15 @@ public sealed class MainWindow : Window
         }
         else if (_liveToRunner)
         {
-            if (!trayRunning) { _send.IsChecked = false; _status.Text = "The Glance tray app stopped, so live sending ended."; }
+            // a tray app that is still there but slow keeps the live link (LiveSendGate says it did not answer); a gone one ends it
+            if (tray is TrayState.None or TrayState.OtherAccount)
+            {
+                _send.IsChecked = false;
+                _status.Text = "The Glance tray app stopped, so live sending ended." + (TrayPresence.Explain(tray) is { } why ? " " + why : "");
+            }
             else { _displayDot.Fill = Brush("#34D399"); _displayText.Text = "Display via tray app (live)"; }
         }
-        else if (trayRunning) { _displayDot.Fill = Brush("#4F8CFF"); _displayText.Text = "Tray app shows your theme"; }
+        else if (tray == TrayState.Answering) { _displayDot.Fill = Brush("#4F8CFF"); _displayText.Text = "Tray app shows your theme"; }
         else { _displayDot.Fill = Brushes.Gray; _displayText.Text = "Display idle"; }
     }
 
@@ -1551,12 +1559,12 @@ public sealed class MainWindow : Window
 
     private void StartLive()
     {
-        _liveToRunner = true; _liveGate.Reset();
+        _liveToRunner = true; _liveGate.Reset(); _keepAlive.Reset();
         _liveTimer.Tick -= OnLiveTick; _liveTimer.Tick += OnLiveTick;
         _liveTimer.Start();
-        var b = _settings.Brightness;
-        var pg = (DesiredPin ?? -1) + 1;
-        Task.Run(() => { RunnerClient.Send(ControlCommand.Resume); RunnerClient.Send(ControlCommand.Brightness(b)); RunnerClient.Send(ControlCommand.Page(pg)); });
+        // one ordered link (M5): these arrive before the LIVE below, and a later LIVE_CLEAR after it
+        RunnerClient.Post(ControlCommand.Resume);
+        foreach (var c in LiveKeepAlive.RestoreCommands(_settings.Brightness, DesiredPin)) RunnerClient.Post(c);
         PushLive();
         _status.Text = LiveSendGate.ShowingText;
     }
@@ -1566,10 +1574,45 @@ public sealed class MainWindow : Window
         _liveTimer.Stop();
         if (!_liveToRunner) return;
         _liveToRunner = false;
-        Task.Run(() => RunnerClient.Send(ControlCommand.LiveClear));
+        RunnerClient.Post(ControlCommand.LiveClear);   // behind any LIVE still on its way, never before it (M5)
     }
 
-    private void OnLiveTick(object? s, EventArgs e) => PushLive();
+    private void OnLiveTick(object? s, EventArgs e)
+    {
+        PushLive();
+        KeepLive();
+    }
+
+    private readonly LiveKeepAlive _keepAlive = new();
+
+    /// <summary>
+    /// M5: the tray shows the live theme only while the editor keeps it alive (a 5 s lease). If the tray no longer holds it (it
+    /// restarted, or the lease ran out), the pin and brightness go again and then the theme (M2). If another editor took the
+    /// display over, live sending stops here instead of taking it back every heartbeat (M1). Monotonic time (L1).
+    /// </summary>
+    private void KeepLive()
+    {
+        if (!_liveToRunner || !_keepAlive.TryBegin(MonotonicClock.Now)) return;
+        RunnerClient.SendAsync(ControlCommand.LiveKeep).ContinueWith(t =>
+        {
+            var reply = t.IsCompletedSuccessfully ? t.Result : null;
+            Dispatcher.UIThread.Post(() =>
+            {
+                var result = _keepAlive.Complete(reply);
+                if (!_liveToRunner) return;
+                if (result == KeepResult.Resend)
+                {
+                    foreach (var c in LiveKeepAlive.RestoreCommands(_settings.Brightness, DesiredPin)) RunnerClient.Post(c);
+                    _liveGate.Lost();   // the next tick sends the theme, after these
+                }
+                else if (result == KeepResult.Taken)
+                {
+                    _send.IsChecked = false;   // runs ToggleSend(false), which sets its own status; ours goes after it
+                    _status.Text = "Another Glance editor is showing its edits on the display now, so live sending stopped here. Tick Send to display to take it back.";
+                }
+            });
+        });
+    }
 
     /// <summary>Turns the display black right now, whoever is driving it. The USB and pipe work runs on <see cref="_displayWork"/>.</summary>
     private async Task TurnDisplayOffAsync()
@@ -1581,18 +1624,20 @@ public sealed class MainWindow : Window
         _status.Text = "Turning the display off...";
         try
         {
-            var (runner, busy, error) = await _displayWork.Run(() =>
+            var (tray, busy, error) = await _displayWork.Run(() =>
             {
                 _display.Release(blank: true, DisplayPusher.StopTimeout);   // nothing left to release when ToggleSend's ran first
-                if (RunnerClient.IsRunning)
+                var t = RunnerClient.Probe();   // M13: a round trip to this user's tray, not a process name
+                if (t == TrayState.Answering)
                 {
-                    RunnerClient.Send(ControlCommand.Pause);   // the runner blanks it and stops drawing
-                    return (true, (string?)null, (string?)null);
+                    RunnerClient.Send(ControlCommand.Pause);   // the runner blanks it and stops drawing (in order behind LIVE_CLEAR)
+                    return (t, (string?)null, (string?)null);
                 }
-                if (_display.StillClosing() is { } b) return (false, b, null);   // the old loop blanks and closes it when its stuck transfer gives up
-                return (false, null, Glance.Core.Service.DisplayConnector.TryBlank());
+                if (_display.StillClosing() is { } b) return (t, b, null);   // the old loop blanks and closes it when its stuck transfer gives up
+                return (t, null, Glance.Core.Service.DisplayConnector.TryBlank());
             });
-            _trayProbe.Report(runner);
+            _trayProbe.Report(tray);
+            bool runner = tray == TrayState.Answering;
             if (generation != _sendGeneration) return;   // Send was ticked again meanwhile: its status wins
             _status.Text = runner ? "Display off (the tray app is paused). Click Send to display to turn it back on."
                          : busy ?? (error is { } err ? "Could not turn the display off: " + err : "Display off. Click Send to display to turn it back on.");
@@ -1609,7 +1654,7 @@ public sealed class MainWindow : Window
         try { snap = _theme.ToSnapshot(); } catch { return; }
         if (_liveGate.TryBegin(snap) is not { } send) return;
         var folder = _theme.BaseFolder;
-        Task.Run(() => RunnerClient.SendLive(snap, folder)).ContinueWith(t =>
+        RunnerClient.SendLiveAsync(snap, folder).ContinueWith(t =>
         {
             var reply = t.IsCompletedSuccessfully ? t.Result : null;
             Dispatcher.UIThread.Post(() =>
@@ -1692,12 +1737,17 @@ public sealed class MainWindow : Window
     private async Task StartSendingOrLiveAsync(int generation)
     {
         _status.Text = "Connecting to the display...";
-        var runner = await _displayWork.Run(() => RunnerClient.IsRunning);
-        _trayProbe.Report(runner);
+        // M13 + live-lease review L2: ask this user's tray now (a round trip, in order behind the release), not a cached answer
+        var tray = await _displayWork.Run(() => RunnerClient.Probe());
+        _trayProbe.Report(tray);
         if (generation != _sendGeneration) return;
-        if (runner) { StartLive(); return; }
-        await StartSendingAsync(generation);
+        if (tray == TrayState.Answering) { StartLive(); return; }
+        if (tray == TrayState.None) { await StartSendingAsync(generation); return; }
+        // a tray app is there but the editor cannot use it: do not fight it for the display, say why instead
+        _send.IsChecked = false;   // runs ToggleSend(false), which sets its own status; ours goes after it
+        _status.Text = TrayPresence.Explain(tray) ?? "Could not tell whether the Glance tray app runs; try again in a moment.";
     }
+
 
     // ---- shutdown, sign-out, sleep and wake while the editor itself drives the display ------------------------------
 
@@ -1708,9 +1758,18 @@ public sealed class MainWindow : Window
     /// <summary>The blank started while the window closed. <see cref="Program"/> waits for it (bounded) before the process exits.</summary>
     internal static Task? PendingExitBlank { get; private set; }
 
+    /// <summary>The last commands to the tray app (LIVE_CLEAR) while the window closed; waited for like <see cref="PendingExitBlank"/>.</summary>
+    internal static Task? PendingTrayClose { get; private set; }
+
+    /// <summary>How long the exit waits for the tray app to take the last commands (M5). If it is too slow, the tray still ends the
+    /// live preview itself when the editor's connection closes.</summary>
+    private static readonly TimeSpan TrayCloseBudget = TimeSpan.FromSeconds(2);
+
     internal static void WaitForExitBlank()
     {
-        try { PendingExitBlank?.Wait(PowerBlank.SessionEndBudget); } catch { /* best effort */ }   // ui-thread-ok: the message loop has ended; bounded
+        // both started while the window closed and run side by side: one shared budget, not one after the other
+        var tasks = new[] { PendingExitBlank, PendingTrayClose }.OfType<Task>().ToArray();
+        try { Task.WaitAll(tasks, PowerBlank.SessionEndBudget); } catch { /* best effort */ }   // ui-thread-ok: the message loop has ended; bounded
     }
 
     private void StartPowerWatcher()

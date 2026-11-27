@@ -25,10 +25,13 @@ public class UiThreadBlockingScanTests
         new("display-open", Editor, @"_display\.TryOpen\(", "opens the service pipe (0.5 s connect + 10 s reply timeout) or the USB device"),
         new("display-release", Editor, @"_display\.Release\(", "waits for the display loop to stop: up to DisplayPusher.StopTimeout (18 s) with a stuck transfer"),
         new("display-restart", Editor, @"_display\.RestartIfDead\(", "stops a dead loop (2 s bound) and opens the display again"),
-        new("tray-process-scan", Editor, @"RunnerClient\.IsRunning", "enumerates every process on the PC"),
+        new("tray-process-scan", Editor, @"RunnerClient\.IsRunning|TrayPresence\.(Probe|TrayProcessesInThisSession|IsMine)\(", "enumerates every process on the PC (after a tray round trip)"),
         new("service-control", Editor, @"ServiceControl\.(Query|Start)\(", "asks the Service Control Manager"),
         new("autostart-schtasks", Editor, @"Autostart\.(IsInstalled|Remove|RunElevated)\b", "starts schtasks.exe or sc.exe and waits up to 5-60 s"),
         new("tray-pipe", Editor, @"RunnerClient\.(Send|SendLive)\(", "a control pipe round trip: 0.8-1 s connect + 0.8-5 s reply timeout"),
+        // after the live-lease merge (docs/reviews/review-ui-thread.md M3): the editor's ordered TrayLink. Post, SendAsync and
+        // SendLiveAsync only queue; these wait for the queue and a round trip (Probe), or for the queue to drain (CloseLink)
+        new("tray-link-wait", Editor, @"RunnerClient\.(Probe|CloseLink)\(|\bLink\.(Send|Close)\(", "waits behind the link's queue and one round trip: up to TrayLink.SendTimeout (6 s), or the exit budget"),
         new("service-pipe", Editor, @"DisplayConnector\.\w+\(", "the service's display pipe, or USB when there is no service"),
         new("tray-launch", Editor, @"RunnerClient\.Launch\(", "ShellExecute of another program"),
         new("package-import", Editor, @"ThemePackage\.(Import|Export)\(", "unzips or zips a .glance file of up to 1 GB"),
@@ -45,6 +48,8 @@ public class UiThreadBlockingScanTests
         new("tray-display-stop", Tray, @"\.Stop\(\s*blank", "waits for the display loop to stop: up to 18 s with a stuck transfer"),
         new("tray-service-pipe", Tray, @"DisplayConnector\.\w+\(", "the service's display pipe, or USB when there is no service"),
         new("tray-file-read", Tray, @"(AppSettings\.Read|ThemeFile\.Load)\(", "reads files that can be locked (retries for up to a second)"),
+        // the live theme's host takes _gate inside Core, where the tray-gate-lock rule cannot see it (Resumed never waits)
+        new("tray-live-lock", Tray, @"_live\.(ExecuteLine|ConnectionClosed|Expire)\(", "TrayLiveHost takes _gate, which a stuck stop holds for up to 18 s"),
 
         // after the review (docs/reviews/review-ui-thread.md)
         new("sync-over-async", Both, @"\.Wait\(|\.Result\b(?!\s*\.)|\bGetResult\(", "blocks on a task (L3); a bounded wait that must stay needs a ui-thread-ok reason"),

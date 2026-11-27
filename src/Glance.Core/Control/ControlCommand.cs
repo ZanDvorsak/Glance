@@ -5,14 +5,14 @@ using System.Text;
 namespace Glance.Core.Control;
 
 /// <summary>The commands the runner accepts on its control pipe.</summary>
-public enum ControlVerb { Status, Reload, Pause, Resume, Exit, Next, Prev, Page, Brightness, Live, LiveClear }
+public enum ControlVerb { Status, Reload, Pause, Resume, Exit, Next, Prev, Page, Brightness, Live, LiveClear, LiveKeep }
 
 /// <summary>
 /// One command on the runner's control pipe (<c>Glance.Runner.Control</c>, one line per command).
 /// The editor builds commands with the factory methods and <see cref="Encode"/>; the runner reads them with <see cref="TryParse"/>.
 /// <para>
 /// Wire format: <c>STATUS</c>, <c>RELOAD</c>, <c>PAUSE</c>, <c>RESUME</c>, <c>EXIT</c>, <c>NEXT</c>, <c>PREV</c>, <c>LIVE_CLEAR</c>,
-/// <c>PAGE &lt;n&gt;</c> (1-based, 0 releases the pin), <c>BRIGHTNESS &lt;0-7&gt;</c> and
+/// <c>LIVE_KEEP</c>, <c>PAGE &lt;n&gt;</c> (1-based, 0 releases the pin), <c>BRIGHTNESS &lt;0-7&gt;</c> and
 /// <c>LIVE &lt;base64 UTF-8 folder&gt; &lt;base64 UTF-8 theme json&gt;</c>. A theme without a folder is sent with
 /// <see cref="NoFolder"/> in place of the folder; base64 never contains that character, so it cannot clash with a real folder.
 /// Older editors sent an empty folder field (two spaces in a row); that is still understood.
@@ -28,6 +28,7 @@ public sealed record ControlCommand
         (ControlVerb.Status, "STATUS"), (ControlVerb.Reload, "RELOAD"), (ControlVerb.Pause, "PAUSE"), (ControlVerb.Resume, "RESUME"),
         (ControlVerb.Exit, "EXIT"), (ControlVerb.Next, "NEXT"), (ControlVerb.Prev, "PREV"), (ControlVerb.Page, "PAGE"),
         (ControlVerb.Brightness, "BRIGHTNESS"), (ControlVerb.Live, "LIVE"), (ControlVerb.LiveClear, "LIVE_CLEAR"),
+        (ControlVerb.LiveKeep, "LIVE_KEEP"),
     };
 
     private ControlCommand(ControlVerb verb) { Verb = verb; }
@@ -51,6 +52,12 @@ public sealed record ControlCommand
     public static ControlCommand Next { get; } = new(ControlVerb.Next);
     public static ControlCommand Prev { get; } = new(ControlVerb.Prev);
     public static ControlCommand LiveClear { get; } = new(ControlVerb.LiveClear);
+
+    /// <summary>
+    /// Heartbeat for the live theme (review M5): "the editor is still here, keep showing its edits". The tray answers <c>OK</c>,
+    /// or <see cref="TrayLiveState.NotHeldReply"/> when this connection holds no live theme (the editor then sends it again).
+    /// </summary>
+    public static ControlCommand LiveKeep { get; } = new(ControlVerb.LiveKeep);
 
     /// <summary>Pins the display to page <paramref name="page"/> (1-based); 0 releases the pin.</summary>
     public static ControlCommand Page(int page) => new(ControlVerb.Page) { Number = page };

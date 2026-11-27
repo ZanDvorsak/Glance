@@ -34,7 +34,6 @@ internal sealed class RunnerContext : ApplicationContext, ITrayDisplayOwner
     private readonly ToolStripMenuItem _serviceItem = new("Glance service: checking...") { Enabled = false };
     private volatile string _serviceText = "checking...";
     private int _serviceCheckRunning;
-    private readonly CancellationTokenSource _cts = new();
     private readonly System.Windows.Forms.Timer _supervisor = new() { Interval = 2000 };
     private readonly System.Windows.Forms.Timer _reloadDebounce = new() { Interval = 700 };
     private readonly List<FileSystemWatcher> _watchers = new();
@@ -51,7 +50,7 @@ internal sealed class RunnerContext : ApplicationContext, ITrayDisplayOwner
     private AppSettings _settings;
     private long _rereadSettingsAtTicks;  // settings.json was locked when last read: read it again then, UTC ticks, 0 = no (review L1)
     private Theme _theme = Theme.CreateDefault(null);
-    private Theme? _live;                 // unsaved theme streamed from the editor
+    private TrayControlServer? _control;    // the editor talks to us here
     private DisplayPusher? _pusher;
     private DisplayPusher? _closingPusher;  // stopped, but a stuck transfer still holds the device
     private string? _loggedRenderError;     // each distinct theme error is logged once, not every frame
@@ -59,14 +58,14 @@ internal sealed class RunnerContext : ApplicationContext, ITrayDisplayOwner
     private string? _lastError;
     private readonly TrayDisplayOpener _opener;   // opens the display off the UI thread and decides what to do with it
     private volatile bool _paused;      // set on the UI thread, read by the supervisor
-    private int? _pinPage;
     private int _brightness;
 
-    private Theme Current => _live ?? _theme;
+    private Theme Current => _live.State.Live ?? _theme;
 
     public RunnerContext()
     {
         _ = _ui.Handle; // force handle creation so other threads can marshal onto the UI thread
+        _live = new TrayLiveHost(_gate, ApplyPin, Log);   // before the control pipe: it handles the live commands
         _supervise = new CoalescedWork(_work, SuperviseNow);
         _reload = new CoalescedWork(_work, ReloadNow);
         _opener = new TrayDisplayOpener(this, OpenPusher);
@@ -104,7 +103,7 @@ internal sealed class RunnerContext : ApplicationContext, ITrayDisplayOwner
         // The control pipe, the watchers and the timers come first, and the display is opened last and off this (UI)
         // thread: Glance 0.2.0 opened it right here, deadlocked on the service pipe, and never got any further.
         WatchFiles();
-        _ = Task.Run(ControlLoop);
+        _control = StartControlServer();
         _powerWatcher = StartPowerWatcher();
         _supervisor.Tick += (_, _) => Supervise();
         _supervisor.Tick += (_, _) => HealStuckSleep();
@@ -233,7 +232,7 @@ internal sealed class RunnerContext : ApplicationContext, ITrayDisplayOwner
                     // in the background, not even on this worker: the service pipe or USB can take seconds, and a stop or
                     // reload queued meanwhile must not wait behind it; TrayDisplayOpener decides what to do with the result
                     _closingPusher = null;
-                    _opener.Start(_brightness, _pinPage);
+                    _opener.Start(_brightness, _live.State.PinnedPage);
                 }
             }
             else
@@ -256,7 +255,7 @@ internal sealed class RunnerContext : ApplicationContext, ITrayDisplayOwner
             SetStatus(_pusher is null
                 ? _lastError is null && _opener.IsOpening ? "Opening the display..." : "Waiting for the display: " + (_lastError ?? "not found")
                 : _pusher.LastRenderError is { } drawError ? "Could not draw the theme: " + drawError
-                : _live is not null ? $"Live preview from the editor, {_pusher.Fps:0.0} fps" : $"Showing \"{_theme.Name}\"{(Current.Pages.Count > 1 ? $" (page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count})" : "")}, {_pusher.Fps:0.0} fps");
+                : _live.State.Live is not null ? $"Live preview from the editor, {_pusher.Fps:0.0} fps" : $"Showing \"{_theme.Name}\"{(Current.Pages.Count > 1 ? $" (page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count})" : "")}, {_pusher.Fps:0.0} fps");
         }
     }
 
@@ -271,7 +270,7 @@ internal sealed class RunnerContext : ApplicationContext, ITrayDisplayOwner
     bool ITrayDisplayOwner.HasPusher => _pusher is not null;
     void ITrayDisplayOwner.Adopt(DisplayPusher pusher)
     {
-        pusher.PinnedPage = _pinPage;        // in case they changed while it opened
+        pusher.PinnedPage = _live.State.PinnedPage;   // in case they changed while it opened
         pusher.SetBrightness(_brightness);
         _pusher = pusher;
         _failingSince = null;
@@ -319,6 +318,7 @@ internal sealed class RunnerContext : ApplicationContext, ITrayDisplayOwner
     private void OnPowerEvent(PowerEvent e)
     {
         var action = _power.Handle(e);       // the policy has its own lock: from now on Supervise will not open the display
+        if (e == PowerEvent.Resume) _live.Resumed();   // L1: the editor slept too; no flash of the saved theme before its next heartbeat
         Log($"Windows {e}: {action}");      // before blanking, in case Windows ends the process during it
         if (action is PowerAction.BlankAndStop or PowerAction.BlankAndHold)
         {
@@ -448,95 +448,46 @@ internal sealed class RunnerContext : ApplicationContext, ITrayDisplayOwner
 
     // ---- control pipe (from the editor) -------------------------------------------------------------------------
 
-    private int _controlInstances;   // live instances of our control pipe; 0 means the name must be claimed (first instance) again
-    private readonly LogLimiter _controlLog = new(TimeSpan.FromMinutes(1));
+    /// <summary>
+    /// The editor's live theme and page pin, leased to the control connection that sent them (review M5; see
+    /// <see cref="TrayLiveState"/>). The host lives in Core, so the tests drive this exact wiring; its own timer ends a live
+    /// theme nobody keeps alive. Read <c>_live.State</c> only under <see cref="_gate"/>.
+    /// </summary>
+    private readonly TrayLiveHost _live;
 
-    private async Task ControlLoop()
+    /// <summary>The server (pipe rules, first instance, remote clients closed) is <see cref="TrayControlServer"/> in Core.</summary>
+    private TrayControlServer StartControlServer() => new(ControlPipeName, Execute, _live.ConnectionClosed, Log);
+
+    /// <summary>Under <see cref="_gate"/>: hands the page pin to the running display loop.</summary>
+    private void ApplyPin()
     {
-        var security = ServicePipeSecurity.CurrentUserOnly();   // the editor runs as the same user; nobody else (and no network logon) may connect
-        while (!_cts.IsCancellationRequested)
-        {
-            NamedPipeServerStream? server = null;
-            try
-            {
-                // L8: claim the name with the first-instance flag, so another user who took it first is refused, not joined
-                server = ServicePipeFactory.Create(ControlPipeName, PipeDirection.InOut, 4, security, first: Volatile.Read(ref _controlInstances) == 0);
-                Interlocked.Increment(ref _controlInstances);
-                await server.WaitForConnectionAsync(_cts.Token);
-                var connected = server;
-                server = null;
-                _ = Task.Run(() => Handle(connected));
-            }
-            catch (OperationCanceledException) { ReleaseControl(server); return; }
-            catch (Exception ex)
-            {
-                ReleaseControl(server);
-                if (_controlLog.Filter("Control pipe error: " + ex.Message) is { } line) Log(line);   // not once a second for ever
-                try { await Task.Delay(2000, _cts.Token); } catch { return; }
-            }
-        }
+        if (_pusher is not null) _pusher.PinnedPage = _live.State.PinnedPage;
     }
 
-    private void ReleaseControl(NamedPipeServerStream? pipe)
-    {
-        if (pipe is null) return;
-        try { pipe.Dispose(); } catch { /* best effort */ }
-        Interlocked.Decrement(ref _controlInstances);
-    }
+    [WorkerThread]   // a pipe thread (TrayControlServer); the live commands' lock waits for the display check, never the UI thread
+    private string Execute(string line, long connection) => _live.ExecuteLine(line, connection, ExecuteOther);
 
-    [WorkerThread]   // a pipe thread (Task.Run in ControlLoop)
-    private async Task Handle(NamedPipeServerStream pipe)
-    {
-        try
-        {
-            if (NativeSessions.IsRemoteClient(pipe)) return;   // L1: never from another PC, not even through \localhost
-            using var reader = new StreamReader(pipe, Encoding.UTF8, false, 1024, leaveOpen: true);
-            using var writer = new StreamWriter(pipe, new UTF8Encoding(false), 1024, leaveOpen: true) { AutoFlush = true };
-            while (await reader.ReadLineAsync(_cts.Token) is { } line)
-            {
-                string reply;
-                try { reply = Execute(line.Trim()); } catch (Exception ex) { reply = "ERR " + ex.Message; }
-                await writer.WriteLineAsync(reply);
-            }
-        }
-        catch { /* client left */ }
-        finally { ReleaseControl(pipe); }
-    }
-
+    /// <summary>Every command but the live ones (<see cref="TrayLiveHost"/> handles those).</summary>
     [WorkerThread]   // a pipe thread; its locks wait for the display check, never the UI thread
-    private string Execute(string line)
+    private string ExecuteOther(ControlCommand cmd)
     {
-        // parsing and the wire format live in Glance.Core (ControlCommand) so the editor and tests share them
-        if (!ControlCommand.TryParse(line, out var cmd, out var error)) return "ERR " + error;
         switch (cmd.Verb)
         {
             case ControlVerb.Status:
             {
                 string pg;
-                lock (_gate) pg = _pusher is null ? "no display" : $"page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count}, pinned={(_pusher.PinnedPage is { } p ? (p + 1).ToString() : "no")}, autoRotate={Current.AutoRotate}, live={_live is not null}";
+                lock (_gate) pg = _pusher is null ? "no display" : $"page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count}, pinned={(_pusher.PinnedPage is { } p ? (p + 1).ToString() : "no")}, autoRotate={Current.AutoRotate}, live={_live.State.Live is not null}";
                 return "OK " + _statusItem.Text + " | " + pg;
             }
             case ControlVerb.Reload: _ui.BeginInvoke(Reload); return "OK";
-            case ControlVerb.Next: lock (_gate) _pusher?.NextPage(); return "OK";
-            case ControlVerb.Prev: lock (_gate) _pusher?.PrevPage(); return "OK";
-            case ControlVerb.Page:   // PAGE <n> pins the display to page n (1-based); PAGE 0 releases it
-                lock (_gate) { _pinPage = cmd.Number > 0 ? cmd.Number - 1 : null; if (_pusher is not null) _pusher.PinnedPage = _pinPage; }
-                return "OK";
+            case ControlVerb.Next: Volatile.Read(ref _pusher)?.NextPage(); return "OK";   // one Interlocked step, like the menu
+            case ControlVerb.Prev: Volatile.Read(ref _pusher)?.PrevPage(); return "OK";
             case ControlVerb.Pause: _ui.BeginInvoke(() => SetPaused(true)); return "OK";
             case ControlVerb.Resume: _ui.BeginInvoke(() => SetPaused(false)); return "OK";
             case ControlVerb.Exit: _ui.BeginInvoke(Quit); return "OK";
             case ControlVerb.Brightness:
                 lock (_gate) { _brightness = Math.Clamp(cmd.Number, 0, 7); _pusher?.SetBrightness(_brightness); }
                 return "OK";
-            case ControlVerb.Live:
-            {
-                // LIVE <base64 folder> <base64 theme json>: show the editor's unsaved theme until LIVE_CLEAR
-                var t = new Theme { BaseFolder = cmd.Folder };
-                t.ApplySnapshot(cmd.ThemeJson!);
-                lock (_gate) _live = t;
-                return "OK";
-            }
-            case ControlVerb.LiveClear: lock (_gate) { _live = null; _pinPage = null; if (_pusher is not null) _pusher.PinnedPage = null; } return "OK";
             default: return "ERR unknown command";
         }
     }
@@ -561,7 +512,8 @@ internal sealed class RunnerContext : ApplicationContext, ITrayDisplayOwner
         if (_quitting) return;   // a session end and the EXIT command can both ask
         _quitting = true;
         Log("Tray app exiting");
-        _cts.Cancel();
+        _control?.Dispose();
+        _live.Dispose();
         _supervisor.Stop();
         lock (_watchers) foreach (var w in _watchers) w.Dispose();
         _power.Handle(PowerEvent.Quit);   // nothing may reopen the display from here on (the policy has its own lock); an open

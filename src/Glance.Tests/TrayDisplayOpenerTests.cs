@@ -173,7 +173,7 @@ public sealed class TrayDisplayOpenerTests
         Assert.True(ctor >= 0);
         int end = src.IndexOf("\n    }", ctor, StringComparison.Ordinal);
         var body = src[ctor..end];
-        int control = body.IndexOf("Task.Run(ControlLoop)", StringComparison.Ordinal);
+        int control = body.IndexOf("_control = StartControlServer()", StringComparison.Ordinal);   // TrayControlServer (live-lease branch)
         int timers = body.IndexOf("_supervisor.Start()", StringComparison.Ordinal);
         int firstOpen = Regex.Match(body, @"^\s*Supervise\(\);", RegexOptions.Multiline).Index;
         Assert.True(control > 0, "the constructor no longer starts the control pipe");

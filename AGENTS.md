@@ -109,7 +109,15 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
   `docs/design/fix-sensor-feed.md`). Drive-space sensors come from `DriveSensors`.
 - **Tray control pipe commands** (one line each, reply `OK ...`): `STATUS`, `RELOAD`, `PAUSE`, `RESUME`, `EXIT`, `NEXT`, `PREV`, `PAGE <n>`
   (0 releases), `BRIGHTNESS <0-7>`, `LIVE <base64 folder> <base64 theme json>` (show the editor's unsaved theme; `-` for no folder),
-  `LIVE_CLEAR`. Build and parse them only with `Glance.Core.Control.ControlCommand` (shared by both sides and tested).
+  `LIVE_CLEAR`, `LIVE_KEEP` (heartbeat; `ERR no live theme` asks the editor to send pin, brightness and theme again;
+  `ERR live taken` means another editor took over: stop, do not fight). Build and parse them only with
+  `Glance.Core.Control.ControlCommand` (shared by both sides and tested). The server side is `TrayControlServer` + `TrayLiveHost` (Core).
+  The **live theme is leased** (`TrayLiveState`, review M5): it ends, with the page pin, on `LIVE_CLEAR` from its own connection,
+  when that connection closes, or 5 s (monotonic, sleep not counted, renewed on resume) without a command on it. A page pin also
+  ends when the connection that set it closes. The editor sends everything through one ordered connection (`TrayLink`, async pipe,
+  bounded `Send`) with a heartbeat every 1.5 s, and its exit waits (bounded) for the queued `LIVE_CLEAR`. Whether the tray is there is decided by a
+  `STATUS` round trip (`TrayPresence`, M13), never by a process name; a tray process that does not answer, or belongs to another
+  account, is reported, and the editor does not fight it for the display.
 - Single tray app per session (mutex `Local\Glance.Runner`). It starts at sign-in from a shortcut in the common Startup folder (installer
   option). There is no scheduled task any more. A leftover Glance 0.1 "Glance Runner" task would start the tray elevated: the tray then
   relaunches itself with normal rights or refuses (`TrayStart`, tested), the service deletes the task at every start (`LegacyTask`), the

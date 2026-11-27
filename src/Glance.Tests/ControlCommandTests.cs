@@ -33,6 +33,7 @@ public class ControlCommandTests
         new object[] { ControlCommand.Next, "NEXT" },
         new object[] { ControlCommand.Prev, "PREV" },
         new object[] { ControlCommand.LiveClear, "LIVE_CLEAR" },
+        new object[] { ControlCommand.LiveKeep, "LIVE_KEEP" },
         new object[] { ControlCommand.Page(3), "PAGE 3" },
         new object[] { ControlCommand.Page(0), "PAGE 0" },
         new object[] { ControlCommand.Brightness(7), "BRIGHTNESS 7" },

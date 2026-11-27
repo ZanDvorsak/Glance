@@ -355,22 +355,37 @@ public class VideoFrameTests
     [Fact]
     public void M9_a_video_whose_ffmpeg_stopped_is_started_again_later()
     {
-        var (r, l, _, t, _, advance) = VideoRenderer();
-        using (r)
+        // Sync points, no sleeps (it failed 2 of 24 full-suite runs under load): the decoder thread notices the exit on its
+        // own schedule, so wait for Stopped itself; and count the sources the renderer makes, which happens synchronously in
+        // Render, instead of waiting a while for a launch that should not come.
+        var l = new Launcher();
+        var made = new List<VideoSource>();
+        long now = 0;
+        using var r = new ThemeRenderer
         {
-            Fake.Render(t, null, renderer: r).Dispose();
-            WaitFor(() => l.Count == 1, "ffmpeg started");
-            l[0].Exit(1);
-            Thread.Sleep(300);
-            advance(1000);
-            Fake.Render(t, null, renderer: r).Dispose();
-            Thread.Sleep(200);
-            Assert.Equal(1, l.Count);   // not every frame
+            Now = () => now,
+            VideoFactory = (p, w, h, fit) =>
+            {
+                var s = new VideoSource(p, w, h, fit, 15, () => "ffmpeg.exe", () => null, l.Launch);
+                made.Add(s);
+                return s;
+            },
+        };
+        var t = Fake.Canvas(200, 200);
+        t.Widgets.Add(new Widget { Kind = WidgetKind.Image, X = 0, Y = 0, Width = 100, Height = 100, ImagePath = @"C:\nowhere\clip.mp4" });
 
-            advance(ThemeRenderer.VideoRetryMs);
-            Fake.Render(t, null, renderer: r).Dispose();
-            WaitFor(() => l.Count == 2, "ffmpeg started again", 2000);
-        }
+        Fake.Render(t, null, renderer: r).Dispose();
+        WaitFor(() => l.Count == 1, "ffmpeg started");
+        l[0].Exit(1);
+        WaitFor(() => made[0].Stopped, "the stopped ffmpeg noticed");
+        now += 1000;
+        Fake.Render(t, null, renderer: r).Dispose();
+        Assert.Single(made);   // not every frame
+
+        now += ThemeRenderer.VideoRetryMs;
+        Fake.Render(t, null, renderer: r).Dispose();
+        Assert.Equal(2, made.Count);   // a new source, after the retry wait
+        WaitFor(() => l.Count == 2, "ffmpeg started again");
     }
 
     // ---- the real process wrapper and arguments --------------------------------------------------------------------

@@ -307,11 +307,18 @@ public sealed class RendererReviewFixTests : IDisposable
         var t = Fake.Canvas(); t.Widgets.Add(Picture(path, 0, 0, 100, 100));
         using (Fake.Render(t, null, renderer: r)) { }
 
-        r.StatFile = p => { Thread.Sleep(3000); return default; };   // an unreachable network share
+        // A file check that hangs until the test lets go (an unreachable network share). The render must finish while it is
+        // still stuck: a sync point, not a stopwatch (a "< 1000 ms" check failed 3 of 30 full-suite runs under load).
+        using var release = new ManualResetEventSlim();
+        int statDone = 0;
+        r.StatFile = p => { release.Wait(10_000); Volatile.Write(ref statDone, 1); return default; };
         now += 10_000;
-        var sw = Stopwatch.StartNew();
-        using (var bmp = RenderOnce(t, r)) Assert.Equal(SKColors.Red, bmp.GetPixel(50, 50));
-        Assert.True(sw.ElapsedMilliseconds < 1000, $"render took {sw.ElapsedMilliseconds} ms");
+        try
+        {
+            using (var bmp = RenderOnce(t, r)) Assert.Equal(SKColors.Red, bmp.GetPixel(50, 50));
+            Assert.True(Volatile.Read(ref statDone) == 0, "the render waited for the file check");
+        }
+        finally { release.Set(); }
     }
 
     [Fact]
@@ -359,14 +366,21 @@ public sealed class RendererReviewFixTests : IDisposable
         full.SeedGraphHistory(t.ActivePage, src);   // 1800 samples
         using var bare = new ThemeRenderer();        // one sample
 
+        // The least any of 10 frames allocates (it failed 1 of 30 full-suite runs under load with a single frame): a copy of
+        // the history happens in every frame, while one-off work (a periodic check, a first call) lands in only some of them.
         long Alloc(ThemeRenderer r)
         {
             using var bmp = new SKBitmap(200, 100);
             using var canvas = new SKCanvas(bmp);
             for (int i = 0; i < 3; i++) r.Render(canvas, t, src);
-            var before = GC.GetAllocatedBytesForCurrentThread();
-            r.Render(canvas, t, src);
-            return GC.GetAllocatedBytesForCurrentThread() - before;
+            long least = long.MaxValue;
+            for (int i = 0; i < 10; i++)
+            {
+                var before = GC.GetAllocatedBytesForCurrentThread();
+                r.Render(canvas, t, src);
+                least = Math.Min(least, GC.GetAllocatedBytesForCurrentThread() - before);
+            }
+            return least;
         }
         long extra = Alloc(full) - Alloc(bare);
         Assert.True(extra < 4096, $"a full history costs {extra} more bytes per frame");

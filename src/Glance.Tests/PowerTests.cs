@@ -161,7 +161,10 @@ public class PowerBlankTests
     public void Gives_up_on_a_stalled_display_within_its_budget()
     {
         // review M1: a display that stops answering must not hold Windows' shutdown or sleep
-        var opener = new FakeOpener { Make = () => new FakeDisplay { BlitDelayMs = 5000 } };
+        // The display stalls for 30 s. The proof is a sync point, not a stopwatch: Run gave up while the transfer is still stuck
+        // (the pusher is not closed yet). The time bound only guards against waiting for the display; it is far from the 300 ms
+        // budget on purpose ("< 1000 ms" failed 1 of 30 full-suite runs under load, at 1034 ms).
+        var opener = new FakeOpener { Make = () => new FakeDisplay { BlitDelayMs = 30_000 } };
         var p = opener.Open();
         Assert.True(opener.Displays[0].BlitStarted.Wait(5000));
         DisplayPusher? stuck = null;
@@ -170,8 +173,8 @@ public class PowerBlankTests
         sw.Stop();
         Assert.Equal(PowerBlank.Result.TimedOut, result);
         Assert.Same(p, stuck);                 // the owner is told the device is still held
-        Assert.False(p.IsClosed);
-        Assert.True(sw.ElapsedMilliseconds < 1000, $"took {sw.ElapsedMilliseconds} ms");
+        Assert.False(p.IsClosed);              // returned while the display is still stuck
+        Assert.True(sw.ElapsedMilliseconds < 10_000, $"took {sw.ElapsedMilliseconds} ms");
     }
 
     [Fact]
