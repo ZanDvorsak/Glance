@@ -182,7 +182,7 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
   Video is decoded only in user-side processes (tray app, editor), as the user; the service never starts ffmpeg.
   `VideoSource` finds and starts ffmpeg on its own thread (never the UI thread); frames are reference counted, so draw them only
   through an `AcquireFrame()` lease. While a video widget is resized, the renderer keeps the running decoder and stretches its frames;
-  a decoder for the new size starts once the size has been stable for 500 ms. A stopped ffmpeg is retried after 5 s
+  a decoder for the new size starts once the size has been stable for 500 ms. A stopped ffmpeg is retried after 5 s, doubling per failed run up to 60 s (logged once to runner.log)
   (`docs/design/fix-video-frames.md`). `Ffmpeg.Find` keeps its
   elevated rule for any elevated caller: it only accepts a copy that only administrators can change
   (`FolderTrust.CheckExecutable(exe, TrustScope.FolderFiles)`: the exe, the files next to it, its folder and every folder above it, no links). The editor's

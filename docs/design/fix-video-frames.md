@@ -108,5 +108,17 @@ Things the tests cannot see (they need the real app, real videos, or a long run)
    `ffmpeg.exe` each time).
 5. Ending ffmpeg by hand in Task Manager while a video plays: the widget keeps its last frame and the video comes back within ~5 s.
 
-Known limits, unchanged: `Dispose` still kills ffmpeg on the calling thread (the editor's UI thread when a video is swept; now rare,
-since a resize no longer creates a source per size). Frames are still allocated per frame (`SKImage.FromPixelCopy`), but freed at once.
+Known limits: frames are still allocated per frame (`SKImage.FromPixelCopy`), but freed at once.
+
+## 5. Follow-ups after the review (`docs/reviews/review-video-frames.md`)
+
+- **L1:** the wait for a new size now tolerates a gap of three of the renderer's own frames (at least 1 s), so a renderer that draws
+  less than once a second (the tray in USB back-off) still gets the sharp decoder. A decoder that stands in during a resize is kept
+  alive even while it is still loading (the old rule let it be swept after 3 s, then the next size started at once).
+- **L2:** `Dispose` hands the kill to the thread pool and returns at once; `FfmpegProcess.Kill` uses `Kill()`, not `Kill(true)`.
+- **L3:** a decoder that stops without having played waits 5, 10, 20, 40, then 60 s before the next try; a run that played resets it.
+  `ThemeRenderer.VideoProblem` reports each file's error once per renderer; the tray app writes it to `runner.log`.
+- **L4:** the concurrent frame test waits for a newer frame before checking the borrowed one, so a frame freed too early is a named
+  failure, not a crash of the test host.
+- Nits: the video cache uses one clock (`Now`) for the resize wait, last use and the 3 s sweep; while resizing, the widget's own
+  old decoder (same fit) is preferred over another widget's; the real-FFmpeg test is reported as skipped without FFmpeg (`[FfmpegFact]`).
