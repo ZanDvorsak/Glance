@@ -32,7 +32,7 @@
 Each test was run on the branch (after merging `main` 84a0b26) before its fix, then after it. Full suite after: 891/891.
 
 - **M1**: `M1_closing_while_a_release_is_still_running_waits_for_its_blank` (before: "the process could end before the display was blanked"), `M1_closing_while_an_open_is_still_running_waits_for_it_and_leaves_the_display_black` (before: no display yet when the exit task finished), `M1_the_editor_hands_its_exit_blank_to_the_display_queue_and_disposes_the_hub_after_it` (before: `ReleaseOnExit` not used). Pass after.
-- **L1**: `L1_fire_and_forget_tasks_are_observed` (before: 4 editor and 5 tray sites); `TaskObserver` tests pass. Pass after.
+- **L1**: `L1_fire_and_forget_tasks_are_observed` (before: 3 editor and 5 tray sites); `TaskObserver` tests pass. Pass after.
 - **L2**: rule `tray-gate-lock` (before: `Quit` and the pipe-thread `Execute` locks flagged; `Quit` was hidden until the L3 fix). Pass after: `Quit` blanks on the worker, waits at most 4 s.
 - **L3**: `L3_a_call_inside_an_interpolated_string_is_seen`, `L3_work_posted_back_to_the_UI_thread_from_a_worker_is_UI_code`, `L3_whitespace_around_the_dot_does_not_hide_a_call`, `L3_blocking_on_a_task_is_a_rule_and_a_ContinueWith_callback_is_not_UI_code` (all failed), rule `sync-over-async` (before: `MainWindow.cs:1687`). Pass after; remaining blind spots are listed in the test.
 - **L4**: `L4_every_file_operation_in_the_editor_runs_under_BeginFileWork` (before: `ThemePackage.Export(_theme, path)`). Pass after.
