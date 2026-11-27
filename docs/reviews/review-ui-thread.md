@@ -26,3 +26,17 @@
 - `Glance.App.exe big.glance`: the window opens at once and shows "Unpacking ...". The Setup check and Background service windows open without a stall.
 - Tray app with the display unplugged or the service stopped: the menu opens at once, Pause/Resume respond, and Exit still blanks.
 - Sleep and wake while the editor sends: the display comes back.
+
+## Fixes after review
+
+Each test was run on the branch (after merging `main` 84a0b26) before its fix, then after it. Full suite after: 891/891.
+
+- **M1**: `M1_closing_while_a_release_is_still_running_waits_for_its_blank` (before: "the process could end before the display was blanked"), `M1_closing_while_an_open_is_still_running_waits_for_it_and_leaves_the_display_black` (before: no display yet when the exit task finished), `M1_the_editor_hands_its_exit_blank_to_the_display_queue_and_disposes_the_hub_after_it` (before: `ReleaseOnExit` not used). Pass after.
+- **L1**: `L1_fire_and_forget_tasks_are_observed` (before: 4 editor and 5 tray sites); `TaskObserver` tests pass. Pass after.
+- **L2**: rule `tray-gate-lock` (before: `Quit` and the pipe-thread `Execute` locks flagged; `Quit` was hidden until the L3 fix). Pass after: `Quit` blanks on the worker, waits at most 4 s.
+- **L3**: `L3_a_call_inside_an_interpolated_string_is_seen`, `L3_work_posted_back_to_the_UI_thread_from_a_worker_is_UI_code`, `L3_whitespace_around_the_dot_does_not_hide_a_call`, `L3_blocking_on_a_task_is_a_rule_and_a_ContinueWith_callback_is_not_UI_code` (all failed), rule `sync-over-async` (before: `MainWindow.cs:1687`). Pass after; remaining blind spots are listed in the test.
+- **L4**: `L4_every_file_operation_in_the_editor_runs_under_BeginFileWork` (before: `ThemePackage.Export(_theme, path)`). Pass after.
+- **Nits**: `Nit_the_tray_menus_page_commands_do_not_wait_behind_the_display_check`, `Nit_the_tray_queues_reloads_and_checks_through_CoalescedWork`, rule `tray-exe-search` (before: `ServiceWindow.cs:123`, `RunnerClient.cs:44`): failed, pass after. `AddWidgetAsync` theme check: no automated test (UI flow). `_ffmpegFound` starting `true`: not changed (cosmetic).
+- **M2 (merge)**: kept `BackgroundOpener`/`Opened` for the tray's open; stops, reloads and blanks stay on the worker. My scanner class is now `UiThreadBlockingScanTests`. `ThemeSaveJob.SaveAsync` no longer resumes on the caller's context (CA2007): it takes an `onUiThread` callback.
+- **Proofs re-run on the merged code**: the scanner against `main` 84a0b26's editor and tray: 23 failures (17 of the original 18 rules; `tray-display-open` is fixed on `main` by `BackgroundOpener`) plus the new rules and checks; all pass on the branch. Timing tests: direct 1.0-1.5 s, through the seams 1-2 ms.
+- **M3**: left for the live-lease merge, as agreed.

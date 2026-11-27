@@ -45,7 +45,7 @@ public sealed class SerialWork
 
 /// <summary>
 /// Marks a method that blocks (USB, pipes, processes, registry, big files) and must only run off the UI thread: from
-/// <c>Task.Run</c>, a <see cref="SerialWork"/> item, or another <c>[WorkerThread]</c> method. <c>UiThreadAuditTests</c>
+/// <c>Task.Run</c>, a <see cref="SerialWork"/> item, or another <c>[WorkerThread]</c> method. <c>UiThreadBlockingScanTests</c>
 /// checks the editor's and the tray app's source for this.
 /// </summary>
 [AttributeUsage(AttributeTargets.Method, Inherited = false)]

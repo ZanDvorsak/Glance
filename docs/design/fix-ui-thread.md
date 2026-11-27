@@ -11,7 +11,7 @@ written against the old design (an elevated runner started by a scheduled task).
 The editor (`Glance.App`) and the tray app (`Glance.Runner`) have no test project of their own. Two kinds of test prove the
 problem and the fix:
 
-- **`UiThreadAuditTests`: an analyzer-style check over the source of both programs.** It has 21 rules, one per blocking API
+- **`UiThreadBlockingScanTests`: an analyzer-style check over the source of both programs.** (renamed from `UiThreadAuditTests` when `main` brought its own class of that name). It had 21 rules, one per blocking API
   (open or stop the display, list processes, ask the Service Control Manager, start `schtasks`, a control-pipe round trip,
   unzip, the AIDA64 import, `Theme.Save`, a network copy, a whole-file read, the FFmpeg search, a tree delete, the tray's
   display open/stop, file reads, and so on). A call passes only when it is:
@@ -51,7 +51,7 @@ problem and the fix:
 | tray-file-read | `RunnerContext.cs:68, 111, 134` | settings and theme reads, which retry for up to a second when the file is locked |
 
 Full output: the test log is reproduced by checking out `main`'s `src/Glance.App` and `src/Glance.Runner` over this branch and
-running `dotnet test src/Glance.Tests -c Release --filter UiThreadAuditTests` (`Failed: 18, Passed: 8`; the 8 are the 3
+running `dotnet test src/Glance.Tests -c Release --filter UiThreadBlockingScanTests` (`Failed: 18, Passed: 8`; the 8 are the 3
 passing rules, the 2 `[WorkerThread]` checks, which have nothing to check on `main`, and the 3 scanner self-tests).
 
 ### Timing (stand-in UI thread, this PC)
