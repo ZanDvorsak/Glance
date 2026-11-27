@@ -45,8 +45,8 @@ public sealed class SensorHub : ISensorSource, IDisposable
     {
         try
         {
-            _ = Task.Run(async () => { while (!_cts.IsCancellationRequested) { Merge(); try { await Task.Delay(500, _cts.Token); } catch { return; } } });
-            await Task.Delay(1500, _cts.Token); // give the service's feed a moment to arrive first
+            _ = Task.Run(async () => { while (!_cts.IsCancellationRequested) { Merge(); try { await Task.Delay(500, _cts.Token).ConfigureAwait(false); } catch { return; } } });
+            await Task.Delay(1500, _cts.Token).ConfigureAwait(false); // give the service's feed a moment to arrive first
             while (!_cts.IsCancellationRequested)
             {
                 if (_pipe.HasData)
@@ -58,7 +58,7 @@ public sealed class SensorHub : ISensorSource, IDisposable
                     _local ??= new SensorService();
                     _local.Update();
                 }
-                await Task.Delay(1000, _cts.Token);
+                await Task.Delay(1000, _cts.Token).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) { }

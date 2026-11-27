@@ -55,7 +55,7 @@ public sealed class TrayControlServer : IDisposable
             {
                 server = ServicePipeFactory.Create(_name, PipeDirection.InOut, MaxInstances, _security, first: Volatile.Read(ref _instances) == 0);
                 Interlocked.Increment(ref _instances);
-                await server.WaitForConnectionAsync(_cts.Token);
+                await server.WaitForConnectionAsync(_cts.Token).ConfigureAwait(false);
                 var connected = server;
                 server = null;
                 _ = Task.Run(() => Handle(connected));
@@ -65,7 +65,7 @@ public sealed class TrayControlServer : IDisposable
             {
                 Release(server);
                 if (_logLimiter.Filter("Control pipe error: " + ex.Message) is { } line) _log(line);   // not once a second for ever
-                try { await Task.Delay(2000, _cts.Token); } catch { return; }
+                try { await Task.Delay(2000, _cts.Token).ConfigureAwait(false); } catch { return; }
             }
         }
     }
@@ -85,11 +85,11 @@ public sealed class TrayControlServer : IDisposable
             if (NativeSessions.IsRemoteClient(pipe)) return;   // L1: never from another PC, not even through \localhost
             using var reader = new StreamReader(pipe, Encoding.UTF8, false, 1024, leaveOpen: true);
             using var writer = new StreamWriter(pipe, new UTF8Encoding(false), 1024, leaveOpen: true) { AutoFlush = true };
-            while (await reader.ReadLineAsync(_cts.Token) is { } line)
+            while (await reader.ReadLineAsync(_cts.Token).ConfigureAwait(false) is { } line)
             {
                 string reply;
                 try { reply = _execute(line.Trim(), id); } catch (Exception ex) { reply = "ERR " + ex.Message; }
-                await writer.WriteLineAsync(reply);
+                await writer.WriteLineAsync(reply).ConfigureAwait(false);
             }
         }
         catch { /* client left */ }

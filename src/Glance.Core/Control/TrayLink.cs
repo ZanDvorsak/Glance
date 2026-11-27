@@ -77,7 +77,7 @@ public sealed class TrayLink : IDisposable
     {
         try
         {
-            await foreach (var item in _queue.Reader.ReadAllAsync())
+            await foreach (var item in _queue.Reader.ReadAllAsync().ConfigureAwait(false))
             {
                 string? reply = null;
                 try { reply = Exchange(item.Command); }

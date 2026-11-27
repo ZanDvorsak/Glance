@@ -46,7 +46,7 @@ public static class DisplayWire
     public static async Task<DisplayRequest?> ReadRequestAsync(Stream stream, CancellationToken ct)
     {
         var header = new byte[HeaderBytes];
-        int got = await ReadUpTo(stream, header, ct);
+        int got = await ReadUpTo(stream, header, ct).ConfigureAwait(false);
         if (got == 0) return null;
         if (got < HeaderBytes) throw new InvalidDataException("The request was cut short.");
         var op = (DisplayOp)header[0];
@@ -54,7 +54,7 @@ public static class DisplayWire
         if (PayloadLength(op) is not { } expected) throw new InvalidDataException($"Unknown request {header[0]}.");
         if (length != expected) throw new InvalidDataException($"{op} must carry {expected} bytes, not {length}.");
         var payload = new byte[length];
-        if (await ReadUpTo(stream, payload, ct) < length) throw new InvalidDataException("The request was cut short.");
+        if (await ReadUpTo(stream, payload, ct).ConfigureAwait(false) < length) throw new InvalidDataException("The request was cut short.");
         return new DisplayRequest(op, payload);
     }
 
@@ -74,12 +74,12 @@ public static class DisplayWire
     public static async Task<(ReplyStatus Status, string Message)> ReadReplyAsync(Stream stream, CancellationToken ct)
     {
         var header = new byte[3];
-        if (await ReadUpTo(stream, header, ct) < 3) throw new InvalidDataException("The reply was cut short.");
+        if (await ReadUpTo(stream, header, ct).ConfigureAwait(false) < 3) throw new InvalidDataException("The reply was cut short.");
         if (header[0] > (byte)ReplyStatus.Denied) throw new InvalidDataException($"Unknown reply status {header[0]}.");
         int length = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1));
         if (length > MaxMessageBytes) throw new InvalidDataException("The reply is too long.");
         var text = new byte[length];
-        if (await ReadUpTo(stream, text, ct) < length) throw new InvalidDataException("The reply was cut short.");
+        if (await ReadUpTo(stream, text, ct).ConfigureAwait(false) < length) throw new InvalidDataException("The reply was cut short.");
         return ((ReplyStatus)header[0], Encoding.UTF8.GetString(text));
     }
 
@@ -89,7 +89,7 @@ public static class DisplayWire
         int total = 0;
         while (total < buffer.Length)
         {
-            int n = await stream.ReadAsync(buffer.AsMemory(total), ct);
+            int n = await stream.ReadAsync(buffer.AsMemory(total), ct).ConfigureAwait(false);
             if (n == 0) break;
             total += n;
         }

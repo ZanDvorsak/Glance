@@ -119,7 +119,7 @@ public sealed class DisplayServer : IDisposable
             try
             {
                 next ??= CreateInstance();
-                await next.WaitForConnectionAsync(token);
+                await next.WaitForConnectionAsync(token).ConfigureAwait(false);
                 var connected = next;
                 next = null;
                 _ = Task.Run(() => Serve(connected, token));
@@ -129,7 +129,7 @@ public sealed class DisplayServer : IDisposable
             {
                 if (next is not null) { Release(next); next = null; }
                 Log("Display pipe error: " + ex.Message);
-                try { await Task.Delay(1000, token); } catch (OperationCanceledException) { return; }
+                try { await Task.Delay(1000, token).ConfigureAwait(false); } catch (OperationCanceledException) { return; }
             }
         }
         if (next is not null) Release(next);
@@ -159,17 +159,17 @@ public sealed class DisplayServer : IDisposable
                 using (var idle = CancellationTokenSource.CreateLinkedTokenSource(token))
                 {
                     idle.CancelAfter(_o.IdleTimeout);   // M2: a connection that says nothing gives its pipe instance back
-                    try { request = await DisplayWire.ReadRequestAsync(pipe, idle.Token); }
+                    try { request = await DisplayWire.ReadRequestAsync(pipe, idle.Token).ConfigureAwait(false); }
                     catch (OperationCanceledException) when (!token.IsCancellationRequested) { return; }
                     catch (InvalidDataException ex)
                     {
-                        await pipe.WriteAsync(DisplayWire.EncodeReply(ReplyStatus.Error, "Bad request: " + ex.Message), token);
+                        await pipe.WriteAsync(DisplayWire.EncodeReply(ReplyStatus.Error, "Bad request: " + ex.Message), token).ConfigureAwait(false);
                         return;   // the stream is out of step now: close it
                     }
                 }
                 if (request is null) return;
                 var (status, message) = Execute(request, session);
-                await pipe.WriteAsync(DisplayWire.EncodeReply(status, message), token);
+                await pipe.WriteAsync(DisplayWire.EncodeReply(status, message), token).ConfigureAwait(false);
                 if (request.Op == DisplayOp.Hello && status != ReplyStatus.Ok) return;
             }
         }
@@ -183,7 +183,11 @@ public sealed class DisplayServer : IDisposable
 
     private (ReplyStatus, string) Execute(DisplayRequest request, int? session)
     {
-        if (DisplayAccess.Deny(request.Op, session, _o.ConsoleSession()) is { } why) return (ReplyStatus.Denied, why);
+        if (DisplayAccess.Deny(request.Op, session, _o.ConsoleSession()) is { } why)
+        {
+            Log($"Refused {request.Op} from session {session?.ToString() ?? "unknown"}: {why}");   // rate-limited like every line here
+            return (ReplyStatus.Denied, why);
+        }
         switch (request.Op)
         {
             case DisplayOp.Status:
@@ -229,7 +233,12 @@ public sealed class DisplayServer : IDisposable
                             Volatile.Write(ref _device, d);
                             Log($"Display opened for session {session}");
                         }
-                        catch (Exception ex) { _lastError = ex.Message; return (ReplyStatus.Error, ex.Message); }
+                        catch (Exception ex)
+                        {
+                            _lastError = ex.Message;
+                            Log($"Could not open the display for session {session}: {ex.Message}");   // rate-limited: clients retry every few seconds
+                            return (ReplyStatus.Error, ex.Message);
+                        }
                     }
                     Exception? failed = null;
                     try { _device!.Blit(0, 0, DisplayWire.FrameWidth, DisplayWire.FrameHeight, request.Payload); }
