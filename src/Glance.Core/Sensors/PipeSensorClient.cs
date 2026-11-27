@@ -52,10 +52,10 @@ public sealed class PipeSensorClient : ISensorSource, IDisposable
             try
             {
                 using var pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.In, PipeOptions.None, System.Security.Principal.TokenImpersonationLevel.Anonymous);   // the server can never act as this user
-                await pipe.ConnectAsync(1000, _cts.Token);
+                await pipe.ConnectAsync(1000, _cts.Token).ConfigureAwait(false);
                 Glance.Core.Service.PipeServerCheck.Verify(pipe, _trustedOwners);   // fake values from a squatter are never shown
                 using var reader = new StreamReader(pipe);
-                while (!_cts.IsCancellationRequested && await reader.ReadLineAsync(_cts.Token) is { } line)
+                while (!_cts.IsCancellationRequested && await reader.ReadLineAsync(_cts.Token).ConfigureAwait(false) is { } line)
                 {
                     if (Parse(line) is not { } feed) continue;
                     lock (_lock)
@@ -70,7 +70,7 @@ public sealed class PipeSensorClient : ISensorSource, IDisposable
             catch (Exception) { /* sender not running or disconnected: retry */ }
 
             lock (_lock) _snapshot = Array.Empty<SensorInfo>();   // the connection is gone: drop the old values
-            try { await Task.Delay(1000, _cts.Token); } catch (OperationCanceledException) { return; }
+            try { await Task.Delay(1000, _cts.Token).ConfigureAwait(false); } catch (OperationCanceledException) { return; }
         }
     }
 

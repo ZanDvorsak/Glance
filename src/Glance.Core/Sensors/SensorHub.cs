@@ -19,7 +19,7 @@ public sealed class SensorHub : ISensorSource, IDisposable
     private readonly Func<SensorService> _openLocal;
     private readonly Func<List<SensorInfo>> _readDrives;
     private readonly TimeSpan _firstWait;
-    private readonly Task _localLoop, _mergeLoop;
+    private readonly Task _localLoop;
     private int _disposed;
 
     /// <param name="pipe">Tests pass their own client; the default reads <see cref="PipeSensorClient.PipeName"/> from the service.</param>
@@ -32,12 +32,12 @@ public sealed class SensorHub : ISensorSource, IDisposable
         _openLocal = openLocal;
         _readDrives = readDrives;
         _firstWait = firstWait;
-        _mergeLoop = Task.Run(MergeLoop);
+        _ = Task.Run(MergeLoop);
         _localLoop = Task.Run(LocalLoop);
     }
 
     /// <summary>True while the Glance service's feed arrives (all sensors).</summary>
-    public bool FromService => _pipe.HasData;
+    public bool FromService => _source switch { Service => true, Local => false, _ => _pipe.HasData };
 
     /// <summary>Hardware sensors (from the service or local reading) plus drive-space sensors from Windows.</summary>
     public IReadOnlyList<SensorInfo> Snapshot => _merged;
@@ -47,9 +47,34 @@ public sealed class SensorHub : ISensorSource, IDisposable
         ? $"Sensors: Glance service ({Snapshot.Count})"
         : _local is null ? "Sensors: starting..." : $"Sensors: limited, service not running ({Snapshot.Count})";
 
+    /// <summary>The hub changes between the service's feed and its own sensors only after this many checks in a row (1 s apart) disagree (review L4).</summary>
+    public const int SwitchAfterChecks = 2;
+
+    private const int Undecided = 0, Service = 1, Local = 2;
+    private volatile int _source = Undecided;
+    private int _streak;   // checks in a row that disagreed with _source (local loop only)
+
+    /// <summary>
+    /// One check of the feed: the first decides at once; after that the source changes only when <see cref="SwitchAfterChecks"/>
+    /// checks in a row disagree. A feed that is stale for a moment (the first second after a resume, one slow service update)
+    /// then never makes this process open LibreHardwareMonitor and close it again.
+    /// </summary>
+    private int Choose(bool feedLive)
+    {
+        int want = feedLive ? Service : Local;
+        if (_source == Undecided || want == _source) { _source = want; _streak = 0; }
+        else if (++_streak >= SwitchAfterChecks) { _source = want; _streak = 0; }
+        return _source;
+    }
+
     private void Merge()
     {
-        var baseList = _pipe.HasData ? _pipe.Snapshot : _local?.Snapshot ?? Array.Empty<SensorInfo>();
+        var baseList = _source switch
+        {
+            Service => _pipe.Snapshot,
+            Local => _local?.Snapshot ?? Array.Empty<SensorInfo>(),
+            _ => _pipe.HasData ? _pipe.Snapshot : Array.Empty<SensorInfo>(),
+        };
         if (Environment.TickCount64 - _drivesAt > 5000) { _drives = _readDrives(); _drivesAt = Environment.TickCount64; }
         _merged = baseList.Concat(_drives).ToList();
     }
@@ -59,7 +84,7 @@ public sealed class SensorHub : ISensorSource, IDisposable
         while (!_cts.IsCancellationRequested)
         {
             try { Merge(); } catch (Exception ex) { Debug.WriteLine("Sensor merge failed: " + ex.Message); }
-            try { await Task.Delay(500, _cts.Token); } catch (OperationCanceledException) { return; }
+            try { await Task.Delay(500, _cts.Token).ConfigureAwait(false); } catch (OperationCanceledException) { return; }
         }
     }
 
@@ -71,12 +96,12 @@ public sealed class SensorHub : ISensorSource, IDisposable
     {
         try
         {
-            try { await Task.Delay(_firstWait, _cts.Token); } catch (OperationCanceledException) { return; }   // give the service's feed a moment to arrive first
+            try { await Task.Delay(_firstWait, _cts.Token).ConfigureAwait(false); } catch (OperationCanceledException) { return; }   // give the service's feed a moment to arrive first
             while (!_cts.IsCancellationRequested)
             {
                 try
                 {
-                    if (_pipe.HasData)
+                    if (Choose(_pipe.HasData) == Service)
                     {
                         if (_local is { } l) { _local = null; l.Dispose(); }
                     }
@@ -88,7 +113,7 @@ public sealed class SensorHub : ISensorSource, IDisposable
                     }
                 }
                 catch (Exception ex) { Debug.WriteLine("Local sensors failed: " + ex.Message); }   // try again in a second
-                try { await Task.Delay(1000, _cts.Token); } catch (OperationCanceledException) { return; }
+                try { await Task.Delay(1000, _cts.Token).ConfigureAwait(false); } catch (OperationCanceledException) { return; }
             }
         }
         finally
@@ -97,22 +122,18 @@ public sealed class SensorHub : ISensorSource, IDisposable
         }
     }
 
-    /// <summary>
-    /// How long <see cref="Dispose"/> waits for the loops. Short: the editor and the tray app dispose the hub on their UI threads
-    /// (review M7), and safety does not depend on it (the loop closes its own sensors); it only lets the close happen before exit.
-    /// </summary>
-    public static readonly TimeSpan DisposeWait = TimeSpan.FromMilliseconds(500);
+    /// <summary>Ends when the local loop has let go of its sensors (after <see cref="Dispose"/>). Tests and shutdown code may wait on it, with a timeout.</summary>
+    public Task Stopped => _localLoop;
 
-    /// <summary>Cancels the loops and waits for them (briefly); the local loop closes its sensors on its way out.</summary>
+    /// <summary>
+    /// Cancels the loops and returns at once: the editor and the tray app call this on their UI threads (review M7). The local
+    /// loop closes its sensors on its way out, off the UI thread, and never during an update; sensors it is still opening are
+    /// closed as soon as they are open.
+    /// </summary>
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _cts.Cancel();
         _pipe.Dispose();
-        bool ended = false;
-        try { ended = Task.WaitAll(new[] { _localLoop, _mergeLoop }, DisposeWait); } catch { /* best effort */ }
-        // still inside an update or an open: mark it closed without waiting; the update closes it when it ends,
-        // and the loop's finally closes sensors that are still being opened
-        if (!ended) _local?.Dispose(TimeSpan.Zero);
     }
 }

@@ -165,16 +165,17 @@ public class SensorFeedTests
     public async Task M8_each_new_snapshot_has_the_next_number_and_reaches_the_client_at_once()
     {
         var name = PipeName();
-        using var server = new SensorPipeServer(name, ServicePipeSecurity.Build(Me));
+        // the re-send waits a minute here, so a snapshot that arrives within a few seconds was sent at once (robust under load)
+        using var server = new SensorPipeServer(name, ServicePipeSecurity.Build(Me), null, TimeSpan.FromMinutes(1));
         server.Start();
         server.Publish(new[] { new SensorInfo("/a", "hw", "A", "Load", 1f, "%") });
         using var client = new PipeSensorClient(name, trustedOwners: new[] { Me });
         Assert.True(await Eventually(() => client.HasData, 6000), "the first snapshot never arrived");
         Assert.Equal(1, client.Sequence);
-        await Task.Delay(300);   // the server is now waiting for its once-a-second re-send
+        await Task.Delay(300);   // the server is now waiting for its re-send
 
         server.Publish(new[] { new SensorInfo("/a", "hw", "A", "Load", 2f, "%") });
-        Assert.True(await Eventually(() => client.Sequence == 2, 500), "a new snapshot waited for the next re-send");
+        Assert.True(await Eventually(() => client.Sequence == 2, 5000), "a new snapshot waited for the next re-send");
         Assert.Equal(2f, client.Snapshot[0].Value);
     }
 

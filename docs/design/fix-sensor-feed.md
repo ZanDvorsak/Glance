@@ -84,9 +84,11 @@ at once; the 1 s re-send remains as a heartbeat (it also finds clients that stop
 | `M8_a_failing_device_is_logged_once_a_minute_not_every_second` (fake clock, 70 updates) | fail: `System.InvalidOperationException: EC read failed` | pass: one line, then one "(repeated 59 more times before this)" line |
 
 Fix: `SensorService.Collect` reads each device and sub-device in its own try. A device whose `Update()` throws keeps its
-sensors in the list with no value (widgets show "no value", not old numbers that look live); if even listing its sensors
+sensors in the list: with their last good value for up to 3 failed updates in a row (`SensorService.FailedUpdatesKept`, review L1:
+EC, SMBus and NVMe reads fail now and then, and the display should not blink), then with no value (widgets show "no value", not
+old numbers that look live); if even listing its sensors
 throws, it is left out. Failures go to the service log through `LogLimiter` (the same line at most once a minute, with the
-count). Only a failure to list the hardware at all still throws, and then nothing new is published (previous section).
+count; the limit keys on the device and error type, not the error text, which can change every time). Only a failure to list the hardware at all still throws, and then nothing new is published (previous section).
 
 ### Dispose races (nit) and the hub's local loop
 
@@ -103,12 +105,15 @@ Fix, the shutdown order is now cancel, wait for the loop, then close:
   3 s for an update in progress; if it is still running then, the update closes it as it ends. After `Dispose`, `Update` does
   nothing. `Dispose(TimeSpan)` lets callers choose the wait.
 - `LocalSensorSource` (service): its loop owns the `SensorService` and closes it in a `finally`. `Dispose` cancels, waits up to
-  3 s for the loop, and only if the loop is still busy marks the service closed without waiting again. `ServiceRuntime.Stop`
+  1 s for the loop (`LocalSensorSource.StopWait`, review L3: inside the service's stop budget), and only if the loop is still busy
+  marks the service closed without waiting again; the hung update then closes it when it ends. `ServiceRuntime.Stop`
   still blanks the display first.
 - `SensorHub` (tray app, editor): the same pattern. Its local loop has a try per pass (a failed open or update is tried again a
   second later), checks for cancellation right after opening, and closes its sensors in a `finally`, so sensors opened while the
-  hub was disposed are closed. `Dispose` waits only 500 ms (`SensorHub.DisposeWait`) for the loops, because the editor and the tray app call it on their
-  UI threads (M7); correctness does not depend on that wait.
+  hub was disposed are closed. `Dispose` only cancels and returns at once (review nit), because the editor and the tray app call it on their
+  UI threads (M7); the loop closes the sensors off the UI thread. `SensorHub.Stopped` ends when it has. The hub changes between the
+  service's feed and its own sensors only after 2 checks in a row disagree (`SensorHub.SwitchAfterChecks`, review L4), so a feed
+  that is stale for a moment (after a resume, one slow update) never opens LibreHardwareMonitor in the user's process.
 
 ### Service wiring (`ServiceRuntime.Start`, not testable here)
 
@@ -149,3 +154,11 @@ Need an installed service (built from this branch) and the real hardware; not ve
 3. Stop the service (`sc.exe stop GlanceService`, one UAC prompt): within about 5 s the editor shows
    "Sensors: limited, service not running", and the service stops in a few seconds (the log ends with "Glance service stopped").
 4. Close the editor and the tray app with the service stopped (local sensors in use): they close at once, as before.
+
+## Older tray app or editor against this service (review L2)
+
+An older tray app or editor reads each line as a bare list, so the new `{"Seq","AgeMs","Sensors"}` line fails to parse: it
+reconnects every second and shows only its basic local sensors. Its log says nothing (that code is already shipped). The
+installer closes the editor and the tray app before it upgrades (`taskkill` in `PrepareToInstall`) and starts the tray app again
+afterwards, so an installed upgrade never mixes them. Only an older portable copy started by hand meets the new service: restart
+it from the new version. The reverse (a new client and an older service) works: the client still reads the bare list.

@@ -27,3 +27,15 @@
 - `sc.exe stop GlanceService` (one UAC prompt): within about 5 s the editor shows limited sensors, and the log ends with "Glance service stopped" a few seconds after the blank.
 - Sleep and wake the PC with the editor open: the sensors come back from the service within a few seconds, without staying on the limited ones.
 - Upgrade from a build without this fix while the tray app runs: confirm it is restarted, otherwise it stays on limited sensors (L2).
+
+## Fixes after review
+Tests in `SensorFeedReviewTests.cs`; "before" = branch head `65fccbe`. All 6 failed before; after, 815/815 pass (three runs of the sensor tests), and a mutation of each of L1, L4 and the number lock makes its test fail.
+- **M1:** `.ConfigureAwait(false)` on every await in `LocalSensorSource`, `SensorHub`, `SensorPipeServer`, `PipeSensorClient`.
+- **L1** `L1_a_device_that_fails_now_and_then_keeps_its_last_value_for_a_few_updates`: before "failed update 1: the value blinked to no value"; after: last good value for 3 failed updates, then no value.
+- **L2:** documented in `docs/design/fix-sensor-feed.md` (the installer closes and restarts the tray app and editor; only an old portable copy is affected; old binaries cannot log it).
+- **L3** `L3_the_service_sensors_stop_within_about_a_second_when_an_update_hangs`: before "Dispose took 3001 ms"; after: `LocalSensorSource.StopWait` 1 s, blank still first.
+- **L4** `L4_a_short_gap_in_the_service_feed_does_not_open_the_local_sensors`: before "Expected 0, Actual 3" local opens; after: switch only after 2 checks in a row.
+- **Nit, number** `Nit_snapshot_numbers_are_not_lost_when_two_threads_publish`: before "Expected 40000, Actual 33930"; after: numbered under a lock.
+- **Nit, log key** `Nit_a_device_whose_error_text_changes_is_still_logged_once_a_minute`: before "contained 30 items"; after: one line (`LogLimiter.Filter(key, message)`).
+- **Nit, hub dispose** `Nit_disposing_the_hub_never_waits_for_its_local_sensors`: before "blocked the UI thread for 513 ms"; after: returns at once, the loop closes the sensors.
+- **Nit, flaky test:** `M8_each_new_snapshot_..._at_once` now uses a 1-minute re-send and a 5 s window (test seam `resend`).

@@ -39,7 +39,7 @@ public sealed class LocalSensorSource : ISensorSource, IDisposable
         _readDrives = readDrives;
         _log = log;
         try { _service.Update(); }
-        catch (Exception ex) { Log("Sensors: the first update failed: " + ex.Message); }   // the loop tries again every second
+        catch (Exception ex) { Log("first", "Sensors: the first update failed: " + ex.Message); }   // the loop tries again every second
         Merge();
         _loop = Task.Run(Loop);
     }
@@ -50,15 +50,15 @@ public sealed class LocalSensorSource : ISensorSource, IDisposable
         {
             while (!_cts.IsCancellationRequested)
             {
-                try { await Task.Delay(1000, _cts.Token); } catch (OperationCanceledException) { return; }
+                try { await Task.Delay(1000, _cts.Token).ConfigureAwait(false); } catch (OperationCanceledException) { return; }
                 bool fresh = false;
                 try { _service.Update(); fresh = true; }
-                catch (Exception ex) { Log("Sensors: update failed: " + ex.Message); }
+                catch (Exception ex) { Log("update", "Sensors: update failed: " + ex.Message); }
                 if (_cts.IsCancellationRequested) return;
-                try { Merge(); } catch (Exception ex) { Log("Sensors: reading drive space failed: " + ex.Message); }
+                try { Merge(); } catch (Exception ex) { Log("drives", "Sensors: reading drive space failed: " + ex.Message); }
                 if (fresh)
                 {
-                    try { Updated?.Invoke(); } catch (Exception ex) { Log("Sensors: publishing failed: " + ex.Message); }
+                    try { Updated?.Invoke(); } catch (Exception ex) { Log("publish", "Sensors: publishing failed: " + ex.Message); }
                 }
             }
         }
@@ -71,18 +71,25 @@ public sealed class LocalSensorSource : ISensorSource, IDisposable
         _merged = _service.Snapshot.Concat(_drives).ToList();
     }
 
-    private void Log(string message)
+    private void Log(string key, string message)   // the key leaves out the error text, which can change every time
     {
-        try { if (_limiter.Filter(message) is { } line) _log?.Invoke(line); } catch { /* never */ }
+        try { if (_limiter.Filter(key, message) is { } line) _log?.Invoke(line); } catch { /* never */ }
     }
 
-    /// <summary>Cancels the loop and waits for it (bounded); the loop closes LibreHardwareMonitor on its way out.</summary>
+    /// <summary>
+    /// How long <see cref="Dispose"/> waits for the loop. The service disposes this in its stop, after the blank, inside the
+    /// stop wait it gave Windows; an update is normally far shorter, and one that hangs closes LibreHardwareMonitor itself when it
+    /// ends (review L3).
+    /// </summary>
+    public static readonly TimeSpan StopWait = TimeSpan.FromSeconds(1);
+
+    /// <summary>Cancels the loop and waits for it (at most <see cref="StopWait"/>); the loop closes LibreHardwareMonitor on its way out.</summary>
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _cts.Cancel();
         bool ended = false;
-        try { ended = _loop.Wait(SensorService.DisposeWait); } catch { /* the loop never throws; best effort */ }
+        try { ended = _loop.Wait(StopWait); } catch { /* the loop never throws; best effort */ }
         // if the loop is still inside an update after that, mark it closed without waiting again: the update closes when it ends
         if (!ended) _service.Dispose(TimeSpan.Zero);
     }

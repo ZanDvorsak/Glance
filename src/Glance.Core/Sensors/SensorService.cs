@@ -44,6 +44,12 @@ public sealed class SensorService : ISensorSource, IDisposable
     private bool _closed;
     private List<SensorInfo> _snapshot = new();
 
+    /// <summary>How many failed updates in a row a device's sensors keep their last good value (review L1).</summary>
+    public const int FailedUpdatesKept = 3;
+
+    // per sensor id: the last good value and how many updates in a row its device has failed since (under _gate)
+    private Dictionary<string, (float? Value, int Failures)> _held = new(), _nextHeld = new();
+
     /// <param name="log">Where a failing device is reported (the service log); the same line is written once a minute.</param>
     public SensorService(Action<string>? log = null)
     {
@@ -90,7 +96,9 @@ public sealed class SensorService : ISensorSource, IDisposable
             {
                 if (_disposed) return;
                 var list = new List<SensorInfo>();
+                _nextHeld = new Dictionary<string, (float?, int)>();
                 foreach (var hw in _roots()) Collect(hw, list);
+                _held = _nextHeld;   // sensors that are gone are forgotten
                 lock (_lock) _snapshot = list;
             }
             finally
@@ -105,20 +113,44 @@ public sealed class SensorService : ISensorSource, IDisposable
         string name = "?";
         bool failed = false;
         try { name = hw.Name; hw.Update(); }
-        catch (Exception ex) { failed = true; Log($"Sensors: reading \"{name}\" failed: {ex.GetType().Name}: {ex.Message}"); }
+        catch (Exception ex) { failed = true; Log($"reading {name} {ex.GetType().Name}", $"Sensors: reading \"{name}\" failed: {ex.GetType().Name}: {ex.Message}"); }
         try
         {
-            foreach (var s in hw.Readings)   // a device that failed keeps its sensors, with no value: widgets show "no value", not old numbers
-                list.Add(new SensorInfo(s.Id, name, s.Name, s.Type.ToString(), failed ? null : SensorInfo.Finite(s.Value), UnitFor(s.Type)));
+            foreach (var s in hw.Readings)
+                list.Add(new SensorInfo(s.Id, name, s.Name, s.Type.ToString(), failed ? Held(s.Id) : Fresh(s.Id, SensorInfo.Finite(s.Value)), UnitFor(s.Type)));
             foreach (var sub in hw.Children) Collect(sub, list);
         }
-        catch (Exception ex) { Log($"Sensors: listing \"{name}\" failed: {ex.GetType().Name}: {ex.Message}"); }
+        catch (Exception ex) { Log($"listing {name} {ex.GetType().Name}", $"Sensors: listing \"{name}\" failed: {ex.GetType().Name}: {ex.Message}"); }
     }
 
-    private void Log(string message)
+    /// <summary>A sensor read now: remember its value in case its device fails next time.</summary>
+    private float? Fresh(string id, float? value)
     {
-        try { if (_limiter.Filter(message) is { } line) _log?.Invoke(line); } catch { /* never */ }
+        _nextHeld[id] = (value, 0);
+        return value;
     }
+
+    /// <summary>
+    /// A sensor whose device failed this update: its last good value for up to <see cref="FailedUpdatesKept"/> failed updates in
+    /// a row (devices such as the EC, SMBus or NVMe fail now and then, and the display should not blink), then no value, so a
+    /// device that has really stopped never shows old numbers as live (review L1).
+    /// </summary>
+    private float? Held(string id)
+    {
+        var (value, failures) = _held.TryGetValue(id, out var h) ? h : (null, FailedUpdatesKept);
+        failures++;
+        var shown = failures <= FailedUpdatesKept ? value : null;
+        _nextHeld[id] = (value, failures);
+        return shown;
+    }
+
+    /// <param name="key">What counts as "the same line" for the once-a-minute limit: without the error text, which can change every time.</param>
+    private void Log(string key, string message)
+    {
+        try { if (_limiter.Filter(key, message) is { } line) _log?.Invoke(line); } catch { /* never */ }
+    }
+
+    private void Log(string message) => Log(message, message);
 
     public SensorInfo? Find(string id) => Snapshot.FirstOrDefault(s => s.Id == id);
 

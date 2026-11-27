@@ -30,15 +30,22 @@ public sealed class SensorPipeServer : IDisposable
     private readonly Action<string>? _log;
     private readonly LogLimiter _limiter = new(TimeSpan.FromMinutes(1));
     private int _instances;   // our live instances; 0 means the name has to be claimed again
+    private readonly object _publishLock = new();
+    private readonly TimeSpan _resend;
 
     /// <param name="pipeName">Defaults to the name the editor looks for. Tests pass their own so they never collide with a running service.</param>
     /// <param name="security">The pipe's rules; null allows only the current user (the Glance service passes <c>ServicePipeSecurity.Build</c>).</param>
     /// <param name="log">Where pipe problems are reported (the service log); repeated lines are written once a minute.</param>
     public SensorPipeServer(string? pipeName = null, PipeSecurity? security = null, Action<string>? log = null)
+        : this(pipeName, security, log, TimeSpan.FromSeconds(1)) { }
+
+    /// <param name="resend">Tests: how long the same snapshot waits before it is sent again (1 s in the service).</param>
+    internal SensorPipeServer(string? pipeName, PipeSecurity? security, Action<string>? log, TimeSpan resend)
     {
         _pipeName = pipeName ?? PipeSensorClient.PipeName;
         _security = security;
         _log = log;
+        _resend = resend;
     }
 
     /// <summary>
@@ -52,9 +59,11 @@ public sealed class SensorPipeServer : IDisposable
         {
             var clean = snapshot.Select(s => s with { Value = SensorInfo.Finite(s.Value) }).ToList();
             var json = JsonSerializer.Serialize(clean);
-            var previous = _latest;
-            _latest = new Published(previous.Seq + 1, Environment.TickCount64, json);   // one publisher (the service's sensor loop)
-            Interlocked.Exchange(ref _changed, NewSignal()).TrySetResult();
+            lock (_publishLock)   // two publishers (Start and the loop) never share or reorder a number
+            {
+                _latest = new Published(_latest.Seq + 1, Environment.TickCount64, json);
+                Interlocked.Exchange(ref _changed, NewSignal()).TrySetResult();
+            }
         }
         catch (Exception ex) { Log("Sensor snapshot could not be published: " + ex.Message); }
     }
@@ -79,7 +88,7 @@ public sealed class SensorPipeServer : IDisposable
                 {
                     server = ServicePipeFactory.Create(_pipeName, PipeDirection.Out, 16, security, first: Volatile.Read(ref _instances) == 0);
                     Interlocked.Increment(ref _instances);
-                    await server.WaitForConnectionAsync(_cts.Token);
+                    await server.WaitForConnectionAsync(_cts.Token).ConfigureAwait(false);
                     _ = Serve(server);
                     server = null;
                 }
@@ -88,7 +97,7 @@ public sealed class SensorPipeServer : IDisposable
                 {
                     Release(server);
                     Log("Sensor pipe error: " + ex.Message);
-                    try { await Task.Delay(2000, _cts.Token); } catch (OperationCanceledException) { return; }
+                    try { await Task.Delay(2000, _cts.Token).ConfigureAwait(false); } catch (OperationCanceledException) { return; }
                 }
             }
         });
@@ -112,13 +121,13 @@ public sealed class SensorPipeServer : IDisposable
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
                 timeout.CancelAfter(TimeSpan.FromSeconds(5)); // a client that does not read for 5 s is dropped
                 var changed = Volatile.Read(ref _changed).Task;   // before the line: a snapshot published after it is sent at once
-                await writer.WriteLineAsync(Line().AsMemory(), timeout.Token);
-                await writer.FlushAsync(timeout.Token);
+                await writer.WriteLineAsync(Line().AsMemory(), timeout.Token).ConfigureAwait(false);
+                await writer.FlushAsync(timeout.Token).ConfigureAwait(false);
                 // a new snapshot goes out at once (so the age a client sees stays about one update interval); without one, the
                 // same snapshot is re-sent after a second, older, which also finds a client that stopped reading
                 using (var wait = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token))
                 {
-                    await Task.WhenAny(changed, Task.Delay(1000, wait.Token));
+                    await Task.WhenAny(changed, Task.Delay(_resend, wait.Token)).ConfigureAwait(false);
                     wait.Cancel();
                 }
                 _cts.Token.ThrowIfCancellationRequested();
