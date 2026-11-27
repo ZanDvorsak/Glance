@@ -2,6 +2,7 @@
 global using Glance.Core.Control;
 using System.Diagnostics;
 using Glance.Core.Service;
+using Glance.Core.Threading;
 
 namespace Glance.App.Services;
 
@@ -39,6 +40,7 @@ public static class RunnerClient
     public static string? SendLive(string snapshotJson, string? baseFolder) => Send(ControlCommand.Live(snapshotJson, baseFolder));
 
     /// <summary>Starts the tray app with the editor's own (normal) rights.</summary>
+    [WorkerThread]   // looks for the exe (in a development build also the build output) and starts it through ShellExecute
     public static bool Launch()
     {
         var path = AppPaths.FindTrayExe();

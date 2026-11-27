@@ -23,6 +23,7 @@ using Glance.Core.Presets;
 using Glance.Core.Setup;
 using Glance.Core.Sensors;
 using Glance.Core.Themes;
+using Glance.Core.Threading;
 using SkiaSharp;
 using AppTheme = Glance.Core.Themes.Theme;
 
@@ -86,6 +87,19 @@ public sealed class MainWindow : Window
     private readonly PusherSlot _display;          // the editor's own display (through the service, or USB), when no tray app draws
     private DisplayPusher? _pusher => _display.Current;
     private bool _installingFfmpeg;
+
+    // M7: nothing below blocks the UI thread. Opening and closing the display, pipe round trips and process checks run on
+    // _displayWork (in order, one at a time); file work (open, save, imports) runs in Task.Run while _fileBusy disables the
+    // file buttons; slow yes/no checks are BackgroundProbes read without waiting.
+    private readonly SerialWork _displayWork = new();
+    private readonly BackgroundProbe<bool> _trayProbe = new BackgroundProbe<bool>(() => RunnerClient.IsRunning, false);
+    private readonly BackgroundProbe<bool> _ffmpegFound = new BackgroundProbe<bool>(() => Ffmpeg.Find() is not null, true);
+    private int _sendGeneration;            // bumped by every Send toggle; a slow open whose toggle is stale changes no UI
+    private bool _restarting;               // a dead-loop restart is running on _displayWork
+    private bool _fileBusy;                 // an open, save or import is running
+    private string? _pendingPackage;        // a .glance named on the command line: unpacked once the window is open
+    private readonly List<Control> _fileButtons = new();
+    private Button _offBtn = null!;
 
     // drag / resize state
     private bool _dragging;
@@ -159,21 +173,32 @@ public sealed class MainWindow : Window
             if (startArgs.Contains("--virtual")) OpenVirtualDisplay();
             var note = string.Join("  ", new[] { _settingsRead.Problem, _startupNote }.Where(s => s is not null));
             if (note.Length > 0) _status.Text = note;
-            try { await ShowRemovedImportPathsAsync(); } catch { /* a .glance opened from the command line; cosmetic */ }
+            if (_pendingPackage is { } package) { _pendingPackage = null; await OpenPathAsync(package); }   // unpacked off the UI thread
             try { await MaybeShowSetupOnFirstRunAsync(); } catch { /* never block startup */ }
         };
 
         Program.UiError += OnUiError;
-        Closing += (_, _) =>
+        Closing += (_, e) =>
         {
+            // a save or import still copying files: closing now could leave half a theme folder. Windows shutting down wins.
+            if (_fileBusy && e.CloseReason is not (WindowCloseReason.OSShutdown or WindowCloseReason.ApplicationShutdown))
+            {
+                e.Cancel = true;
+                _status.Text = "Glance is still saving, exporting or importing; close it again when that has finished.";
+                return;
+            }
             Program.UiError -= OnUiError;
             StopLive();
             _power.Handle(PowerEvent.Quit);   // nothing may reopen the display from here on
             // Avalonia also closes the window this way when Windows shuts down (WM_QUERYENDSESSION), so this is usually where the
             // session-end blank happens. It runs off the UI thread so the window closes at once; Program.Main waits for it (bounded).
-            if (_display.Current is not null) PendingExitBlank = Task.Run(() => _display.Release(blank: true, DisplayPusher.QuickStopTimeout));
+            // Always queued on _displayWork, behind a release or open still running (review M1): those already took the pusher
+            // out of _display.Current, so an empty slot does not mean the display is dark.
+            PendingExitBlank = _display.ReleaseOnExit(_displayWork);
             if (OperatingSystem.IsWindows()) _powerWatcher?.Dispose();
-            _renderer.Dispose(); _hub.Dispose(); _settings.Save();
+            _renderer.Dispose();
+            Observe(_displayWork.Run(_hub.Dispose), "Could not stop the sensors");   // after the blank: an open still running reads the sensors
+            _settings.Save();
         };
         StartPowerWatcher();   // blank the display at shutdown, sign-out and sleep while the editor drives it
     }
@@ -220,6 +245,7 @@ public sealed class MainWindow : Window
         files.Children.Add(Btn("Import AIDA64", async (_, _) => await ImportAidaAsync()));
         var export = Btn("Export", async (_, _) => await ExportAsync()); ToolTip.SetTip(export, "Share this theme as a single .glance file");
         files.Children.Add(export);
+        _fileButtons.AddRange(files.Children.OfType<Button>());   // disabled while one of them works (BeginFileWork)
         files.Children.Add(new Border { Width = 1, Margin = new Thickness(6, 4), Background = Brush("#2B3342") });
         _undoBtn = Btn("Undo", (_, _) => DoUndo()); ToolTip.SetTip(_undoBtn, "Undo (Ctrl+Z)");
         _redoBtn = Btn("Redo", (_, _) => DoRedo()); ToolTip.SetTip(_redoBtn, "Redo (Ctrl+Y)");
@@ -238,9 +264,9 @@ public sealed class MainWindow : Window
         var right = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, VerticalAlignment = VerticalAlignment.Center };
         right.Children.Add(new TextBlock { Text = "Backlight", VerticalAlignment = VerticalAlignment.Center, Foreground = Brush("#8C96A8"), Margin = new Thickness(8, 0, 0, 0) });
         right.Children.Add(slider);
-        var off = Btn("Display off", (_, _) => TurnDisplayOff());
-        ToolTip.SetTip(off, "Turn the display black (backlight off). Click \"Send to display\" to turn it back on.");
-        right.Children.Add(off);
+        _offBtn = Btn("Display off", async (_, _) => await TurnDisplayOffAsync());
+        ToolTip.SetTip(_offBtn, "Turn the display black (backlight off). Click \"Send to display\" to turn it back on.");
+        right.Children.Add(_offBtn);
         right.Children.Add(_send);
 
         // two columns: the file buttons take what is left and wrap onto more lines when needed; the display controls keep their own column.
@@ -619,15 +645,12 @@ public sealed class MainWindow : Window
     {
         // Glance.App.exe <theme.json | theme.glance> opens that file instead of the last theme (also how "Open with" would work)
         var fileArg = Environment.GetCommandLineArgs().Skip(1).FirstOrDefault(a => !a.StartsWith("--") && File.Exists(a));
-        if (fileArg is not null)
+        if (fileArg is not null && fileArg.EndsWith(ThemePackage.Extension, StringComparison.OrdinalIgnoreCase))
+            _pendingPackage = fileArg;   // a package can be up to 1 GB: unpacked once the window is open, off the UI thread (M7)
+        else if (fileArg is not null)
         {
-            try
-            {
-                var path = fileArg.EndsWith(ThemePackage.Extension, StringComparison.OrdinalIgnoreCase) ? ImportPackage(fileArg) : fileArg;
-                _themePath = path;
-                return ReadThemeNoting(path);
-            }
-            catch { _themePath = null; _importRemoved = Array.Empty<RemovedAssetPath>(); /* fall through to the usual start-up theme */ }
+            try { _themePath = fileArg; return ReadThemeNoting(fileArg); }
+            catch { _themePath = null; /* fall through to the usual start-up theme */ }
         }
 
         if (_settings.LastTheme is { } p && File.Exists(p))
@@ -728,8 +751,9 @@ public sealed class MainWindow : Window
         if (_undo.Commit(_theme.ToSnapshot())) UpdateUndoButtons();
     }
 
-    private void DoUndo() { _commitTimer.Stop(); CommitNow(); Restore(_undo.Undo()); }
-    private void DoRedo() { _commitTimer.Stop(); Restore(_undo.Redo()); }
+    // not while a save runs: it would swap in widgets the save does not know, and they would keep paths into the old folder
+    private void DoUndo() { if (_fileBusy) return; _commitTimer.Stop(); CommitNow(); Restore(_undo.Undo()); }
+    private void DoRedo() { if (_fileBusy) return; _commitTimer.Stop(); Restore(_undo.Redo()); }
 
     private void Restore(string? snapshot)
     {
@@ -749,8 +773,8 @@ public sealed class MainWindow : Window
 
     private void UpdateUndoButtons()
     {
-        _undoBtn.IsEnabled = _undo.CanUndo;
-        _redoBtn.IsEnabled = _undo.CanRedo;
+        _undoBtn.IsEnabled = !_fileBusy && _undo.CanUndo;
+        _redoBtn.IsEnabled = !_fileBusy && _undo.CanRedo;
     }
 
     private TemplatesWindow? _templates;
@@ -773,37 +797,81 @@ public sealed class MainWindow : Window
     /// <summary>Shares the current theme as one .glance file with its images and videos inside.</summary>
     private async Task ExportAsync()
     {
+        if (_fileBusy) { _status.Text = FileBusyText; return; }
         var file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
         {
             Title = "Export theme", SuggestedFileName = SafeName(_theme.Name) + ThemePackage.Extension, DefaultExtension = "glance",
             FileTypeChoices = new[] { new FilePickerFileType("Glance theme") { Patterns = new[] { "*.glance" } } },
         });
         if (file?.TryGetLocalPath() is not { } path) return;
-        try
+        if (_fileBusy) { _status.Text = FileBusyText; return; }   // a save started while the picker was open
+        // file work (review L4): no save can race it and closing waits; it zips a copy, because a save changes the live theme's paths
+        var copy = _theme.Detach();
+        using (BeginFileWork("Exporting " + path + "..."))
         {
-            await Task.Run(() => ThemePackage.Export(_theme, path));
-            _status.Text = $"Exported to {path} ({new FileInfo(path).Length / 1024.0 / 1024.0:0.0} MB). Anyone can open it with Glance.";
+            try
+            {
+                var size = await Task.Run(() => { ThemePackage.Export(copy, path); return new FileInfo(path).Length; });
+                _status.Text = $"Exported to {path} ({size / 1024.0 / 1024.0:0.0} MB). Anyone can open it with Glance.";
+            }
+            catch (Exception ex) { _status.Text = "Export failed: " + ex.Message; }
         }
-        catch (Exception ex) { _status.Text = "Export failed: " + ex.Message; }
     }
 
     /// <summary>Paths the last .glance import removed from the theme; shown once by <see cref="ShowRemovedImportPathsAsync"/>.</summary>
     private IReadOnlyList<RemovedAssetPath> _importRemoved = Array.Empty<RemovedAssetPath>();
 
     /// <summary>Opens a .glance file by unpacking it into its own folder under the themes folder.</summary>
-    private string ImportPackage(string package)
+    [WorkerThread]
+    private static string ImportPackage(string package, out IReadOnlyList<RemovedAssetPath> removed)
     {
         var baseName = SafeName(Path.GetFileNameWithoutExtension(package));
         var folder = Path.Combine(AppSettings.ThemesFolder, baseName);
         for (int n = 2; Directory.Exists(folder); n++) folder = Path.Combine(AppSettings.ThemesFolder, $"{baseName} {n}");
-        try
-        {
-            var themeFile = ThemePackage.Import(package, folder, out var removed);
-            _importRemoved = removed;
-            return themeFile;
-        }
+        try { return ThemePackage.Import(package, folder, out removed); }
         catch { try { if (Directory.Exists(folder)) Directory.Delete(folder, true); } catch { } throw; }   // do not leave a half-imported folder
     }
+
+    /// <summary>
+    /// Marks a file operation (open, save, import) as running: the file buttons and undo are disabled and the status says what
+    /// is happening, until the returned object is disposed. One at a time; callers check <see cref="_fileBusy"/> first.
+    /// </summary>
+    private IDisposable BeginFileWork(string status)
+    {
+        _fileBusy = true;
+        foreach (var b in _fileButtons) b.IsEnabled = false;
+        UpdateUndoButtons();
+        _status.Text = status;
+        return new EndFileWork(this);
+    }
+
+    private sealed class EndFileWork : IDisposable
+    {
+        private MainWindow? _w;
+        public EndFileWork(MainWindow w) => _w = w;
+        public void Dispose()
+        {
+            if (_w is not { } w) return;
+            _w = null;
+            w._fileBusy = false;
+            foreach (var b in w._fileButtons) b.IsEnabled = true;
+            w.UpdateUndoButtons();
+        }
+    }
+
+    /// <summary>
+    /// Work started and not awaited (review L1): if it fails, the error goes to editor.log and the status bar, and
+    /// <paramref name="reset"/> puts the UI back first (for example unticks Send to display). Call on the UI thread; the handler
+    /// runs there too.
+    /// </summary>
+    private void Observe(Task task, string what, Action? reset = null) => TaskObserver.Observe(task, ex =>
+    {
+        Glance.Core.Diagnostics.CrashLog.Write(Program.CrashLogFile, what, ex, DateTime.Now);
+        try { reset?.Invoke(); } catch { /* the status below still says what happened */ }
+        _status.Text = what + ": " + ex.Message;
+    });
+
+    private const string FileBusyText = "Glance is still saving, exporting or importing; try again when it has finished.";
 
     /// <summary>Tells the user which file paths an imported theme pointed outside its own package and were removed.</summary>
     private async Task ShowRemovedImportPathsAsync()
@@ -820,6 +888,7 @@ public sealed class MainWindow : Window
 
     private async Task OpenAsync()
     {
+        if (_fileBusy) { _status.Text = FileBusyText; return; }
         Directory.CreateDirectory(AppSettings.ThemesFolder);
         var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
         {
@@ -828,19 +897,36 @@ public sealed class MainWindow : Window
             FileTypeFilter = new[] { new FilePickerFileType("Glance theme") { Patterns = new[] { "*.json", "*.glance" } } },
         });
         if (files.Count == 0 || files[0].TryGetLocalPath() is not { } path) return;
-        try
+        await OpenPathAsync(path);
+    }
+
+    /// <summary>Opens a theme.json, or unpacks a shared .glance first; the file work runs off the UI thread.</summary>
+    private async Task OpenPathAsync(string path)
+    {
+        if (_fileBusy) { _status.Text = FileBusyText; return; }
+        var package = path.EndsWith(ThemePackage.Extension, StringComparison.OrdinalIgnoreCase);
+        using (BeginFileWork((package ? "Unpacking " : "Opening ") + path + "..."))
         {
-            if (path.EndsWith(ThemePackage.Extension, StringComparison.OrdinalIgnoreCase)) path = ImportPackage(path);   // a shared theme: unpack it first
-            var read = ThemeFile.Load(path);
-            SetTheme(read.Theme, path); _settings.LastTheme = path; _status.Text = read.Problem ?? "Opened " + path;
+            try
+            {
+                var (themePath, read, removed) = await Task.Run(() =>
+                {
+                    IReadOnlyList<RemovedAssetPath> removed = Array.Empty<RemovedAssetPath>();
+                    var p = package ? ImportPackage(path, out removed) : path;   // a shared theme: unpack it first
+                    return (p, ThemeFile.Load(p), removed);
+                });
+                SetTheme(read.Theme, themePath); _settings.LastTheme = themePath; _status.Text = read.Problem ?? "Opened " + themePath;
+                _importRemoved = removed;
+            }
+            catch (Exception ex) { _status.Text = "Could not open theme: " + ex.Message; return; }
         }
-        catch (Exception ex) { _status.Text = "Could not open theme: " + ex.Message; _importRemoved = Array.Empty<RemovedAssetPath>(); return; }
         await ShowRemovedImportPathsAsync();
     }
 
     /// <returns>True when the theme was written.</returns>
     private async Task<bool> SaveAsync(bool saveAs)
     {
+        if (_fileBusy) { _status.Text = FileBusyText; return false; }
         var path = _themePath;
         if (path is null || saveAs)
         {
@@ -854,18 +940,27 @@ public sealed class MainWindow : Window
             if (file?.TryGetLocalPath() is not { } p) return false;
             path = p;
         }
-        try
+        if (_fileBusy) { _status.Text = FileBusyText; return false; }   // another file operation started while the picker was open
+        var live = _theme;
+        ThemeSaveJob job;
+        using (BeginFileWork("Saving " + path + "..."))
         {
-            var moved = _theme.Save(path);
-            _undo.AfterSave(_theme.ToSnapshot(), moved);   // a plain save is not an undo step; a move to another folder clears the history
-            UpdateUndoButtons();
-            _themePath = path; _settings.LastTheme = path;
-            var settingsSaved = _settings.Save();
-            _status.Text = "Saved " + path + (moved ? " (undo history cleared: the theme now lives in a new folder)" : "")
-                           + (settingsSaved ? "" : SettingsNotSavedNote());
-            return true;
+            // pictures and videos are copied off the UI thread from a copy of the theme; the editor stays usable (M7)
+            try { job = await ThemeSaveJob.SaveAsync(live, path, a => Dispatcher.UIThread.InvokeAsync(a).GetTask()); }
+            catch (Exception ex) { _status.Text = "Save failed: " + ex.Message; return false; }
         }
-        catch (Exception ex) { _status.Text = "Save failed: " + ex.Message; return false; }
+        if (!ReferenceEquals(live, _theme)) { _status.Text = "Saved " + path; return true; }   // another theme was opened from a window meanwhile
+
+        // a plain save is not an undo step; a move to another folder clears the history. Edits made while saving stay an undo step.
+        _undo.AfterSave(job.ChangedWhileSaving ? job.SavedSnapshot : _theme.ToSnapshot(), job.Moved);
+        if (job.ChangedWhileSaving) { _commitTimer.Stop(); CommitNow(); }
+        UpdateUndoButtons();
+        _themePath = path; _settings.LastTheme = path;
+        var settingsSaved = _settings.Save();
+        _status.Text = "Saved " + path + (job.Moved ? " (undo history cleared: the theme now lives in a new folder)" : "")
+                       + (job.ChangedWhileSaving ? "  Changes made while saving are not in the file yet; save again to keep them." : "")
+                       + (settingsSaved ? "" : SettingsNotSavedNote());
+        return true;
     }
 
     // ---- errors caught by Program's UI crash handler -------------------------------------------------------------
@@ -921,36 +1016,50 @@ public sealed class MainWindow : Window
 
     private async Task ImportAidaAsync()
     {
+        if (_fileBusy) { _status.Text = FileBusyText; return; }
         var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
         {
             Title = "Import an AIDA64 LCD theme", AllowMultiple = false,
             FileTypeFilter = new[] { new FilePickerFileType("AIDA64 LCD theme") { Patterns = new[] { "*.axlcd" } } },
         });
         if (files.Count == 0 || files[0].TryGetLocalPath() is not { } path) return;
+        if (_fileBusy) { _status.Text = FileBusyText; return; }
+        var name = Path.GetFileName(path);
         var temp = Path.Combine(Path.GetTempPath(), "Glance", "import-preview-" + Guid.NewGuid().ToString("N"));
         try
         {
-            // 1) import into a throw-away folder and show it before touching the themes folder
+            // 1) import into a throw-away folder and show it before touching the themes folder (off the UI thread: it copies pictures)
+            Core.Import.AidaImportResult preview;
             var sensors = _hub.Snapshot;
-            var preview = Core.Import.AidaImporter.Import(path, temp, sensors);
-            var ok = await new ImportPreviewWindow(Path.GetFileName(path), preview, _hub, _hub.FromService).ShowDialog<bool>(this);
+            using (BeginFileWork("Reading " + name + "..."))
+                preview = await Task.Run(() => Core.Import.AidaImporter.Import(path, temp, sensors));
+            _status.Text = "Check the preview of " + name + ".";
+            var ok = await new ImportPreviewWindow(name, preview, _hub, _hub.FromService).ShowDialog<bool>(this);
             if (!ok) { _status.Text = "Import cancelled."; return; }
+            if (_fileBusy) { _status.Text = FileBusyText; return; }
 
-            // 2) confirmed: import again into the real themes folder
-            var baseName = SafeName(Path.GetFileNameWithoutExtension(path));
-            var folder = Path.Combine(AppSettings.ThemesFolder, baseName);
-            for (int n = 2; Directory.Exists(folder); n++) folder = Path.Combine(AppSettings.ThemesFolder, $"{baseName} {n}");
-
-            var res = Core.Import.AidaImporter.Import(path, folder, _hub.Snapshot);
-            var themeFile = Path.Combine(folder, "theme.json");
-            res.Theme.Save(themeFile);
-            SetTheme(res.Theme, themeFile);
-            _settings.LastTheme = themeFile;
-            var settingsSaved = _settings.Save();
-            _status.Text = $"Imported {Path.GetFileName(path)} - saved to {folder}" + (settingsSaved ? "" : SettingsNotSavedNote());
+            // 2) confirmed: import again into the real themes folder and save it there, also off the UI thread
+            using (BeginFileWork("Importing " + name + "..."))
+            {
+                var sensorsNow = _hub.Snapshot;
+                var (res, folder, themeFile) = await Task.Run(() =>
+                {
+                    var baseName = SafeName(Path.GetFileNameWithoutExtension(path));
+                    var folder = Path.Combine(AppSettings.ThemesFolder, baseName);
+                    for (int n = 2; Directory.Exists(folder); n++) folder = Path.Combine(AppSettings.ThemesFolder, $"{baseName} {n}");
+                    var res = Core.Import.AidaImporter.Import(path, folder, sensorsNow);
+                    var themeFile = Path.Combine(folder, "theme.json");
+                    res.Theme.Save(themeFile);   // a new theme nothing else has seen yet
+                    return (res, folder, themeFile);
+                });
+                SetTheme(res.Theme, themeFile);
+                _settings.LastTheme = themeFile;
+                var settingsSaved = _settings.Save();
+                _status.Text = $"Imported {name} - saved to {folder}" + (settingsSaved ? "" : SettingsNotSavedNote());
+            }
         }
         catch (Exception ex) { _status.Text = "Import failed: " + ex.Message; }
-        finally { try { if (Directory.Exists(temp)) Directory.Delete(temp, true); } catch { } }
+        finally { _ = Task.Run(() => { try { if (Directory.Exists(temp)) Directory.Delete(temp, true); } catch { } }); }
     }
     private static string SafeName(string n) => string.Concat(n.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
 
@@ -961,7 +1070,7 @@ public sealed class MainWindow : Window
             Title = "Choose an image, GIF or video", AllowMultiple = false,
             FileTypeFilter = new[] { new FilePickerFileType("Images, GIFs and videos") { Patterns = new[] { "*.png", "*.jpg", "*.jpeg", "*.bmp", "*.gif", "*.webp", "*.mp4", "*.webm", "*.mkv", "*.mov", "*.avi", "*.m4v", "*.wmv" } } },
         });
-        return LocalizePick(files.Count > 0 ? files[0].TryGetLocalPath() : null);   // a changed file is noticed by the renderer itself
+        return await LocalizePickAsync(files.Count > 0 ? files[0].TryGetLocalPath() : null);   // a changed file is noticed by the renderer itself
     }
 
     /// <summary>Where network files picked for a theme that was never saved are copied (Save then adopts them).</summary>
@@ -971,12 +1080,16 @@ public sealed class MainWindow : Window
     /// A file picked on a network share is copied into the theme now, while the user's choice is fresh: the renderer and
     /// Save never open network paths (a theme from someone else could name any host). Local files are used as they are.
     /// </summary>
-    private string? LocalizePick(string? picked)
+    private async Task<string?> LocalizePickAsync(string? picked)
     {
         if (picked is null || !AppTheme.IsNetworkOrDevicePath(picked)) return picked;
+        // a save moves the theme's folder and copies its files: a copy into the old folder now would be left behind
+        if (_fileBusy) { _status.Text = FileBusyText; return null; }
         try
         {
-            var local = PickedFile.Localize(picked, _theme, PickedStagingFolder);
+            _status.Text = $"Copying {Path.GetFileName(picked)} from the network...";
+            var into = new AppTheme { BaseFolder = _theme.BaseFolder };   // Localize only needs the folder; the live theme stays on the UI thread
+            var local = await Task.Run(() => PickedFile.Localize(picked, into, PickedStagingFolder));
             _status.Text = $"Copied {Path.GetFileName(picked)} from the network into the theme (Glance does not read network folders while it runs).";
             return local;
         }
@@ -994,14 +1107,15 @@ public sealed class MainWindow : Window
             Title = "Choose a font file", AllowMultiple = false,
             FileTypeFilter = new[] { new FilePickerFileType("Fonts") { Patterns = new[] { "*.ttf", "*.otf", "*.ttc" } } },
         });
-        return LocalizePick(files.Count > 0 ? files[0].TryGetLocalPath() : null);
+        return await LocalizePickAsync(files.Count > 0 ? files[0].TryGetLocalPath() : null);
     }
 
     // ---- widgets ------------------------------------------------------------------------------------------------
 
     private async Task AddWidgetAsync(WidgetKind kind)
     {
-        var w = Widget.Create(kind, 30 + _theme.Widgets.Count % 8 * 10, 30 + _theme.Widgets.Count % 8 * 10);
+        var theme = _theme;   // the picker and the size read are awaited: another theme may be opened meanwhile
+        var w = Widget.Create(kind, 30 + theme.Widgets.Count % 8 * 10, 30 + theme.Widgets.Count % 8 * 10);
         if (kind == WidgetKind.Image)
         {
             var path = await PickImageAsync();
@@ -1009,25 +1123,36 @@ public sealed class MainWindow : Window
             w.ImagePath = path; w.Name = Path.GetFileNameWithoutExtension(path);
             if (!Ffmpeg.IsVideo(path))
             {
-                using var data = _theme.ResolveAsset(path) is { } file ? SKData.Create(file) : null;   // a copied network pick is "assets/..."
-                using var codec = data is null ? null : SKCodec.Create(data);
-                if (codec is not null)
+                var file = _theme.ResolveAsset(path);   // a copied network pick is "assets/..."
+                if (file is not null && await Task.Run(() => ImageSize(file)) is { } size)
                 {
-                    var s = Math.Min(1.0, Math.Min((double)_theme.Width / codec.Info.Width, (double)_theme.Height / codec.Info.Height));
-                    w.Width = Math.Round(codec.Info.Width * s); w.Height = Math.Round(codec.Info.Height * s);
+                    var s = Math.Min(1.0, Math.Min((double)_theme.Width / size.Width, (double)_theme.Height / size.Height));
+                    w.Width = Math.Round(size.Width * s); w.Height = Math.Round(size.Height * s);
                 }
             }
             else { w.X = 0; w.Y = 0; w.Width = _theme.Width; w.Height = _theme.Height; w.Fit = ImageFit.Cover; }
         }
+        if (!ReferenceEquals(theme, _theme)) { _status.Text = "Another theme was opened meanwhile; add the widget again."; return; }   // a path may point into the old theme's folder
         _theme.Widgets.Add(w);
         RefreshLayers();
         SelectWidget(w);
+    }
+
+    /// <summary>A picture's pixel size, or null when it cannot be decoded. Reads the whole file.</summary>
+    [WorkerThread]
+    private static (int Width, int Height)? ImageSize(string file)
+    {
+        using var data = SKData.Create(file);
+        using var codec = data is null ? null : SKCodec.Create(data);
+        return codec is null ? null : (codec.Info.Width, codec.Info.Height);
     }
 
     // ---- setup check -------------------------------------------------------------------------------------------
 
     private SetupWindow? _setup;
 
+    /// <summary>Asks the Service Control Manager and lists processes; the sensor hub is safe to read from any thread.</summary>
+    [WorkerThread]
     private SetupContext CurrentSetupContext() => new(_hub.FromService, _hub.Snapshot.Count, Glance.Core.Service.ServiceControl.Query(), RunnerClient.IsRunning);
 
     private void OpenSetupCheck()
@@ -1043,8 +1168,7 @@ public sealed class MainWindow : Window
     {
         if (_settings.SetupCheckShown) return;
         await Task.Delay(2500);   // let sensors and the runner connection settle first
-        var ctx = CurrentSetupContext();
-        var results = await Task.Run(() => SetupChecks.Run(ctx));
+        var results = await Task.Run(() => SetupChecks.Run(CurrentSetupContext()));
         if (!SetupChecks.NeedsAttention(results)) return;
         _settings.SetupCheckShown = true; _settings.Save();
         OpenSetupCheck();
@@ -1367,13 +1491,19 @@ public sealed class MainWindow : Window
         _sensorText.Text = _hub.Status;
         _sensorDot.Fill = _hub.FromService ? Brush("#34D399") : Brush("#FF9F43");
 
-        // video widgets need FFmpeg; offer a one-click install when one is present and it is missing
-        bool needFfmpeg = Ffmpeg.Find() is null && _theme.Widgets.Any(w => w.Kind == WidgetKind.Image && Ffmpeg.IsVideo(w.ImagePath));
+        // video widgets need FFmpeg; offer a one-click install when one is present and it is missing.
+        // The search (PATH, winget folders) runs in the background; this tick shows the last answer.
+        bool hasVideo = _theme.Widgets.Any(w => w.Kind == WidgetKind.Image && Ffmpeg.IsVideo(w.ImagePath));
+        if (hasVideo) _ffmpegFound.Poke();
+        bool needFfmpeg = hasVideo && !_ffmpegFound.Value;
         _ffmpegBtn.IsVisible = needFfmpeg || _installingFfmpeg;
         _ffmpegBtn.IsEnabled = !_installingFfmpeg;
         _ffmpegBtn.Content = _installingFfmpeg ? "Installing FFmpeg..." : "Install FFmpeg for video";
 
-        if (_pusher is { IsAlive: false }) RestartDeadPusher();
+        _trayProbe.Poke();                     // lists processes in the background; the answer is at most a tick old
+        bool trayRunning = _trayProbe.Value;
+
+        if (_pusher is { IsAlive: false } && !_restarting) Observe(RestartDeadPusherAsync(), "Could not restart the display");
         if (_pusher is { } p)
         {
             _displayDot.Fill = p.LastError is not null ? Brush("#FF6B6B") : p.LastRenderError is not null ? Brush("#FF9F43") : Brush("#34D399");
@@ -1383,10 +1513,10 @@ public sealed class MainWindow : Window
         }
         else if (_liveToRunner)
         {
-            if (!RunnerClient.IsRunning) { _send.IsChecked = false; _status.Text = "The Glance tray app stopped, so live sending ended."; }
+            if (!trayRunning) { _send.IsChecked = false; _status.Text = "The Glance tray app stopped, so live sending ended."; }
             else { _displayDot.Fill = Brush("#34D399"); _displayText.Text = "Display via tray app (live)"; }
         }
-        else if (RunnerClient.IsRunning) { _displayDot.Fill = Brush("#4F8CFF"); _displayText.Text = "Tray app shows your theme"; }
+        else if (trayRunning) { _displayDot.Fill = Brush("#4F8CFF"); _displayText.Text = "Tray app shows your theme"; }
         else { _displayDot.Fill = Brushes.Gray; _displayText.Text = "Display idle"; }
     }
 
@@ -1403,8 +1533,10 @@ public sealed class MainWindow : Window
             await proc.WaitForExitAsync();
             await drain;
             Ffmpeg.Reset();
+            var found = await Task.Run(() => Ffmpeg.Find() is not null);   // a full search; it also refills the cache the renderer reads
+            _ffmpegFound.Report(found);
             _renderer.ClearImageCache();
-            _status.Text = Ffmpeg.Find() is not null ? "FFmpeg is installed. Video backgrounds are ready." : $"FFmpeg was not found after the install (winget exit code {proc.ExitCode}).";
+            _status.Text = found ? "FFmpeg is installed. Video backgrounds are ready." : $"FFmpeg was not found after the install (winget exit code {proc.ExitCode}).";
         }
         catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 2) { _status.Text = "winget was not found. Install the App Installer from the Microsoft Store, then try again."; }
         catch (Exception ex) { _status.Text = "FFmpeg install failed: " + ex.Message; }
@@ -1439,27 +1571,34 @@ public sealed class MainWindow : Window
 
     private void OnLiveTick(object? s, EventArgs e) => PushLive();
 
-    /// <summary>Turns the display black right now, whoever is driving it.</summary>
-    private void TurnDisplayOff()
+    /// <summary>Turns the display black right now, whoever is driving it. The USB and pipe work runs on <see cref="_displayWork"/>.</summary>
+    private async Task TurnDisplayOffAsync()
     {
-        bool runner = RunnerClient.IsRunning;
         StopLive();
-        _display.Release(blank: true, DisplayPusher.StopTimeout);   // blanks the screen as it closes
-        _send.IsChecked = false;
-        if (runner)
+        _send.IsChecked = false;          // runs ToggleSend(false), which queues the release (it blanks the screen as it closes)
+        var generation = _sendGeneration;
+        _offBtn.IsEnabled = false;        // one at a time
+        _status.Text = "Turning the display off...";
+        try
         {
-            Task.Run(() => RunnerClient.Send(ControlCommand.Pause));   // the runner blanks it and stops drawing
-            _status.Text = "Display off (the tray app is paused). Click Send to display to turn it back on.";
+            var (runner, busy, error) = await _displayWork.Run(() =>
+            {
+                _display.Release(blank: true, DisplayPusher.StopTimeout);   // nothing left to release when ToggleSend's ran first
+                if (RunnerClient.IsRunning)
+                {
+                    RunnerClient.Send(ControlCommand.Pause);   // the runner blanks it and stops drawing
+                    return (true, (string?)null, (string?)null);
+                }
+                if (_display.StillClosing() is { } b) return (false, b, null);   // the old loop blanks and closes it when its stuck transfer gives up
+                return (false, null, Glance.Core.Service.DisplayConnector.TryBlank());
+            });
+            _trayProbe.Report(runner);
+            if (generation != _sendGeneration) return;   // Send was ticked again meanwhile: its status wins
+            _status.Text = runner ? "Display off (the tray app is paused). Click Send to display to turn it back on."
+                         : busy ?? (error is { } err ? "Could not turn the display off: " + err : "Display off. Click Send to display to turn it back on.");
         }
-        else if (_display.StillClosing() is { } busy)
-        {
-            _status.Text = busy;          // the old loop blanks and closes it when its stuck transfer gives up
-        }
-        else
-        {
-            Task.Run(Glance.Core.Service.DisplayConnector.TryBlank).ContinueWith(t => Dispatcher.UIThread.Post(() =>
-                _status.Text = t.Result is { } err ? "Could not turn the display off: " + err : "Display off. Click Send to display to turn it back on."));
-        }
+        catch (Exception ex) { _status.Text = "Could not turn the display off: " + ex.Message; }
+        finally { _offBtn.IsEnabled = true; }
     }
 
     /// <summary>Sends the current theme to the runner whenever it changed, or again after a failed send (see <see cref="LiveSendGate"/>).</summary>
@@ -1485,42 +1624,79 @@ public sealed class MainWindow : Window
     /// through the same power and "still closing" checks as any other open. While Windows sleeps it stays closed and the wake-up
     /// path reopens it; after a session end it stays closed.
     /// </summary>
-    private void RestartDeadPusher()
+    private async Task RestartDeadPusherAsync()
     {
-        switch (_display.RestartIfDead(out var why, out var error))
+        _restarting = true;
+        try
         {
-            case PusherSlot.RestartResult.Reopened:
-                _status.Text = "The display stopped (" + why + "); reopened it.";
-                break;
-            case PusherSlot.RestartResult.NotNow:
-                if (_display.Power.Suspended) _resumeAfterSleep = true;
-                break;
-            case PusherSlot.RestartResult.Failed:
-                _send.IsChecked = false;   // runs ToggleSend(false), which sets its own status; ours goes after it
-                _status.Text = "The display stopped (" + why + ") and could not be reopened: " + error;
-                break;
+            var generation = _sendGeneration;
+            var open = OpenArgsNow();
+            var (result, why, error) = await _displayWork.Run(() =>
+            {
+                _openArgs = open;
+                var r = _display.RestartIfDead(out var w, out var e);
+                return (r, w, e);
+            });
+            switch (result)
+            {
+                case PusherSlot.RestartResult.Reopened:
+                    if (generation == _sendGeneration) _status.Text = "The display stopped (" + why + "); reopened it.";
+                    break;
+                case PusherSlot.RestartResult.NotNow:
+                    if (_display.Power.Suspended) _resumeAfterSleep = true;
+                    break;
+                case PusherSlot.RestartResult.Failed when generation == _sendGeneration:
+                    _send.IsChecked = false;   // runs ToggleSend(false), which sets its own status; ours goes after it
+                    _status.Text = "The display stopped (" + why + ") and could not be reopened: " + error;
+                    break;
+            }
         }
+        finally { _restarting = false; }
     }
 
-    private DisplayPusher OpenPusher() => new(() => _theme, _hub, _settings.Brightness) { PinnedPage = DesiredPin };
+    /// <summary>What a new pusher starts with. Read on the UI thread (Avalonia controls refuse other threads), used by <see cref="OpenPusher"/>.</summary>
+    private (int Brightness, int? Pin) OpenArgsNow() => (_settings.Brightness, DesiredPin);
+    private (int Brightness, int? Pin) _openArgs;   // set by the _displayWork item that opens, just before it opens
 
-    /// <summary>Opens the display; on failure unticks Send to display and says why.</summary>
-    private bool StartSending()
+    [WorkerThread]
+    private DisplayPusher OpenPusher() => new(() => _theme, _hub, _openArgs.Brightness) { PinnedPage = _openArgs.Pin };
+
+    /// <summary>Opens the display on <see cref="_displayWork"/>; on failure unticks Send to display and says why.</summary>
+    private async Task<bool> StartSendingAsync(int generation)
     {
-        if (_display.TryOpen(out var error)) { _status.Text = "Sending to the display..."; return true; }
+        var open = OpenArgsNow();
+        var (opened, error) = await _displayWork.Run(() => { _openArgs = open; return (_display.TryOpen(out var e), e); });
+        if (generation != _sendGeneration) return opened;   // unticked meanwhile: the release it queued runs after this open
+        if (opened) { _status.Text = "Sending to the display..."; return true; }
         bool deviceProblem = _display.PowerReason is null && _display.StillClosing() is null;
         _send.IsChecked = false;   // runs ToggleSend(false), which sets its own status; ours goes after it
         _status.Text = error + (deviceProblem ? "  (No display? Use Virtual display to preview and demo your theme on screen.)" : "");
         return false;
     }
 
+    /// <summary>
+    /// Send to display ticked or unticked. Returns at once: the release, the "is the tray app running?" check and the open run
+    /// on <see cref="_displayWork"/> in the order they were asked for, so ticking it again quickly never opens before the
+    /// release has finished. A slow open whose toggle is no longer the latest changes no UI (<see cref="_sendGeneration"/>).
+    /// </summary>
     private void ToggleSend(bool on)
     {
-        _display.Release(blank: true, DisplayPusher.StopTimeout);
+        var generation = ++_sendGeneration;
+        Observe(_displayWork.Run(() => _display.Release(blank: true, DisplayPusher.StopTimeout)), "Could not stop the display");   // also releases an open still running
         StopLive();
         if (!on) { _status.Text = "Stopped sending."; return; }
-        if (RunnerClient.IsRunning) { StartLive(); return; }
-        StartSending();
+        Observe(StartSendingOrLiveAsync(generation), "Could not start sending to the display",
+            reset: () => { if (generation == _sendGeneration) _send.IsChecked = false; });   // never left ticked on "Connecting..."
+    }
+
+    private async Task StartSendingOrLiveAsync(int generation)
+    {
+        _status.Text = "Connecting to the display...";
+        var runner = await _displayWork.Run(() => RunnerClient.IsRunning);
+        _trayProbe.Report(runner);
+        if (generation != _sendGeneration) return;
+        if (runner) { StartLive(); return; }
+        await StartSendingAsync(generation);
     }
 
     // ---- shutdown, sign-out, sleep and wake while the editor itself drives the display ------------------------------
@@ -1534,7 +1710,7 @@ public sealed class MainWindow : Window
 
     internal static void WaitForExitBlank()
     {
-        try { PendingExitBlank?.Wait(PowerBlank.SessionEndBudget); } catch { /* best effort */ }
+        try { PendingExitBlank?.Wait(PowerBlank.SessionEndBudget); } catch { /* best effort */ }   // ui-thread-ok: the message loop has ended; bounded
     }
 
     private void StartPowerWatcher()
@@ -1584,7 +1760,11 @@ public sealed class MainWindow : Window
         {
             await Task.Delay(delay);
             if (_send.IsChecked != true || _pusher is not null || _liveToRunner || !_power.MayDrive) return; // the user (or Windows) moved on
-            if (_display.TryOpen(out error)) { _status.Text = "Sending to the display..."; return; }
+            var generation = _sendGeneration;
+            var open = OpenArgsNow();
+            (var opened, error) = await _displayWork.Run(() => { _openArgs = open; return (_display.TryOpen(out var e), e); });
+            if (generation != _sendGeneration) return;   // Send was toggled while it opened; that toggle decides
+            if (opened) { _status.Text = "Sending to the display..."; return; }
         }
         _send.IsChecked = false;   // runs ToggleSend(false), which sets its own status; ours goes after it
         _status.Text = "Could not reopen the display after waking up: " + error;

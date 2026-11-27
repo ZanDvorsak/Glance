@@ -241,6 +241,17 @@ public partial class Theme : ObservableObject
     /// <summary>The whole theme as JSON, used by undo/redo and live preview.</summary>
     public string ToSnapshot() => JsonSerializer.Serialize(this, Json);
 
+    /// <summary>
+    /// An independent copy (same folder and active page) that another thread may read while the editor keeps changing this
+    /// one, for example to export it (review M7 L4). Call on the thread that owns this theme.
+    /// </summary>
+    public Theme Detach()
+    {
+        var copy = new Theme { BaseFolder = BaseFolder, ActivePageIndex = ActivePageIndex };
+        copy.ApplySnapshot(ToSnapshot());
+        return copy;
+    }
+
     /// <summary>Replaces this theme's content with a snapshot, keeping this instance (and its base folder and active page).</summary>
     public void ApplySnapshot(string json)
     {

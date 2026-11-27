@@ -56,8 +56,9 @@ public sealed class SetupWindow : Window
         _busyChecking = true;
         try
         {
-            var ctx = _context();
-            var results = await Task.Run(() => SetupChecks.Run(ctx));   // spawns processes and touches USB, so keep it off the UI thread
+            // the context asks the Service Control Manager and lists processes, and the checks spawn processes and touch USB:
+            // all of it off the UI thread (M7)
+            var results = await Task.Run(() => SetupChecks.Run(_context()));
             Render(results);
         }
         catch (Exception ex) { Say("Could not run the checks: " + ex.Message); }

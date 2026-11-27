@@ -1,0 +1,43 @@
+# Review: blocking work off the UI threads (M7, autostart L6)
+
+- **Verdict:** merge after fixing M1; resolve M2 and M3 when merging the sibling branches. The seams (`SerialWork`, `BackgroundProbe`, `ThemeSaveJob`) are sound and the editor and tray handlers use them correctly. Branch `claude/fix-ui-thread-280814` (`c9ed915`, `a656b13`) on `main` `8d2d13c`. Independent reviewer: no code changed, nothing run against the editor, tray, service or display.
+- **Build/tests:** `dotnet build src/Glance.sln -c Release -p:SkipHost=true`: 0 errors. `dotnet test src/Glance.Tests -c Release` 3 runs: 829/829 each time (about 16 s), no flaky timing tests.
+- **Proof:** I confirmed the author's claim myself.
+  - Before: scratch worktree at `8d2d13c` plus only `UiThreadAuditTests.cs`: **Failed 18, Passed 8** of 26. The 18 failures are exactly the rules in the design note's table. The 8 passes are the 3 rules the redesign already fixed, the 2 `[WorkerThread]` checks and the 3 scanner self-tests.
+  - After: all 26 audit tests and the 12 `UiThreadTests` pass on the branch. In the timing tests a stuck release or open holds the stand-in UI thread for about 1-1.5 s when called directly and under 150 ms through the seam.
+  - Is it meaningful? Yes, as a guard against regressions for the APIs it knows. It is not a proof that nothing blocks. I fooled it in a scratch copy: a call inside an interpolated-string hole, `Task.Run(() => Dispatcher.UIThread.Post(() => block))` and `ServiceControl .Query()` (with a space) all passed. A lambda that is only assigned was flagged, which is a false positive and harmless. The timing tests prove the seams, not the handlers.
+
+## Findings
+
+- **Medium M1** — The exit blank can be lost (`MainWindow.cs:195-197`). `Closing` only blanks when `_display.Current` is set, and `Program.Main` waits only for that. A release or open that Send/Display off queued on `_displayWork` a moment earlier is not waited for, so the process can end mid-blank. Over USB without the service the last frame then stays lit. `_hub.Dispose()` can also run under an open that is still in flight. On `main` the release was synchronous, so this is new. → After `_power.Handle(Quit)`, always set `PendingExitBlank = _displayWork.Run(() => _display.Release(true, QuickStopTimeout))`. It queues behind pending items and the wait is already bounded. Dispose the hub after it, or let the worker do it.
+- **Medium M2** — The deadlock branch fixes the same tray open a different way (`BackgroundOpener` + `Opened`). It also adds a different file with the same name and class, `UiThreadAuditTests`, so the merge gives an add/add conflict. → Keep one tray design: `SuperviseNow` on `_work` makes `BackgroundOpener` redundant. Keep that branch's Core `ConfigureAwait(false)`/`RemoteFrameDisplay` fixes, and rename one test class.
+- **Medium M3** — The live-lease branch replaces `RunnerClient.IsRunning` with `Presence`/`Probe()`, which is a pipe round trip. After that merge the `tray-process-scan` rule matches nothing and passes silently, and `_trayProbe` duplicates `RunnerClient.RefreshPresence`. → Add audit rules for `RunnerClient.Probe(` and the link's `Send`, and read `Presence` in place of `_trayProbe`.
+- **Low L1** — Fire-and-forget tasks swallow faults: `_ = StartSendingOrLiveAsync` (`MainWindow.cs:1663`), `_ = RestartDeadPusherAsync` (`:1481`), `_ = _displayWork.Run(Release)` (`:1660`), and the tray's `_work.Run(...)` (`RunnerContext.cs:88-89,143,208,372`). If one throws, Send stays ticked with "Connecting to the display..." and nothing is logged. → Use a small `Observe(task, onError)` helper that sets the status or logs.
+- **Low L2** — The tray's `Quit` (`RunnerContext.cs:532-537`) now does `lock (_gate)` on the UI thread while the worker can hold it for up to 18 s. Before this change the UI thread was the holder, so it never waited here. Until the deadlock branch lands, `PayOwedBlank` there also calls `DisplayConnector.TryBlank()`, which is sync-over-async on the WinForms thread. → Use `Monitor.TryEnter` with `PowerBlank.SessionEndBudget`, or run the exit blank on `_work` and wait for it with a bound.
+- **Low L3** — The scanner's blind spots (see Proof); it also has no rule for `.Wait()`, `.Result` or `GetAwaiter().GetResult()`. → Keep interpolation holes when blanking strings, treat `Post`/`InvokeAsync`/`BeginInvoke` lambdas as UI code, allow `\s*` around `.`, and add a sync-over-async rule.
+- **Low L4** — Export (`MainWindow.cs:794-808`) is not file work. Save can start during an Export, and Export reads the live theme on the pool while Save's `Apply` changes its paths. Closing during an Export is not refused either. → Wrap Export in `BeginFileWork` and export a detached snapshot.
+- **Nits:** the tray's Next/Previous page wait behind a stuck supervise and apply seconds later. Repeated "Reload theme" clicks are not collapsed. `_ffmpegFound` starts `true`, so the FFmpeg button shows one tick late. `ServiceWindow.Show` still calls `AppPaths.FindTrayExe()` every 2 s. `AddWidgetAsync` adds to whatever `_theme` is after its await.
+
+## Manual checks for the user
+
+- With no service (USB direct): tick Send, untick it, then close the editor within a second. The display must go black (this is M1).
+- Tick and untick Send quickly several times, then press Display off. The window never freezes and the display ends in the state the checkbox shows.
+- Save As a theme with a large video: the status says "Saving ...", the file buttons and Undo grey out, the preview keeps animating, and closing is refused until the save ends.
+- `Glance.App.exe big.glance`: the window opens at once and shows "Unpacking ...". The Setup check and Background service windows open without a stall.
+- Tray app with the display unplugged or the service stopped: the menu opens at once, Pause/Resume respond, and Exit still blanks.
+- Sleep and wake while the editor sends: the display comes back.
+
+## Fixes after review
+
+Each test was run on the branch (after merging `main` 84a0b26) before its fix, then after it. Full suite after: 891/891.
+
+- **M1**: `M1_closing_while_a_release_is_still_running_waits_for_its_blank` (before: "the process could end before the display was blanked"), `M1_closing_while_an_open_is_still_running_waits_for_it_and_leaves_the_display_black` (before: no display yet when the exit task finished), `M1_the_editor_hands_its_exit_blank_to_the_display_queue_and_disposes_the_hub_after_it` (before: `ReleaseOnExit` not used). Pass after.
+- **L1**: `L1_fire_and_forget_tasks_are_observed` (before: 3 editor and 5 tray sites); `TaskObserver` tests pass. Pass after.
+- **L2**: rule `tray-gate-lock` (before: `Quit` and the pipe-thread `Execute` locks flagged; `Quit` was hidden until the L3 fix). Pass after: `Quit` blanks on the worker, waits at most 4 s.
+- **L3**: `L3_a_call_inside_an_interpolated_string_is_seen`, `L3_work_posted_back_to_the_UI_thread_from_a_worker_is_UI_code`, `L3_whitespace_around_the_dot_does_not_hide_a_call`, `L3_blocking_on_a_task_is_a_rule_and_a_ContinueWith_callback_is_not_UI_code` (all failed), rule `sync-over-async` (before: `MainWindow.cs:1687`). Pass after; remaining blind spots are listed in the test.
+- **L4**: `L4_every_file_operation_in_the_editor_runs_under_BeginFileWork` (before: `ThemePackage.Export(_theme, path)`). Pass after.
+- **Nits**: `Nit_the_tray_menus_page_commands_do_not_wait_behind_the_display_check`, `Nit_the_tray_queues_reloads_and_checks_through_CoalescedWork`, rule `tray-exe-search` (before: `ServiceWindow.cs:123`, `RunnerClient.cs:44`): failed, pass after. `AddWidgetAsync` theme check: no automated test (UI flow). `_ffmpegFound` starting `true`: not changed (cosmetic).
+- **M2 (merge)**: kept `BackgroundOpener`/`Opened` for the tray's open; stops, reloads and blanks stay on the worker. My scanner class is now `UiThreadBlockingScanTests`. `ThemeSaveJob.SaveAsync` no longer resumes on the caller's context (CA2007): it takes an `onUiThread` callback.
+- **Proofs re-run on the merged code**: the scanner against `main` 84a0b26's editor and tray: 23 failures (17 of the original 18 rules; `tray-display-open` is fixed on `main` by `BackgroundOpener`) plus the new rules and checks; all pass on the branch. Timing tests: direct 1.0-1.5 s, through the seams 1-2 ms.
+- **M3**: left for the live-lease merge, as agreed.
+- **Merge of `main` 9138f4b** (deadlock, video and sensor follow-ups): the tray now opens only through `main`'s `TrayDisplayOpener` (my `Opened` is gone); its `Changed` queues the next check on the worker. `Quit` keeps one bounded wait: a worker job runs `TrayDisplayOpener.Close` and then the blank. Full suite 3 runs: 943/943; startup order, opener, deadlock, ConfigureAwait guard and UI-thread scan tests: 105/105.

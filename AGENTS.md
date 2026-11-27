@@ -204,7 +204,13 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
 - PowerShell 5.1 quirks: no `&&`; here-string terminators must start at column 0; avoid nested quotes inside `$(...)` in one-liners.
 - Elevation: only the service has administrator rights (LocalSystem, environment from the SCM). The tray app and the editor are `asInvoker`
   and must never run elevated (the installer starts them with `runasoriginaluser`). Never add a `requireAdministrator` manifest (a test fails).
-- Do not block the UI thread with USB, process or registry work (setup checks run in `Task.Run`).
+- Do not block the UI thread (editor or tray app) with USB, pipe, process, registry or big-file work (review M7,
+  `docs/design/fix-ui-thread.md`). The editor's display open/close and the tray's display check go through a `SerialWork` (Core,
+  ordered, never on the caller's thread); the tray opens with `TrayDisplayOpener`; file work goes through `Task.Run` (Save through
+  `ThemeSaveJob`); slow yes/no checks through `BackgroundProbe`. Mark blocking helpers `[WorkerThread]`. Fire-and-forget tasks go
+  through `TaskObserver.Observe` (never a bare `_ =`). `UiThreadBlockingScanTests` scans `Glance.App` and `Glance.Runner` for known
+  blocking calls on the UI thread: add a rule for a new blocking API, and give any call that must stay synchronous a
+  `// ui-thread-ok: reason` comment. Avalonia controls refuse other threads: read them on the UI thread before handing work over.
 - **Every `await` in `Glance.Core` needs `ConfigureAwait(false)`** (CA2007 is a build error there, and `ConfigureAwaitGuardTests` scans
   the source). The tray app and the editor call Core from their UI threads and block on it; an await that resumes on the caller's
   context deadlocks (that left the display black in 0.2.0, `docs/design/fix-tray-deadlock.md`). Never block on a task
