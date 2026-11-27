@@ -205,7 +205,7 @@ internal static class UiThreadScanner
     }
 
     /// <summary>Calls that start work off the calling thread; everything inside their parentheses is off the UI thread.</summary>
-    private static readonly Regex Offloads = new(@"(\b(Task\s*\.\s*Run|Task\s*\.\s*Factory\s*\.\s*StartNew|ThreadPool\s*\.\s*QueueUserWorkItem|\w*[Ww]ork\s*\.\s*Run)|\bnew\s+BackgroundProbe<[^>]*>|\w*[Oo]pener\s*\.\s*TryStart|\.\s*ContinueWith)\s*\(");
+    private static readonly Regex Offloads = new(@"(\b(Task\s*\.\s*Run|Task\s*\.\s*Factory\s*\.\s*StartNew|ThreadPool\s*\.\s*QueueUserWorkItem|\w*[Ww]ork\s*\.\s*Run)|\bnew\s+BackgroundProbe<[^>]*>|\.\s*ContinueWith)\s*\(");
     /// <summary>Calls that run their lambda on the UI thread again, also from inside a worker (review L3).</summary>
     private static readonly Regex UiPosts = new(@"(\bDispatcher\s*\.\s*UIThread\s*\.\s*(Post|InvokeAsync|Invoke)|\.\s*BeginInvoke)\s*\(");
     private static readonly Regex WorkerAttribute = new(@"\[WorkerThread\]");

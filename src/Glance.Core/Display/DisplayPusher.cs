@@ -87,13 +87,14 @@ public sealed class DisplayPusher : IDisposable
     public int? PinnedPage { get => _pinned < 0 ? null : _pinned; set => _pinned = value ?? -1; }
 
     /// <summary>Opens the display, through the Glance service when it runs, else over USB directly; throws with a readable message if it is missing or busy.</summary>
-    public DisplayPusher(Func<Theme> theme, ISensorSource sensors, int brightness)
-        : this(theme, sensors, brightness, Service.DisplayConnector.Open()) { }
+    /// <param name="pinnedPage">The page to show from the very first frame (see <see cref="PinnedPage"/>); null rotates normally.</param>
+    public DisplayPusher(Func<Theme> theme, ISensorSource sensors, int brightness, int? pinnedPage = null)
+        : this(theme, sensors, brightness, Service.DisplayConnector.Open(), null, pinnedPage) { }
 
     /// <summary>Drives any <see cref="IFrameDisplay"/> (tests pass a fake and short timings). Takes ownership of <paramref name="lcd"/>, also when this throws.</summary>
-    internal DisplayPusher(Func<Theme> theme, ISensorSource sensors, int brightness, IFrameDisplay lcd, PusherTiming? timing = null)
+    internal DisplayPusher(Func<Theme> theme, ISensorSource sensors, int brightness, IFrameDisplay lcd, PusherTiming? timing = null, int? pinnedPage = null)
     {
-        _theme = theme; _sensors = sensors; _brightness = brightness;
+        _theme = theme; _sensors = sensors; _brightness = brightness; PinnedPage = pinnedPage;   // before the loop starts: its first frame shows that page
         _lcd = lcd; _timing = timing ?? PusherTiming.Default;
         try { _lcd.SetBrightness(brightness); }
         catch { _lcd.Dispose(); throw; }   // otherwise the claimed USB interface stays busy until the process exits

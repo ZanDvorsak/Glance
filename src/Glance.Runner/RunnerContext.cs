@@ -20,7 +20,7 @@ namespace Glance.Runner;
 /// frames to the Glance service (or straight to the display when there is no service), reloads the theme when it changes,
 /// and accepts commands from the editor over a pipe only this user can open. Sensors come from the service (or the basic local ones).
 /// </summary>
-internal sealed class RunnerContext : ApplicationContext
+internal sealed class RunnerContext : ApplicationContext, ITrayDisplayOwner
 {
     /// <summary>The editor of this Windows session talks to this pipe (see <see cref="ServiceNames.TrayControlPipe"/>).</summary>
     private static readonly string ControlPipeName = ServiceNames.TrayControlPipeForThisSession();
@@ -57,8 +57,7 @@ internal sealed class RunnerContext : ApplicationContext
     private string? _loggedRenderError;     // each distinct theme error is logged once, not every frame
     private DateTime? _failingSince;
     private string? _lastError;
-    private readonly BackgroundOpener _opener = new();                       // opens the display off the UI thread
-    private readonly LogLimiter _openLog = new(TimeSpan.FromMinutes(1));     // a missing display is retried every 2 s
+    private readonly TrayDisplayOpener _opener;   // opens the display off the UI thread and decides what to do with it
     private volatile bool _paused;      // set on the UI thread, read by the supervisor
     private int? _pinPage;
     private int _brightness;
@@ -70,7 +69,9 @@ internal sealed class RunnerContext : ApplicationContext
         _ = _ui.Handle; // force handle creation so other threads can marshal onto the UI thread
         _supervise = new CoalescedWork(_work, SuperviseNow);
         _reload = new CoalescedWork(_work, ReloadNow);
+        _opener = new TrayDisplayOpener(this, OpenPusher);
         Log("Tray app starting as " + WindowsIdentity.GetCurrent().Name);
+        ThemeRenderer.VideoProblem += Log;   // a video that cannot play, once per file and error
 
 
         _sensors = new SensorHub();   // the service's feed, or the basic sensors this user can read
@@ -230,10 +231,9 @@ internal sealed class RunnerContext : ApplicationContext
                 else if (!_opener.IsOpening)
                 {
                     // in the background, not even on this worker: the service pipe or USB can take seconds, and a stop or
-                    // reload queued meanwhile must not wait behind it; Opened takes the result
+                    // reload queued meanwhile must not wait behind it; TrayDisplayOpener decides what to do with the result
                     _closingPusher = null;
-                    int brightness = _brightness;
-                    _opener.TryStart(() => new DisplayPusher(() => Current, _sensors, brightness), Opened);
+                    _opener.Start(_brightness, _pinPage);
                 }
             }
             else
@@ -260,43 +260,29 @@ internal sealed class RunnerContext : ApplicationContext
         }
     }
 
-    /// <summary>
-    /// The background open finished (thread pool). Takes the new pusher unless things changed meanwhile: Windows started a
-    /// shutdown or sleep, the user paused, the app is quitting (the policy then forbids driving) or another pusher is running.
-    /// Failures are logged, at most once a minute per distinct message, and shown in the tray menu.
-    /// </summary>
+    /// <summary>The only place the tray app creates a pusher. Passed to <see cref="TrayDisplayOpener"/>, which runs it off the UI thread.</summary>
     [WorkerThread]
-    private void Opened(DisplayPusher? opened, Exception? error)
+    private DisplayPusher OpenPusher(int brightness, int? pinnedPage) => new(() => Current, _sensors, brightness, pinnedPage);
+
+    // ITrayDisplayOwner: TrayDisplayOpener (Core, tested) decides what to do with an opened display; these apply it here
+    object ITrayDisplayOwner.Gate => _gate;
+    DisplayPowerPolicy ITrayDisplayOwner.Power => _power;
+    bool ITrayDisplayOwner.Paused => _paused;
+    bool ITrayDisplayOwner.HasPusher => _pusher is not null;
+    void ITrayDisplayOwner.Adopt(DisplayPusher pusher)
     {
-        lock (_gate)
-        {
-            if (opened is null)
-            {
-                _lastError = error?.Message ?? "unknown error";
-                if (_openLog.Filter("Could not open the display: " + _lastError) is { } line) Log(line);
-            }
-            else if (!_power.MayDrive)
-            {
-                // the power event found nothing to blank while this opened; the new pusher may already have drawn a frame
-                Log("Windows is ending the session or sleeping; closing the display just opened");
-                _blankOwed = false;
-                if (!opened.Stop(blank: true, DisplayPusher.QuickStopTimeout)) RememberClosing(opened);
-            }
-            else if (_paused || _pusher is not null)
-            {
-                if (!opened.Stop(blank: _paused, DisplayPusher.StopTimeout)) RememberClosing(opened);
-            }
-            else
-            {
-                opened.PinnedPage = _pinPage;
-                opened.SetBrightness(_brightness);   // in case it changed while opening
-                _pusher = opened;
-                _failingSince = null;
-                _lastError = null;
-                Log(opened.ViaService ? "Display opened through the Glance service" : "Display opened over USB (no Glance service)");
-            }
-        }
-        Supervise();   // status now (and a retry later if it failed); only queues work, from any thread
+        pusher.PinnedPage = _pinPage;        // in case they changed while it opened
+        pusher.SetBrightness(_brightness);
+        _pusher = pusher;
+        _failingSince = null;
+        _lastError = null;
+    }
+    void ITrayDisplayOwner.RememberClosing(DisplayPusher pusher) => RememberClosing(pusher);
+    void ITrayDisplayOwner.OpenFailed(string message) => _lastError = message;
+    void ITrayDisplayOwner.Log(string line) => Log(line);
+    void ITrayDisplayOwner.Changed()
+    {
+        Supervise();   // status now (and the next open, if it failed); only queues work on _work, from any thread
     }
 
     /// <param name="blank">Turn the screen black as it closes. Not wanted when it is reopened immediately (reload, error recovery).</param>
@@ -328,7 +314,7 @@ internal sealed class RunnerContext : ApplicationContext
     /// display is blanked here, not later on the UI thread. It never waits on the UI thread (BeginInvoke only), and the blank is
     /// bounded: if the supervisor worker holds <see cref="_gate"/> for long (stopping or reloading the display), it gives up and
     /// leaves the blank to the worker, which sees the policy and pays the owed blank in its next <see cref="SuperviseNow"/>. A
-    /// display that is still being opened in the background is not under the lock; <see cref="Opened"/> sees the policy and blanks it.
+    /// display that is still being opened in the background is not under the lock; <see cref="TrayDisplayOpener"/> sees the policy and blanks it.
     /// </summary>
     private void OnPowerEvent(PowerEvent e)
     {
@@ -567,6 +553,9 @@ internal sealed class RunnerContext : ApplicationContext
     /// <summary>Next to the tray app; in a development build also in the repository's editor output, never elsewhere (L9).</summary>
     private static string? FindEditor() => DevPaths.FindSibling("Glance.App.exe", "Glance.App");
 
+    /// <summary>How long quitting waits for a background open: the open itself (a pipe connect and hello) plus its blank.</summary>
+    private static readonly TimeSpan QuitOpenWait = DisplayPusher.QuickStopTimeout + TimeSpan.FromSeconds(2);
+
     private void Quit()
     {
         if (_quitting) return;   // a session end and the EXIT command can both ask
@@ -576,18 +565,22 @@ internal sealed class RunnerContext : ApplicationContext
         _supervisor.Stop();
         lock (_watchers) foreach (var w in _watchers) w.Dispose();
         _power.Handle(PowerEvent.Quit);   // nothing may reopen the display from here on (the policy has its own lock); an open
-                                          // still running in the background sees it in Opened and blanks what it opened
-        // The blank runs on the worker, behind anything it is doing, and the UI thread waits for it at most the session-end
-        // budget (review L2): a stuck transfer holds _gate for up to 18 s, and the old lock (_gate) here waited for all of it.
+                                          // still running in the background sees it in TrayDisplayOpener and blanks what it opened
+        // One exit job on the worker, behind anything it is doing, and one bounded wait here (UI-thread review L2): a stuck
+        // transfer holds _gate for up to 18 s, and a lock (_gate) on this thread waited for all of it.
+        //  1. TrayDisplayOpener.Close: no new opens, and an open still running finishes (it blanks and closes what it opened)
+        //     before the sensors it renders with are disposed below (deadlock review L2);
+        //  2. the blank of the running display.
         var exit = _work.Run(() =>
         {
+            if (!_opener.Close(QuitOpenWait)) Log("A display open was still running when the tray app quit");
             lock (_gate)
             {
                 PayOwedBlank();                                               // a session end that found the display busy
                 DisposePusher(blank: true, DisplayPusher.QuickStopTimeout);   // blanks it unless a session end already took and blanked it
             }
         });
-        try { if (!exit.Wait(PowerBlank.SessionEndBudget)) Log("The display did not blank in time; exiting anyway"); }   // ui-thread-ok: exiting; bounded
+        try { if (!exit.Wait(QuitOpenWait + PowerBlank.SessionEndBudget)) Log("The display did not blank in time; exiting anyway"); }   // ui-thread-ok: exiting; bounded
         catch (Exception ex) { Log("Could not blank the display on exit: " + ex.GetBaseException().Message); }
         _powerWatcher?.Dispose();
         _sensors.Dispose();

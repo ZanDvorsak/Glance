@@ -123,7 +123,7 @@ internal sealed class RemoteFrameDisplay : IFrameDisplay
             throw new OperationCanceledException("The Glance service did not answer in time.");
         }
         cts.Dispose();
-        return io.GetAwaiter().GetResult();
+        return io.GetAwaiter().GetResult();   // sync-wait: the task has finished (bounded Wait above); this only unwraps its exception
     }
 
     public void Blit(int x, int y, int w, int h, byte[] rgb565Be)

@@ -21,7 +21,7 @@ on Avalonia's UI thread. Tests use `UiLikeContext` (a never-pumped UI-like threa
 
 - `RemoteFrameDisplay.Request`: fixed. The pipe exchange runs on the thread pool, with a timeout that works.
 - All 22 `await`s in Core: `ConfigureAwait(false)` added. CA2007 is a build error in Core, and `ConfigureAwaitGuardTests` scans the source.
-- `RunnerContext`: the display opens off the UI thread (`BackgroundOpener`) after the control pipe and timers start; a failed open is logged once a minute.
+- `RunnerContext`: the display opens off the UI thread (`TrayDisplayOpener`, Core) after the control pipe and timers start; a failed open is logged once a minute.
 - `DisplayServer`: logs refusals and failed USB opens, rate-limited.
 - `ControlPipeClient.cs:43`: safe, unchanged (tested: returns null within the timeout on a UI-like thread).
 - `ThemeRenderer.cs:765`, `SessionPowerWatcher.cs:90`, `DisplayPusher.cs:309`: safe, unchanged (each tested on a UI-like thread).

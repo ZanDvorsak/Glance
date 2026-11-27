@@ -104,7 +104,9 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
   the service once it answers (`DisplayPusher.ViaService`).
 - **Sensors:** LibreHardwareMonitor (needs admin + the PawnIO driver for CPU/motherboard data) runs in the service. The sensor pipe is
   created first and serves `[]` until it is ready. `SensorHub` (Core) in the tray and the editor prefers the service's feed and falls back
-  to basic local sensors; the feed counts as gone after 5 s without data. Drive-space sensors come from `DriveSensors`.
+  to basic local sensors; the feed counts as gone when its snapshot is 5 s old, even while the pipe stays connected (each line
+  is `{"Seq","AgeMs","Sensors"}`; NaN/Infinity are sent as no value; one failing device never stops the others; see
+  `docs/design/fix-sensor-feed.md`). Drive-space sensors come from `DriveSensors`.
 - **Tray control pipe commands** (one line each, reply `OK ...`): `STATUS`, `RELOAD`, `PAUSE`, `RESUME`, `EXIT`, `NEXT`, `PREV`, `PAGE <n>`
   (0 releases), `BRIGHTNESS <0-7>`, `LIVE <base64 folder> <base64 theme json>` (show the editor's unsaved theme; `-` for no folder),
   `LIVE_CLEAR`. Build and parse them only with `Glance.Core.Control.ControlCommand` (shared by both sides and tested).
@@ -182,7 +184,7 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
   Video is decoded only in user-side processes (tray app, editor), as the user; the service never starts ffmpeg.
   `VideoSource` finds and starts ffmpeg on its own thread (never the UI thread); frames are reference counted, so draw them only
   through an `AcquireFrame()` lease. While a video widget is resized, the renderer keeps the running decoder and stretches its frames;
-  a decoder for the new size starts once the size has been stable for 500 ms. A stopped ffmpeg is retried after 5 s
+  a decoder for the new size starts once the size has been stable for 500 ms. A stopped ffmpeg is retried after 5 s, doubling per failed run up to 60 s (logged once to runner.log)
   (`docs/design/fix-video-frames.md`). `Ffmpeg.Find` keeps its
   elevated rule for any elevated caller: it only accepts a copy that only administrators can change
   (`FolderTrust.CheckExecutable(exe, TrustScope.FolderFiles)`: the exe, the files next to it, its folder and every folder above it, no links). The editor's
@@ -204,7 +206,7 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
   and must never run elevated (the installer starts them with `runasoriginaluser`). Never add a `requireAdministrator` manifest (a test fails).
 - Do not block the UI thread (editor or tray app) with USB, pipe, process, registry or big-file work (review M7,
   `docs/design/fix-ui-thread.md`). The editor's display open/close and the tray's display check go through a `SerialWork` (Core,
-  ordered, never on the caller's thread); the tray opens with `BackgroundOpener`; file work goes through `Task.Run` (Save through
+  ordered, never on the caller's thread); the tray opens with `TrayDisplayOpener`; file work goes through `Task.Run` (Save through
   `ThemeSaveJob`); slow yes/no checks through `BackgroundProbe`. Mark blocking helpers `[WorkerThread]`. Fire-and-forget tasks go
   through `TaskObserver.Observe` (never a bare `_ =`). `UiThreadBlockingScanTests` scans `Glance.App` and `Glance.Runner` for known
   blocking calls on the UI thread: add a rule for a new blocking API, and give any call that must stay synchronous a
@@ -213,7 +215,8 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
   the source). The tray app and the editor call Core from their UI threads and block on it; an await that resumes on the caller's
   context deadlocks (that left the display black in 0.2.0, `docs/design/fix-tray-deadlock.md`). Never block on a task
   (`.Result`, `.Wait()`, `GetAwaiter().GetResult()`) without a timeout; test such code on `UiLikeContext` (tests), not only under xUnit.
-  The tray app opens the display with `BackgroundOpener`, never on its UI thread.
+  The tray app opens the display with `TrayDisplayOpener` (Core, tested), never on its UI thread; blocking waits in Core need a timeout
+  or a `// sync-wait: <why>` comment (`ConfigureAwaitGuardTests` scans for `.Wait()`, `.Result`, `GetResult()`).
 - Rendering races: the editor mutates the theme while a pusher renders it; renderers catch `InvalidOperationException` and retry next frame.
 
 ## Verifying changes

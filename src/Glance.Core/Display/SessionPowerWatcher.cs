@@ -87,7 +87,7 @@ public sealed class SessionPowerWatcher : IDisposable
         }) { IsBackground = true, Name = "Glance session/power watcher" };
         _thread.SetApartmentState(ApartmentState.STA);
         _thread.Start();
-        ready.Wait();
+        ready.Wait();   // sync-wait: its own new thread sets it right after creating the window; nothing needs the caller
         if (failure is not null) throw failure;
     }
 
