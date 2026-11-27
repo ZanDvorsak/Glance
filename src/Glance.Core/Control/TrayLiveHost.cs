@@ -66,6 +66,7 @@ public sealed class TrayLiveHost : IDisposable
         {
             lock (_gate)
             {
+                if (Interlocked.Exchange(ref _renewPending, 0) == 1) State.Renew();   // a wake noted by Resumed
                 ended = State.Expire();
                 if (ended) _changed();
             }
@@ -74,11 +75,14 @@ public sealed class TrayLiveHost : IDisposable
         if (ended) _log("The editor's live preview ended (no word from the editor); showing the saved theme");
     }
 
-    /// <summary>Windows woke up: restart the lease, so the saved theme does not flash before the editor's next heartbeat.</summary>
-    public void Resumed()
-    {
-        lock (_gate) State.Renew();
-    }
+    private int _renewPending;
+
+    /// <summary>
+    /// Windows woke up: restart the lease, so the saved theme does not flash before the editor's next heartbeat. Never waits:
+    /// it runs on the power watcher's thread while the tray's lock may be held for seconds; the next <see cref="Expire"/>
+    /// renews the lease first, under the lock, before it checks it.
+    /// </summary>
+    public void Resumed() => Interlocked.Exchange(ref _renewPending, 1);
 
     public void Dispose() => _timer.Dispose();
 }

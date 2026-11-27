@@ -67,7 +67,7 @@ public sealed class TrayLink : IDisposable
     public string? Send(ControlCommand command)
     {
         var reply = SendAsync(command);
-        return reply.Wait(SendTimeout) ? reply.Result : null;
+        return reply.Wait(SendTimeout) ? reply.Result : null;   // sync-wait: Result only after the bounded Wait said it finished
     }
 
     /// <summary>

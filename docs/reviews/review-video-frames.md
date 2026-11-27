@@ -22,3 +22,11 @@
 - Leave a full-screen video playing for 5 minutes: private bytes of the tray app and the editor stay flat in Task Manager
 - Rename a text file to `.mp4` and use it: the widget shows ffmpeg's error, with one short `ffmpeg.exe` about every 5 s. End `ffmpeg.exe` in Task Manager while a good video plays: the last frame stays and playback resumes within about 5 s
 - Close the theme or the editor while a video plays: no `ffmpeg.exe` is left running and the window does not hang
+
+## Fixes after review
+- **L1** → the settle wait tolerates a gap of 3 of the renderer's own frames (at least 1 s); a stand-in decoder is kept alive while still loading. Test `L1_a_renderer_drawing_every_1_2_seconds_...`: before timed out (no decoder at the new size), after passes; `L1_a_drag_still_starts_no_decoder_...` guards the drag (it caught the stand-in being swept after 3 s)
+- **L2** → `Dispose` kills ffmpeg on the thread pool and returns at once; `Kill()` instead of `Kill(true)`. Test `L2_disposing_a_source_returns_at_once_...`: before "Dispose took 1513 ms", after passes
+- **L3** → back-off 5, 10, 20, 40, 60 s for runs that stop without a frame, reset after a run that played; `ThemeRenderer.VideoProblem` once per file and error, logged by the tray to `runner.log`. Tests: back-off before `Expected: 2, Actual: 3`, log-once before "collection was empty"; both pass now (the reset test is a guard)
+- **L4** → the concurrent test waits for a newer frame before checking the borrowed one. Mutation (no `AddRef`): before "Test Run Aborted" (AccessViolation), after a named failure "a borrowed frame was already freed" (3 of 3 runs). Other renderer tests can still crash under that mutation
+- **Nits** → one clock (`Now`) for the resize wait, last use and the 3 s sweep (test before timed out); while resizing, the widget's own same-fit decoder is preferred (test before drew red, after blue); `[FfmpegFact]` reports a skip without FFmpeg. Not changed: `WaitForExit()` without a limit, per-frame allocation, `Thread.Sleep` in "nothing happened" checks
+- **Suite:** 842/842, three runs; mutation checks fail the new tests for L1, L2, L3 and the fit nit

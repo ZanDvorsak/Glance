@@ -47,7 +47,17 @@ internal sealed class FakeVideoProcess : IVideoProcess
     public void Exit(int code) { ExitCode = code; _exited = true; _feed.End(); }
 
     public bool WaitForExit(int ms) => _exited;
-    public void Kill() { Killed = true; Exit(-1); }
+    /// <summary>How long Kill takes (a slow process-tree walk); 0 = at once.</summary>
+    public int KillDelayMs;
+    public volatile int KillThreadId;
+
+    public void Kill()
+    {
+        KillThreadId = Environment.CurrentManagedThreadId;
+        if (KillDelayMs > 0) Thread.Sleep(KillDelayMs);
+        Killed = true;
+        Exit(-1);
+    }
     public void Dispose() => Disposed = true;
 
     /// <summary>A read-only stream fed by the test; Read blocks until data comes or the feed ends.</summary>
@@ -96,11 +106,13 @@ public class VideoFrameTests
         public readonly List<FakeVideoProcess> Started = new();
         public int Count { get { lock (Started) return Started.Count; } }
         public FakeVideoProcess this[int i] { get { lock (Started) return Started[i]; } }
+        public Action<FakeVideoProcess>? OnLaunch;
 
         public IVideoProcess Launch(string exe, IReadOnlyList<string> args, Action<string> onErrorLine)
         {
             var p = new FakeVideoProcess(args, onErrorLine);
             lock (Started) Started.Add(p);
+            OnLaunch?.Invoke(p);
             return p;
         }
     }
@@ -175,7 +187,16 @@ public class VideoFrameTests
             while (v.FramesRead < frames)
             {
                 using var lease = v.AcquireFrame();
-                if (lease.Image is { } img) { seen.Add(img); c.DrawImage(img, 0, 0); }
+                if (lease.Image is { } img)
+                {
+                    // let the decoder replace this frame first: a frame wrongly freed while borrowed is then already freed,
+                    // so this names the failure instead of a native crash in DrawImage that aborts the whole run (review L4)
+                    int n = v.FramesRead;
+                    SpinWait.SpinUntil(() => v.FramesRead > n || v.FramesRead >= frames, 1000);
+                    Assert.True(img.Handle != IntPtr.Zero, "a borrowed frame was already freed");
+                    seen.Add(img);
+                    c.DrawImage(img, 0, 0);
+                }
             }
         producer.Wait();
         v.Dispose();
@@ -190,8 +211,7 @@ public class VideoFrameTests
         var v = Source(l);
         WaitFor(() => l.Count == 1, "ffmpeg started");
         v.Dispose();
-        Assert.True(l[0].Killed);
-        Assert.True(l[0].Disposed);
+        WaitFor(() => l[0].Killed && l[0].Disposed, "ffmpeg killed and disposed");
     }
 
     [Fact]
@@ -389,12 +409,11 @@ public class VideoFrameTests
         Assert.Equal(path, args[args.ToList().IndexOf("-i") + 1]);
     }
 
-    /// <summary>Real FFmpeg on a tiny clip it generates itself; does nothing on a PC without FFmpeg.</summary>
-    [Fact]
+    /// <summary>Real FFmpeg on a tiny clip it generates itself; skipped on a PC without FFmpeg.</summary>
+    [FfmpegFact]
     public void With_real_ffmpeg_frames_keep_coming_and_are_freed()
     {
-        var ffmpeg = Ffmpeg.Find();
-        if (ffmpeg is null) return;   // FFmpeg is optional: nothing to check here
+        var ffmpeg = Ffmpeg.Find()!;
         var dir = Path.Combine(Path.GetTempPath(), "glance-video-test-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         try

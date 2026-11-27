@@ -5,6 +5,7 @@ using Avalonia.Media;
 using Avalonia.Threading;
 using Glance.App.Services;
 using Glance.Core.Service;
+using Glance.Core.Threading;
 
 namespace Glance.App.Views;
 
@@ -70,9 +71,9 @@ public sealed class ServiceWindow : Window
         timer.Tick += async (_, _) => await Refresh();
         timer.Start();
         Closed += (_, _) => timer.Stop();
-        Show(ServiceState.Unknown, null, RunnerClient.Presence == TrayState.Answering);
-        _ = Refresh();
-        _ = CheckOldTask();
+        Show(ServiceState.Unknown, null, null, false);   // "checking..." until Refresh has asked, off the UI thread
+        TaskObserver.Observe(Refresh(), ex => Say("Could not read the service state: " + ex.Message));
+        TaskObserver.Observe(CheckOldTask(), ex => Say("Could not look for the old sign-in task: " + ex.Message));
     }
 
     private async Task Refresh()
@@ -81,18 +82,19 @@ public sealed class ServiceWindow : Window
         _refreshing = true;
         try
         {
-            var (state, status, tray) = await Task.Run(() =>
+            var (state, status, tray, trayExe) = await Task.Run(() =>
             {
                 var s = ServiceControl.Query();
-                return (s, s == ServiceState.Running ? DisplayConnector.ServiceStatus() : null, RunnerClient.Probe() == TrayState.Answering);   // M13: a round trip, not a process name
+                return (s, s == ServiceState.Running ? DisplayConnector.ServiceStatus() : null, RunnerClient.Probe() == TrayState.Answering, AppPaths.FindTrayExe() is not null);   // M13: a round trip, not a process name
             });
-            Show(state, status, tray);
+            Show(state, status, tray, trayExe);
         }
         finally { _refreshing = false; }
     }
 
-    private void Show(ServiceState service, string? status, bool trayRunning)
+    private void Show(ServiceState service, string? status, bool? trayKnown, bool trayExeFound)
     {
+        var trayRunning = trayKnown == true;
         _service = service; _trayRunning = trayRunning;
         _dot.Background = new SolidColorBrush(Color.Parse(service == ServiceState.Running ? "#34D399" : service == ServiceState.NotInstalled ? "#6B7280" : "#FF9F43"));
         _state.Text = service switch
@@ -117,15 +119,16 @@ public sealed class ServiceWindow : Window
         _serviceButton.IsEnabled = !_busy && service is ServiceState.Running or ServiceState.Stopped;
 
         _trayDot.Background = new SolidColorBrush(Color.Parse(trayRunning ? "#34D399" : "#6B7280"));
-        _trayState.Text = trayRunning ? "Tray app is running" : "Tray app is not running";
+        _trayState.Text = trayKnown is null ? "Tray app: checking..." : trayRunning ? "Tray app is running" : "Tray app is not running";
         _trayButton.Content = trayRunning ? "Stop the tray app" : "Start the tray app";
-        _trayButton.IsEnabled = !_busy && (trayRunning || AppPaths.FindTrayExe() is not null);
+        _trayButton.IsEnabled = !_busy && trayKnown is not null && (trayRunning || trayExeFound);   // looked up in Refresh, off the UI thread
         _removeTask.IsEnabled = !_busy;
     }
 
     private async Task ToggleService()
     {
-        _busy = true; _message.IsVisible = false;
+        if (!BeginBusy()) return;
+        _message.IsVisible = false;
         try
         {
             string? error = _service == ServiceState.Running
@@ -139,11 +142,12 @@ public sealed class ServiceWindow : Window
 
     private async Task ToggleTray()
     {
-        _busy = true; _message.IsVisible = false;
+        if (!BeginBusy()) return;
+        _message.IsVisible = false;
         try
         {
             if (_trayRunning) { await Task.Run(() => RunnerClient.Send(ControlCommand.Exit)); await Task.Delay(1200); }
-            else if (!RunnerClient.Launch()) Say("Could not start the tray app (Glance.Runner.exe was not found next to the editor).");
+            else if (!await Task.Run(RunnerClient.Launch)) Say("Could not start the tray app (Glance.Runner.exe was not found next to the editor).");
             else await Task.Delay(1500);
         }
         finally { _busy = false; await Refresh(); }
@@ -160,7 +164,7 @@ public sealed class ServiceWindow : Window
 
     private async Task RemoveOldTask()
     {
-        _busy = true;
+        if (!BeginBusy()) return;
         try
         {
             var error = await Task.Run(Autostart.Remove);
@@ -168,6 +172,15 @@ public sealed class ServiceWindow : Window
             else Say(error);
         }
         finally { _busy = false; await Refresh(); }
+    }
+
+    /// <summary>One action at a time: its buttons are disabled at once (not only at the next refresh), so a second click does nothing.</summary>
+    private bool BeginBusy()
+    {
+        if (_busy) return false;
+        _busy = true;
+        _serviceButton.IsEnabled = _trayButton.IsEnabled = _removeTask.IsEnabled = false;
+        return true;
     }
 
     private void Say(string text) { _message.Text = text; _message.IsVisible = true; }

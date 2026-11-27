@@ -48,9 +48,11 @@ internal sealed class ServiceRuntime : IServiceBody
 
         try
         {
-            _sensors = new LocalSensorSource();
-            _sensorPipe.Publish(_sensors.HardwareSnapshot);
-            _sensors.Updated += () => _sensorPipe.Publish(_sensors.HardwareSnapshot);
+            var sensors = new LocalSensorSource(Log);   // failing devices are logged once a minute (M8)
+            var pipe = _sensorPipe;
+            _sensors = sensors;
+            sensors.Updated += () => pipe.Publish(sensors.HardwareSnapshot);   // first: nothing below can leave the pipe serving "[]" for good
+            pipe.Publish(sensors.HardwareSnapshot);   // never throws; NaN and infinities go out as "no value" (M8)
             Log($"Sensors ready ({_sensors.HardwareSnapshot.Count})");
         }
         catch (Exception ex) { Log("Sensors could not be read: " + ex.Message); }   // the display still works

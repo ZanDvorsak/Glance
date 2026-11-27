@@ -2,6 +2,7 @@
 global using Glance.Core.Control;
 using System.Diagnostics;
 using Glance.Core.Service;
+using Glance.Core.Threading;
 
 namespace Glance.App.Services;
 
@@ -23,42 +24,19 @@ public static class RunnerClient
     private static readonly Lazy<TrayLink> LinkLazy = new(() => new TrayLink(PipeName));
     private static TrayLink Link => LinkLazy.Value;
 
-    private static int _presence = (int)TrayState.Unknown;
-    private static int _probing;
-    private static long _lastProbe;   // Environment.TickCount64 of the last probe start
-
-    /// <summary>What the last probe found (<see cref="TrayState.Unknown"/> before the first one). Never blocks.</summary>
-    public static TrayState Presence => (TrayState)Volatile.Read(ref _presence);
-
     /// <summary>
-    /// Asks the tray app now and remembers the answer. Blocks for up to the link's timeouts, so never call it on the UI thread.
+    /// Asks the tray app now: a <c>STATUS</c> round trip, and only without an answer a look at the tray processes in this
+    /// session (M13). Blocks for up to the link's timeouts. The editor keeps the last answer in its own BackgroundProbe.
     /// </summary>
-    public static TrayState Probe()
-    {
-        var state = TrayPresence.Probe(() => Link.Send(ControlCommand.Status), TrayPresence.TrayProcessesInThisSession);
-        Volatile.Write(ref _presence, (int)state);
-        return state;
-    }
-
-    /// <summary>For a UI timer: starts a probe in the background when the last one is 2 s old or more. Never blocks.</summary>
-    public static void RefreshPresence()
-    {
-        if (Environment.TickCount64 - Interlocked.Read(ref _lastProbe) < 2000) return;
-        if (Interlocked.Exchange(ref _probing, 1) != 0) return;
-        Interlocked.Exchange(ref _lastProbe, Environment.TickCount64);
-        Task.Run(() =>
-        {
-            try { Probe(); }
-            catch { /* the next tick tries again */ }
-            finally { Volatile.Write(ref _probing, 0); }
-        });
-    }
+    [WorkerThread]   // a pipe round trip, and a process list when the tray does not answer
+    public static TrayState Probe() => TrayPresence.Probe(() => Link.Send(ControlCommand.Status), TrayPresence.TrayProcessesInThisSession);
 
     /// <summary>
     /// Sends one command and waits for the reply (null if the tray app could not be reached or did not answer in time).
     /// Blocks: call it off the UI thread. There is deliberately no overload that takes a raw string: the wire format lives
     /// only in <see cref="ControlCommand"/>.
     /// </summary>
+    [WorkerThread]   // waits for the queue and one round trip (bounded by TrayLink.SendTimeout)
     public static string? Send(ControlCommand command) => Link.Send(command);
 
     /// <summary>Sends one command in order behind the ones before it; the task gives the reply.</summary>
@@ -74,9 +52,11 @@ public static class RunnerClient
     public static Task<string?> SendLiveAsync(string snapshotJson, string? baseFolder) => SendAsync(ControlCommand.Live(snapshotJson, baseFolder));
 
     /// <summary>When the editor exits: delivers what is still queued (bounded) and hangs up. Blocks: call it off the UI thread.</summary>
+    [WorkerThread]   // waits up to the timeout for the queue to drain
     public static bool CloseLink(TimeSpan timeout) => !LinkLazy.IsValueCreated || Link.Close(timeout);
 
     /// <summary>Starts the tray app with the editor's own (normal) rights.</summary>
+    [WorkerThread]   // looks for the exe (in a development build also the build output) and starts it through ShellExecute
     public static bool Launch()
     {
         var path = AppPaths.FindTrayExe();

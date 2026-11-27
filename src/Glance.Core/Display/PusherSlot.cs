@@ -100,4 +100,18 @@ public sealed class PusherSlot
         hadOne = had;
         return result;
     }
+
+    /// <summary>
+    /// The editor is closing (call after the policy got <see cref="PowerEvent.Quit"/>): blank and release the display. Returns the
+    /// work to wait for, bounded by the caller (<c>Program.Main</c> waits <see cref="PowerBlank.SessionEndBudget"/>).
+    /// Always queued behind the owner's display work (review M7 M1): a release that is still running or an open that has not
+    /// finished yet has already taken the pusher out of <see cref="Current"/>, so "nothing to release right now" does not mean
+    /// the display is dark. Waiting for this task waits for them too; an open that finishes after the Quit closes itself
+    /// (<see cref="TryOpen"/> checks the policy again), and this release then finds nothing left.
+    /// </summary>
+    public Task ReleaseOnExit(Glance.Core.Threading.SerialWork queue)
+    {
+        ArgumentNullException.ThrowIfNull(queue);
+        return queue.Run(() => Release(blank: true, DisplayPusher.QuickStopTimeout));
+    }
 }

@@ -40,7 +40,7 @@ public static class ControlPipeClient
             pipe.Write(new UTF8Encoding(false).GetBytes(line + "\n"));
             using var reader = new StreamReader(pipe, Encoding.UTF8, false, 1024, leaveOpen: true);
             var task = reader.ReadLineAsync();
-            return task.Wait(replyTimeoutMs) ? task.Result : null;
+            return task.Wait(replyTimeoutMs) ? task.Result : null;   // sync-wait: Result only after the bounded Wait; the BCL read never needs the caller
         }
         catch { return null; }
     }

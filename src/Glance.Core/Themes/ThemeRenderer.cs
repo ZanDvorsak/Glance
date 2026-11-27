@@ -26,6 +26,15 @@ public sealed class ThemeRenderer : IDisposable
     /// <summary>A pending size not asked for within this long starts its wait again.</summary>
     internal const long VideoSizeGapMs = 1000;
     private readonly Dictionary<string, (long First, long Last)> _pendingVideos = new();
+
+    /// <summary>Longest wait before a decoder that keeps failing is started again (the wait doubles per failure from <see cref="VideoRetryMs"/>).</summary>
+    internal const long VideoRetryMaxMs = 60_000;
+    private readonly Dictionary<string, int> _videoFailures = new();   // failed runs in a row per decoder key
+    private readonly HashSet<string> _videoLogged = new();             // "path\nerror" already reported
+    private long _lastRenderAt = long.MinValue, _renderInterval;
+
+    /// <summary>A video that cannot play (ffmpeg's error, once per file and message per renderer). The tray app logs it.</summary>
+    public static event Action<string>? VideoProblem;
     private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
     private readonly Dictionary<(string, bool, bool), SKTypeface> _faces = new();
     private readonly Dictionary<string, FontEntry> _fileFaces = new();
@@ -46,6 +55,7 @@ public sealed class ThemeRenderer : IDisposable
         Index(sensors);
         _theme = theme;
         _pass++;
+        NoteRenderTime(Now());
         page ??= theme.ActivePage;
         CollectThemePictures(theme, page);
         var bg = string.IsNullOrWhiteSpace(page.BackgroundColor) ? theme.BackgroundColor : page.BackgroundColor!;
@@ -409,43 +419,63 @@ public sealed class ThemeRenderer : IDisposable
         var v = GetVideo(path, key, w, h, fit, now, out var other);
         if (v is not null)
         {
-            v.LastUsedTicks = Environment.TickCount64;
+            v.LastUsedTicks = now;
             var lease = v.AcquireFrame();
             if (lease.Image is not null) { note = null; return lease; }
-            other ??= OtherVideo(path, key);
+            other ??= OtherVideo(path, key, fit);
         }
         if (other is not null)
         {
+            other.LastUsedTicks = now;   // keep it (even while it is still loading) until the new decoder has a frame
             var lease = other.AcquireFrame();
-            if (lease.Image is not null)
-            {
-                other.LastUsedTicks = Environment.TickCount64;   // keep it until the new decoder has a frame
-                note = null;
-                return lease;
-            }
+            if (lease.Image is not null) { note = null; return lease; }
         }
         note = v?.Error ?? other?.Error ?? "Loading video...";
         return VideoFrameLease.Empty;
     }
 
-    /// <summary>The most recently used decoder of this file for another size or fit, or null.</summary>
-    private VideoSource? OtherVideo(string path, string key)
+    /// <summary>
+    /// The most recently used decoder of this file for another size, preferring the same fit (the widget's own old
+    /// decoder rather than another widget's Cover or Contain frames), or null.
+    /// </summary>
+    private VideoSource? OtherVideo(string path, string key, ImageFit fit)
     {
-        VideoSource? best = null;
+        VideoSource? best = null, bestSameFit = null;
+        var fitSuffix = "|" + fit;
         foreach (var (k, v) in _videos)
-            if (k != key && k.StartsWith(path + "|", StringComparison.Ordinal) && (best is null || v.LastUsedTicks > best.LastUsedTicks))
-                best = v;
-        return best;
+        {
+            if (k == key || !k.StartsWith(path + "|", StringComparison.Ordinal)) continue;
+            if (best is null || v.LastUsedTicks > best.LastUsedTicks) best = v;
+            if (k.EndsWith(fitSuffix, StringComparison.Ordinal) && (bestSameFit is null || v.LastUsedTicks > bestSameFit.LastUsedTicks)) bestSameFit = v;
+        }
+        return bestSameFit ?? best;
     }
+
+    private void NoteRenderTime(long now)
+    {
+        if (now == _lastRenderAt) return;   // a second pass of the same frame
+        if (_lastRenderAt != long.MinValue) _renderInterval = now - _lastRenderAt;
+        _lastRenderAt = now;
+    }
+
+    /// <summary>
+    /// A pending size not asked for within this long starts its wait again: at least <see cref="VideoSizeGapMs"/>, and
+    /// three frames of this renderer, so one that draws less than once a second still settles (review L1).
+    /// </summary>
+    private long VideoGapMs => Math.Max(VideoSizeGapMs, 3 * _renderInterval);
 
     /// <summary>True once <paramref name="key"/> has been asked for without a gap for <see cref="VideoSettleMs"/>.</summary>
     private bool VideoSizeSettled(string key, long now)
     {
-        if (!_pendingVideos.TryGetValue(key, out var p) || now - p.Last > VideoSizeGapMs) p = (now, now);
+        if (!_pendingVideos.TryGetValue(key, out var p) || now - p.Last > VideoGapMs) p = (now, now);
         else p.Last = now;
         _pendingVideos[key] = p;
         return now - p.First >= VideoSettleMs;
     }
+
+    /// <summary>How long a decoder that stopped after <paramref name="failures"/> failed runs in a row waits: 5 s, 10 s, 20 s ... 60 s.</summary>
+    internal static long VideoRetryDelay(int failures) =>
+        Math.Min(VideoRetryMaxMs, VideoRetryMs << Math.Clamp(failures - 1, 0, 8));
 
     /// <summary>The decoder for exactly this size and fit, or null while a resize has not settled (then <paramref name="other"/> is the one to show).</summary>
     private VideoSource? GetVideo(string path, string key, int w, int h, ImageFit fit, long now, out VideoSource? other)
@@ -460,19 +490,28 @@ public sealed class ThemeRenderer : IDisposable
                 {
                     _videos[k].Dispose();
                     _videos.Remove(k);
+                    _videoFailures.Remove(k);
                 }
             check.Stamp = stamp;
         }
-        if (_videos.TryGetValue(key, out var v) && (v.FfmpegMissing || v.Stopped) && now - v.CreatedTicks >= VideoRetryMs)
+        if (_videos.TryGetValue(key, out var v) && (v.FfmpegMissing || v.Stopped))
         {
-            // FFmpeg was missing (or not trusted by the elevated runner) when this source was made, or it stopped: try
-            // again, so a fresh install shows up without reloading the theme. Ffmpeg.Find paces its own disk search too.
-            v.Dispose();
-            _videos.Remove(key);
+            if (v.Error is { } error && _videoLogged.Add(path + "\n" + error))
+                try { VideoProblem?.Invoke($"Video {path} does not play: {error}"); } catch { /* logging must never break drawing */ }
+            // FFmpeg was missing (or not trusted by an elevated caller): try again every 5 s, so a fresh install shows up
+            // without reloading the theme (Ffmpeg.Find paces its own disk search). FFmpeg stopped: wait twice as long
+            // after each run that failed without a frame, up to a minute; a run that played starts the count again.
+            int failures = v.FfmpegMissing || v.FramesRead > 0 ? 1 : _videoFailures.GetValueOrDefault(key) + 1;
+            if (now - v.CreatedTicks >= VideoRetryDelay(failures))
+            {
+                v.Dispose();
+                _videos.Remove(key);
+                if (v.Stopped) _videoFailures[key] = failures;
+            }
         }
         if (!_videos.TryGetValue(key, out v))
         {
-            other = OtherVideo(path, key);
+            other = OtherVideo(path, key, fit);
             if (other is not null && !VideoSizeSettled(key, now)) return null;
             _pendingVideos.Remove(key);
             // cheap: the source finds and starts ffmpeg on its own thread, never on the rendering (UI) thread
@@ -482,21 +521,21 @@ public sealed class ThemeRenderer : IDisposable
         return v;
     }
 
-    /// <summary>Stops videos that are no longer shown (widget deleted, resized, hidden, or on another page).</summary>
+    /// <summary>Stops videos that are no longer shown (widget deleted, resized, hidden, or on another page), on the renderer's clock.</summary>
     private void SweepVideos()
     {
-        var now = Environment.TickCount64;
+        var now = Now();
         foreach (var k in _videos.Where(kv => now - kv.Value.LastUsedTicks > 3000).Select(kv => kv.Key).ToList())
         {
-            _videos[k].Dispose();
+            _videos[k].Dispose();   // returns at once: ffmpeg is killed on the thread pool
             _videos.Remove(k);
         }
         if (_pendingVideos.Count > 0)   // sizes passed during a resize drag
-        {
-            var clock = Now();
-            foreach (var k in _pendingVideos.Where(kv => clock - kv.Value.Last > VideoSizeGapMs).Select(kv => kv.Key).ToList())
+            foreach (var k in _pendingVideos.Where(kv => now - kv.Value.Last > VideoGapMs).Select(kv => kv.Key).ToList())
                 _pendingVideos.Remove(k);
-        }
+        if (_videoFailures.Count > 0)   // failure counts of decoders that are gone
+            foreach (var k in _videoFailures.Keys.Where(k => !_videos.ContainsKey(k)).ToList())
+                _videoFailures.Remove(k);
         if (_videoFiles.Count > _videos.Count)   // forget file checks of videos that no longer play
             foreach (var p in _videoFiles.Keys.Where(p => !_videos.Keys.Any(k => k.StartsWith(p + "|", StringComparison.Ordinal))).ToList())
                 _videoFiles.Remove(p);
@@ -836,7 +875,7 @@ public sealed class ThemeRenderer : IDisposable
                 started = true;
             }
             if (started ? !_pending.Wait(waitMs) : !_pending.IsCompleted) return null;
-            var (stamp, ms) = _pending.Result;
+            var (stamp, ms) = _pending.Result;   // sync-wait: finished (checked just above)
             _pending = null;
             _interval = ms > SlowStatMs ? Math.Min(_interval * 2, MaxStatIntervalMs) : StatIntervalMs;
             return stamp;
@@ -885,6 +924,8 @@ public sealed class ThemeRenderer : IDisposable
         _videos.Clear();
         _videoFiles.Clear();
         _pendingVideos.Clear();
+        _videoFailures.Clear();
+        _videoLogged.Clear();
         foreach (var e in _fileFaces.Values) e.Face?.Dispose();
         _fileFaces.Clear();
     }

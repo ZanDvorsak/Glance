@@ -73,9 +73,10 @@ public partial class LiveLeaseTests
     [Fact]
     public void L2_ticking_send_probes_the_tray_fresh_instead_of_trusting_the_cached_answer()
     {
-        var toggle = MethodBody(MainWindowSource(), "ToggleSend");
-        Assert.DoesNotContain("RunnerClient.Presence", toggle);
-        Assert.Contains("RunnerClient.Probe", toggle);
+        // after the merge with the UI-thread fix the decision is in StartSendingOrLiveAsync, on _displayWork behind the release
+        var decide = MethodBody(MainWindowSource(), "StartSendingOrLiveAsync");
+        Assert.DoesNotContain("_trayProbe.Value", decide);   // the cached answer
+        Assert.Contains("_displayWork.Run(() => RunnerClient.Probe())", decide);
     }
 
     // ---- L3: a reply given up on frees the connection at once ----------------------------------------------------------
@@ -198,5 +199,38 @@ public partial class LiveLeaseTests
             Assert.StartsWith("OK", await link.SendAsync(ControlCommand.Status));   // the probe's STATUS on the same connection
         }
         Assert.NotNull(tray.Read(t => t.State.Live));   // 1.5 s, much longer than the lease
+    }
+
+    [Fact]
+    public void L1_a_wake_noted_by_the_host_renews_the_lease_before_it_is_checked()
+    {
+        var clock = new Clock();
+        var gate = new object();
+        using var host = new TrayLiveHost(gate, () => { }, _ => { }, TimeSpan.FromSeconds(5), () => clock.Now, tick: TimeSpan.FromHours(1));
+        Assert.Equal("OK", host.ExecuteLine(ControlCommand.Live(LiveJson(), null).Encode(), 1, _ => "OK"));
+        clock.Advance(4.5);
+        host.Resumed();
+        clock.Advance(4.5);
+        host.Expire();
+        lock (gate) Assert.NotNull(host.State.Live);
+    }
+
+    [Fact]
+    public void L1_noting_a_wake_never_waits_for_the_trays_lock()
+    {
+        // it runs on the power watcher's thread while a stuck stop may hold the tray's lock for seconds
+        var gate = new object();
+        using var host = new TrayLiveHost(gate, () => { }, _ => { }, tick: TimeSpan.FromHours(1));
+        using var held = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var owner = new Thread(() => { lock (gate) { held.Set(); release.Wait(10_000); } }) { IsBackground = true };
+        owner.Start();
+        Assert.True(held.Wait(5000));
+        try
+        {
+            var noted = Task.Run(host.Resumed);
+            Assert.True(noted.Wait(5000), "Resumed waited for the tray's lock");   // done while the lock is still held
+        }
+        finally { release.Set(); }
     }
 }
