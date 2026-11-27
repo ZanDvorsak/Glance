@@ -57,8 +57,18 @@ public sealed class TrayLink : IDisposable
     /// <summary>Queues a command without waiting for the reply.</summary>
     public void Post(ControlCommand command) => _ = SendAsync(command);
 
-    /// <summary>Sends a command (in order) and waits for the reply. Blocks: never call this on the UI thread.</summary>
-    public string? Send(ControlCommand command) => SendAsync(command).GetAwaiter().GetResult();
+    /// <summary>How long <see cref="Send"/> waits at most: one connect and one reply (review M3: never an unbounded wait).</summary>
+    public TimeSpan SendTimeout => _replyTimeout + TimeSpan.FromMilliseconds(_connectTimeoutMs);
+
+    /// <summary>
+    /// Sends a command (in order) and waits for the reply, at most <see cref="SendTimeout"/>, also when commands queued before it
+    /// are slow; then null (the command may still go out later). Blocks: never call this on the UI thread.
+    /// </summary>
+    public string? Send(ControlCommand command)
+    {
+        var reply = SendAsync(command);
+        return reply.Wait(SendTimeout) ? reply.Result : null;
+    }
 
     /// <summary>
     /// Takes no more commands, delivers what is still queued within <paramref name="timeout"/>, then hangs up (which also
@@ -98,9 +108,13 @@ public sealed class TrayLink : IDisposable
             {
                 if (_pipe is null) Connect();
                 _pipe!.Write(line);
-                var read = _reader!.ReadLineAsync();
+                using var giveUp = new CancellationTokenSource();
+                var read = _reader!.ReadLineAsync(giveUp.Token).AsTask();
                 if (!read.Wait(_replyTimeout))
                 {
+                    // L3: cancel the read first; while it is pending the handle cannot really close, and the tray would keep
+                    // this connection (one of its four) until it answers
+                    giveUp.Cancel();
                     Observe(read);
                     Drop();          // a late reply must never be read as the next command's
                     return null;
@@ -122,7 +136,8 @@ public sealed class TrayLink : IDisposable
     {
         // CurrentUserOnly: .NET checks that this user owns the server end, so another account that took the name gets nothing.
         // Anonymous: whoever serves the pipe can never act as this user (ImpersonateNamedPipeClient).
-        var pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, ControlPipeClient.Options, TokenImpersonationLevel.Anonymous);
+        // Asynchronous (L3): only then can a pending read be cancelled, so a dropped connection really closes at once.
+        var pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, ControlPipeClient.Options | PipeOptions.Asynchronous, TokenImpersonationLevel.Anonymous);
         try { pipe.Connect(_connectTimeoutMs); }
         catch { pipe.Dispose(); throw; }
         _pipe = pipe;

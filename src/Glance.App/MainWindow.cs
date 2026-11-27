@@ -1434,8 +1434,7 @@ public sealed class MainWindow : Window
         _liveTimer.Start();
         // one ordered link (M5): these arrive before the LIVE below, and a later LIVE_CLEAR after it
         RunnerClient.Post(ControlCommand.Resume);
-        RunnerClient.Post(ControlCommand.Brightness(_settings.Brightness));
-        RunnerClient.Post(ControlCommand.Page((DesiredPin ?? -1) + 1));
+        foreach (var c in LiveKeepAlive.RestoreCommands(_settings.Brightness, DesiredPin)) RunnerClient.Post(c);
         PushLive();
         _status.Text = LiveSendGate.ShowingText;
     }
@@ -1457,16 +1456,31 @@ public sealed class MainWindow : Window
     private readonly LiveKeepAlive _keepAlive = new();
 
     /// <summary>
-    /// M5: the tray shows the live theme only while the editor keeps it alive (a 5 s lease). If the tray says it no longer holds
-    /// it (it restarted), the next tick sends the theme again.
+    /// M5: the tray shows the live theme only while the editor keeps it alive (a 5 s lease). If the tray no longer holds it (it
+    /// restarted, or the lease ran out), the pin and brightness go again and then the theme (M2). If another editor took the
+    /// display over, live sending stops here instead of taking it back every heartbeat (M1). Monotonic time (L1).
     /// </summary>
     private void KeepLive()
     {
-        if (!_liveToRunner || !_keepAlive.TryBegin(DateTime.UtcNow)) return;
+        if (!_liveToRunner || !_keepAlive.TryBegin(MonotonicClock.Now)) return;
         RunnerClient.SendAsync(ControlCommand.LiveKeep).ContinueWith(t =>
         {
             var reply = t.IsCompletedSuccessfully ? t.Result : null;
-            Dispatcher.UIThread.Post(() => { if (_keepAlive.Complete(reply) && _liveToRunner) _liveGate.Lost(); });
+            Dispatcher.UIThread.Post(() =>
+            {
+                var result = _keepAlive.Complete(reply);
+                if (!_liveToRunner) return;
+                if (result == KeepResult.Resend)
+                {
+                    foreach (var c in LiveKeepAlive.RestoreCommands(_settings.Brightness, DesiredPin)) RunnerClient.Post(c);
+                    _liveGate.Lost();   // the next tick sends the theme, after these
+                }
+                else if (result == KeepResult.Taken)
+                {
+                    _send.IsChecked = false;   // runs ToggleSend(false), which sets its own status; ours goes after it
+                    _status.Text = "Another Glance editor is showing its edits on the display now, so live sending stopped here. Tick Send to display to take it back.";
+                }
+            });
         });
     }
 
@@ -1549,16 +1563,23 @@ public sealed class MainWindow : Window
     {
         _display.Release(blank: true, DisplayPusher.StopTimeout);
         StopLive();
+        int ticket = ++_sendTicket;   // a later tick or untick makes this answer stale
         if (!on) { _status.Text = "Stopped sending."; return; }
-        // M13: decided by the tray's answer to STATUS (asked in the background), not by a process name
-        var tray = RunnerClient.Presence;
-        if (tray == TrayState.Answering) { StartLive(); return; }
-        if (tray == TrayState.None) { StartSending(); return; }
-        // a tray app is there but the editor cannot use it: do not fight it for the display, say why instead
-        _send.IsChecked = false;   // runs ToggleSend(false), which sets its own status; ours goes after it
-        _status.Text = TrayPresence.Explain(tray) ?? "Still looking for the Glance tray app; try again in a moment.";
-        RunnerClient.RefreshPresence();
+        // M13 + review L2: ask the tray now, on a worker (the cached answer can be seconds old, or not there yet), then decide
+        _status.Text = "Looking for the Glance tray app...";
+        Task.Run(RunnerClient.Probe).ContinueWith(t => Dispatcher.UIThread.Post(() =>
+        {
+            if (ticket != _sendTicket || _send.IsChecked != true) return;
+            var tray = t.IsCompletedSuccessfully ? t.Result : TrayState.Unknown;
+            if (tray == TrayState.Answering) { StartLive(); return; }
+            if (tray == TrayState.None) { StartSending(); return; }
+            // a tray app is there but the editor cannot use it: do not fight it for the display, say why instead
+            _send.IsChecked = false;   // runs ToggleSend(false), which sets its own status; ours goes after it
+            _status.Text = TrayPresence.Explain(tray) ?? "Could not tell whether the Glance tray app runs; try again in a moment.";
+        }));
     }
+
+    private int _sendTicket;
 
     // ---- shutdown, sign-out, sleep and wake while the editor itself drives the display ------------------------------
 

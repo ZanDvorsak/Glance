@@ -11,7 +11,7 @@ namespace Glance.Tests;
 /// Review M5 (a stale live theme stays on the display after the editor is gone; commands can overtake each other) and
 /// M13 ("tray running" judged by a process name). Pipe tests use random names, never the real ones.
 /// </summary>
-public class LiveLeaseTests
+public partial class LiveLeaseTests
 {
     private static string TestPipe() => "glance-test-tray-" + Guid.NewGuid().ToString("N");
 
@@ -28,59 +28,59 @@ public class LiveLeaseTests
         return condition();
     }
 
-    /// <summary>A clock the test moves by hand.</summary>
+    /// <summary>A monotonic clock the test moves by hand.</summary>
     private sealed class Clock
     {
-        public DateTime Now = new(2026, 11, 26, 12, 0, 0, DateTimeKind.Utc);
-        public void Advance(double seconds) => Now = Now.AddSeconds(seconds);
+        public TimeSpan Now = TimeSpan.FromHours(5);
+        public void Advance(double seconds) => Now += TimeSpan.FromSeconds(seconds);
     }
 
     /// <summary>
-    /// The tray app's control side as <c>RunnerContext</c> wires it: <see cref="TrayControlServer"/> on a test pipe, the live
-    /// state under one lock, every command recorded with its connection. <paramref name="beforeApply"/> runs before a command
-    /// is applied (outside the lock), so a test can slow one down.
+    /// The tray app's control side with the tray's own wiring: <see cref="TrayControlServer"/> on a test pipe and
+    /// <see cref="TrayLiveHost"/> (the class <c>RunnerContext</c> uses) under one lock. Every command is recorded with its
+    /// connection; <paramref name="beforeApply"/> runs before a command is applied (outside the lock), so a test can slow one down.
     /// </summary>
     private sealed class FakeTray : IDisposable
     {
         private readonly object _gate = new();
         private readonly Action<ControlVerb>? _beforeApply;
-        public readonly TrayLiveState State;
+        public readonly TrayLiveHost Host;
         public readonly List<(ControlVerb Verb, long Connection)> Seen = new();
         public readonly List<string> Log = new();
         public readonly TrayControlServer Server;
         public readonly string Pipe;
+        public int Changes;   // how often the host said the live theme or pin may have changed
 
-        public FakeTray(string pipe, TrayLiveState? state = null, Action<ControlVerb>? beforeApply = null)
+        public FakeTray(string pipe, Action<ControlVerb>? beforeApply = null, TimeSpan? lease = null, TimeSpan? tick = null)
         {
             Pipe = pipe;
-            State = state ?? new TrayLiveState();
             _beforeApply = beforeApply;
-            Server = new TrayControlServer(pipe, Execute, Closed, line => { lock (Log) Log.Add(line); });
+            Host = new TrayLiveHost(_gate, () => Changes++, AddLog, lease, tick: tick);
+            Server = new TrayControlServer(pipe, Execute, Host.ConnectionClosed, AddLog);
         }
+
+        public TrayLiveState State => Host.State;
 
         /// <summary>Set after each command was applied (outside the lock).</summary>
         public Action<ControlVerb>? AfterApply;
+
+        private void AddLog(string line) { lock (Log) Log.Add(line); }
 
         private string Execute(string line, long connection)
         {
             if (!ControlCommand.TryParse(line, out var cmd, out var error)) return "ERR " + error;
             _beforeApply?.Invoke(cmd.Verb);
-            string reply;
-            lock (_gate)
-            {
-                Seen.Add((cmd.Verb, connection));
-                reply = State.Handle(cmd, connection) ?? "OK fake tray";
-            }
+            lock (_gate) Seen.Add((cmd.Verb, connection));
+            var reply = Host.ExecuteLine(line, connection, _ => "OK fake tray");   // the tray's own entry point
             AfterApply?.Invoke(cmd.Verb);
             return reply;
         }
 
-        private void Closed(long connection) { lock (_gate) State.ConnectionClosed(connection); }
-
         public T Read<T>(Func<FakeTray, T> read) { lock (_gate) return read(this); }
 
-        public void Dispose() => Server.Dispose();
+        public void Dispose() { Server.Dispose(); Host.Dispose(); }
     }
+
 
     /// <summary>An editor that sends LIVE on its own connection and then disappears (crash, kill, Task Manager) without LIVE_CLEAR.</summary>
     private static string SendLiveAndVanish(string pipe)
@@ -140,7 +140,7 @@ public class LiveLeaseTests
         var state = new TrayLiveState();
         Assert.Equal(TrayLiveState.NotHeldReply, state.Handle(ControlCommand.LiveKeep, connection: 1));   // e.g. the tray restarted
         state.Handle(ControlCommand.Live(LiveJson(), null), connection: 1);
-        Assert.Equal(TrayLiveState.NotHeldReply, state.Handle(ControlCommand.LiveKeep, connection: 2));   // not the one that sent it
+        Assert.Equal(TrayLiveState.TakenReply, state.Handle(ControlCommand.LiveKeep, connection: 2));    // another editor shows its theme (review M1)
         Assert.Equal("OK", state.Handle(ControlCommand.LiveKeep, connection: 1));
     }
 
@@ -163,7 +163,10 @@ public class LiveLeaseTests
         state.Handle(ControlCommand.Live(LiveJson(), null), connection: 1);
         Assert.False(state.ConnectionClosed(2));
         Assert.NotNull(state.Live);
-        Assert.Equal("OK", state.Handle(ControlCommand.LiveClear, connection: 2));   // LIVE_CLEAR still works from anywhere
+        // changed after review M1: only the connection that shows its theme may clear it (another editor's LIVE_CLEAR must not)
+        Assert.Equal(TrayLiveState.TakenReply, state.Handle(ControlCommand.LiveClear, connection: 2));
+        Assert.NotNull(state.Live);
+        Assert.Equal("OK", state.Handle(ControlCommand.LiveClear, connection: 1));
         Assert.Null(state.Live);
     }
 
@@ -284,7 +287,7 @@ public class LiveLeaseTests
         Assert.Contains("first: Volatile.Read(ref _instances) == 0", src);
         Assert.Contains("NativeSessions.IsRemoteClient(pipe)", src);
         var runner = File.ReadAllText(Path.Combine(SourceRoot(), "Glance.Runner", "RunnerContext.cs"));
-        Assert.Contains("new(ControlPipeName, Execute, OnControlClosed, Log)", runner);   // the default (current user only) rules
+        Assert.Contains("new(ControlPipeName, Execute, _live.ConnectionClosed, Log)", runner);   // the default (current user only) rules
     }
 
     private static string SourceRoot()
@@ -316,22 +319,22 @@ public class LiveLeaseTests
     {
         Assert.True(LiveKeepAlive.Interval * 3 <= TrayLiveState.DefaultLease, "a heartbeat or two may be late without losing the lease");
         var keep = new LiveKeepAlive();
-        var t = new DateTime(2026, 11, 26, 12, 0, 0, DateTimeKind.Utc);
+        var t = TimeSpan.FromHours(5);
         Assert.True(keep.TryBegin(t));
-        Assert.False(keep.TryBegin(t.AddSeconds(3)));          // still on its way
-        Assert.False(keep.Complete("OK"));
-        Assert.False(keep.TryBegin(t.AddSeconds(1)));          // too soon after the last one
-        Assert.True(keep.TryBegin(t.AddSeconds(2)));
+        Assert.False(keep.TryBegin(t + TimeSpan.FromSeconds(3)));          // still on its way
+        Assert.Equal(KeepResult.Kept, keep.Complete("OK"));
+        Assert.False(keep.TryBegin(t + TimeSpan.FromSeconds(1)));          // too soon after the last one
+        Assert.True(keep.TryBegin(t + TimeSpan.FromSeconds(2)));
     }
 
     [Fact]
     public void M5_only_the_trays_not_held_reply_makes_the_editor_send_its_theme_again()
     {
         var keep = new LiveKeepAlive();
-        Assert.True(keep.Complete(TrayLiveState.NotHeldReply));
-        Assert.False(keep.Complete(null));                      // no answer: the link reconnects and the next heartbeat asks again
-        Assert.False(keep.Complete("ERR unknown command"));     // an older tray: resending every 1.5 s would not help it
-        Assert.False(keep.Complete("OK"));
+        Assert.Equal(KeepResult.Resend, keep.Complete(TrayLiveState.NotHeldReply));
+        Assert.Equal(KeepResult.NoAnswer, keep.Complete(null));                      // no answer: the link reconnects and the next heartbeat asks again
+        Assert.Equal(KeepResult.Other, keep.Complete("ERR unknown command"));     // an older tray: resending every 1.5 s would not help it
+        Assert.Equal(KeepResult.Kept, keep.Complete("OK"));
 
         var gate = new LiveSendGate();
         var send = gate.TryBegin("snap")!;

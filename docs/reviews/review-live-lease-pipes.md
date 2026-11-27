@@ -27,3 +27,15 @@
 - Two editors, both with Send to display ticked: watch for the display flipping between them (M1)
 - Exit and restart the tray while live, and sleep/wake the PC while live: edits return within a few seconds
 - Tray of another account (`runas`) in your session: Send to display says "another account" and does not fight it
+
+## Fixes after review
+Written by the session that made the change. Each test failed on 13ec427 (`main` merged in) and passes now; full suite 875/875, build 0 errors.
+- **M3 (merge):** merged `main` (84a0b26), kept its startup order and `BackgroundOpener`, `Opened` pins with the lease's pin → before: 4 × CA2007 build errors in `TrayControlServer.cs`; after: `.ConfigureAwait(false)` there and on `TrayLink`'s `await foreach`, `ConfigureAwaitGuardTests` pass. `TrayLink.Send` is bounded → `M3_send_gives_up_in_time_even_behind_a_slow_queue` (before: waited 6040 ms)
+- **M1:** `LIVE_KEEP`/`LIVE_CLEAR` from a non-owner get `ERR live taken`; the editor then stops live with a message → `M1_a_second_editor_taking_the_live_theme_tells_the_first_instead_of_fighting`, `M1_the_first_editors_live_clear_does_not_clear_the_second_editors_theme` (before: `ERR no live theme`, and the second theme was cleared)
+- **M2:** the pin belongs to the connection that set it; after `ERR no live theme` the editor queues `BRIGHTNESS` + `PAGE` before `LIVE` (`LiveKeepAlive.RestoreCommands`) → `M2_a_page_pin_ends_when_the_connection_that_set_it_closes`, `M2_the_editor_sends_its_pin_and_brightness_again_when_the_tray_lost_its_theme` (before: pin stayed; `RestoreCommands` not used)
+- **L1:** `MonotonicClock` (unbiased interrupt time, sleep not counted) for lease and heartbeat; the tray renews the lease on resume → `L1_the_lease_and_the_heartbeat_never_read_the_wall_clock` (before: `TrayLiveState.cs`, `MainWindow.KeepLive`)
+- **L2:** ticking Send probes the tray on a worker, then decides (stale answers dropped by a ticket) → `L2_ticking_send_probes_the_tray_fresh_instead_of_trusting_the_cached_answer` (before: decided on `RunnerClient.Presence`)
+- **L3:** async pipe, read cancelled before dispose → `L3_a_reply_given_up_on_closes_the_connection_at_once` (before: the editor's pipe end stayed open; a first timing-only version passed before and was replaced)
+- **Nit (wiring):** the tray's live wiring moved to `TrayLiveHost` (Core; own expiry timer, `STATUS` renews), used by `RunnerContext` and `FakeTray` → new `Nit_the_trays_own_timer_ends_a_live_theme_nobody_keeps_alive`, `Nit_status_from_the_editor_keeps_its_live_theme`
+- Changed on purpose (M1): two earlier tests asserted that `LIVE_CLEAR`/`LIVE_KEEP` from another connection clear/say "not held"; they now expect `ERR live taken`
+- Not verified on the real tray, editor or display; manual checks above still apply (M1: the second editor should now win and the first should stop with a message; M2: the pin should come back after a pause)

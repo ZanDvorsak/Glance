@@ -55,11 +55,12 @@ internal sealed class RunnerContext : ApplicationContext
     private volatile bool _paused;
     private int _brightness;
 
-    private Theme Current => _liveState.Live ?? _theme;
+    private Theme Current => _live.State.Live ?? _theme;
 
     public RunnerContext()
     {
         _ = _ui.Handle; // force handle creation so other threads can marshal onto the UI thread
+        _live = new TrayLiveHost(_gate, ApplyPin, Log);   // before the control pipe: it handles the live commands
         Log("Tray app starting as " + WindowsIdentity.GetCurrent().Name);
 
 
@@ -184,7 +185,6 @@ internal sealed class RunnerContext : ApplicationContext
     {
         lock (_gate)
         {
-            ExpireLive();   // M5: an editor that went away without LIVE_CLEAR does not leave its unsaved theme behind
             // checked before the dead-loop restart below: a dead pusher is never replaced while asleep or after a session end (M2)
             if (!_power.MayDrive) { PayOwedBlank(); DisposePusher(blank: true, DisplayPusher.QuickStopTimeout); SetStatus(_power.Ended ? "Display off: Windows is ending the session" : "Display off while Windows sleeps"); return; }
             if (_paused) { DisposePusher(); SetStatus("Display paused"); return; }
@@ -220,7 +220,7 @@ internal sealed class RunnerContext : ApplicationContext
             SetStatus(_pusher is null
                 ? _lastError is null && _opener.IsOpening ? "Opening the display..." : "Waiting for the display: " + (_lastError ?? "not found")
                 : _pusher.LastRenderError is { } drawError ? "Could not draw the theme: " + drawError
-                : _liveState.Live is not null ? $"Live preview from the editor, {_pusher.Fps:0.0} fps" : $"Showing \"{_theme.Name}\"{(Current.Pages.Count > 1 ? $" (page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count})" : "")}, {_pusher.Fps:0.0} fps");
+                : _live.State.Live is not null ? $"Live preview from the editor, {_pusher.Fps:0.0} fps" : $"Showing \"{_theme.Name}\"{(Current.Pages.Count > 1 ? $" (page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count})" : "")}, {_pusher.Fps:0.0} fps");
         }
     }
 
@@ -251,7 +251,7 @@ internal sealed class RunnerContext : ApplicationContext
             }
             else
             {
-                opened.PinnedPage = _liveState.PinnedPage;
+                opened.PinnedPage = _live.State.PinnedPage;
                 opened.SetBrightness(_brightness);   // in case it changed while opening
                 _pusher = opened;
                 _failingSince = null;
@@ -295,6 +295,7 @@ internal sealed class RunnerContext : ApplicationContext
     private void OnPowerEvent(PowerEvent e)
     {
         var action = _power.Handle(e);       // the policy has its own lock: from now on Supervise will not open the display
+        if (e == PowerEvent.Resume) _live.Resumed();   // L1: the editor slept too; no flash of the saved theme before its next heartbeat
         Log($"Windows {e}: {action}");      // before blanking, in case Windows ends the process during it
         if (action is PowerAction.BlankAndStop or PowerAction.BlankAndHold)
         {
@@ -401,49 +402,31 @@ internal sealed class RunnerContext : ApplicationContext
     // ---- control pipe (from the editor) -------------------------------------------------------------------------
 
     /// <summary>
-    /// Under <see cref="_gate"/>: the editor's live theme and page pin. The live theme is leased to the connection that sent it
-    /// (review M5), see <see cref="TrayLiveState"/>.
+    /// The editor's live theme and page pin, leased to the control connection that sent them (review M5; see
+    /// <see cref="TrayLiveState"/>). The host lives in Core, so the tests drive this exact wiring; its own timer ends a live
+    /// theme nobody keeps alive. Read <c>_live.State</c> only under <see cref="_gate"/>.
     /// </summary>
-    private readonly TrayLiveState _liveState = new();
+    private readonly TrayLiveHost _live;
 
-    private TrayControlServer StartControlServer() => new(ControlPipeName, Execute, OnControlClosed, Log);
+    private TrayControlServer StartControlServer() => new(ControlPipeName, Execute, _live.ConnectionClosed, Log);
 
     /// <summary>Under <see cref="_gate"/>: hands the page pin to the running display loop.</summary>
     private void ApplyPin()
     {
-        if (_pusher is not null) _pusher.PinnedPage = _liveState.PinnedPage;
+        if (_pusher is not null) _pusher.PinnedPage = _live.State.PinnedPage;
     }
 
-    /// <summary>A control connection ended; if it held the live theme, show the saved theme again.</summary>
-    private void OnControlClosed(long connection)
-    {
-        bool ended;
-        lock (_gate) { ended = _liveState.ConnectionClosed(connection); if (ended) ApplyPin(); }
-        if (ended) Log("The editor's live preview ended (its connection closed); showing the saved theme");
-    }
+    private string Execute(string line, long connection) => _live.ExecuteLine(line, connection, ExecuteOther);
 
-    /// <summary>Supervisor tick, under <see cref="_gate"/>: a live theme nobody keeps alive any more ends.</summary>
-    private void ExpireLive()
+    /// <summary>Every command but the live ones (<see cref="TrayLiveHost"/> handles those).</summary>
+    private string ExecuteOther(ControlCommand cmd)
     {
-        if (!_liveState.Expire()) return;
-        ApplyPin();
-        Log("The editor's live preview ended (no word from the editor); showing the saved theme");
-    }
-
-    private string Execute(string line, long connection)
-    {
-        // parsing and the wire format live in Glance.Core (ControlCommand) so the editor and tests share them
-        if (!ControlCommand.TryParse(line, out var cmd, out var error)) return "ERR " + error;
         switch (cmd.Verb)
         {
             case ControlVerb.Status:
             {
                 string pg;
-                lock (_gate)
-                {
-                    _liveState.Handle(cmd, connection);   // counts as a sign of life from the editor
-                    pg = _pusher is null ? "no display" : $"page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count}, pinned={(_pusher.PinnedPage is { } p ? (p + 1).ToString() : "no")}, autoRotate={Current.AutoRotate}, live={_liveState.Live is not null}";
-                }
+                lock (_gate) pg = _pusher is null ? "no display" : $"page {_pusher.CurrentPageIndex + 1}/{Current.Pages.Count}, pinned={(_pusher.PinnedPage is { } p ? (p + 1).ToString() : "no")}, autoRotate={Current.AutoRotate}, live={_live.State.Live is not null}";
                 return "OK " + _statusItem.Text + " | " + pg;
             }
             case ControlVerb.Reload: _ui.BeginInvoke(Reload); return "OK";
@@ -455,16 +438,6 @@ internal sealed class RunnerContext : ApplicationContext
             case ControlVerb.Brightness:
                 lock (_gate) { _brightness = Math.Clamp(cmd.Number, 0, 7); _pusher?.SetBrightness(_brightness); }
                 return "OK";
-            case ControlVerb.Page:        // PAGE <n> pins the display to page n (1-based); PAGE 0 releases it
-            case ControlVerb.Live:        // LIVE <base64 folder> <base64 theme json>: show the editor's unsaved theme
-            case ControlVerb.LiveKeep:    // the editor is still there
-            case ControlVerb.LiveClear:   // back to the saved theme, pin released
-                lock (_gate)
-                {
-                    var reply = _liveState.Handle(cmd, connection) ?? "ERR unknown command";
-                    ApplyPin();
-                    return reply;
-                }
             default: return "ERR unknown command";
         }
     }
@@ -487,6 +460,7 @@ internal sealed class RunnerContext : ApplicationContext
         _quitting = true;
         Log("Tray app exiting");
         _control?.Dispose();
+        _live.Dispose();
         _supervisor.Stop();
         foreach (var w in _watchers) w.Dispose();
         lock (_gate)

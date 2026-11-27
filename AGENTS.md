@@ -107,11 +107,13 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
   to basic local sensors; the feed counts as gone after 5 s without data. Drive-space sensors come from `DriveSensors`.
 - **Tray control pipe commands** (one line each, reply `OK ...`): `STATUS`, `RELOAD`, `PAUSE`, `RESUME`, `EXIT`, `NEXT`, `PREV`, `PAGE <n>`
   (0 releases), `BRIGHTNESS <0-7>`, `LIVE <base64 folder> <base64 theme json>` (show the editor's unsaved theme; `-` for no folder),
-  `LIVE_CLEAR`, `LIVE_KEEP` (heartbeat; `ERR no live theme` asks the editor to send it again). Build and parse them only with
-  `Glance.Core.Control.ControlCommand` (shared by both sides and tested). The server side is `TrayControlServer` (Core).
-  The **live theme is leased** (`TrayLiveState`, review M5): it ends, with the page pin, on `LIVE_CLEAR`, when the connection that
-  sent it closes, or 5 s without a command on it. The editor therefore sends everything through one ordered connection (`TrayLink`)
-  with a heartbeat every 1.5 s, and its exit waits (bounded) for the queued `LIVE_CLEAR`. Whether the tray is there is decided by a
+  `LIVE_CLEAR`, `LIVE_KEEP` (heartbeat; `ERR no live theme` asks the editor to send pin, brightness and theme again;
+  `ERR live taken` means another editor took over: stop, do not fight). Build and parse them only with
+  `Glance.Core.Control.ControlCommand` (shared by both sides and tested). The server side is `TrayControlServer` + `TrayLiveHost` (Core).
+  The **live theme is leased** (`TrayLiveState`, review M5): it ends, with the page pin, on `LIVE_CLEAR` from its own connection,
+  when that connection closes, or 5 s (monotonic, sleep not counted, renewed on resume) without a command on it. A page pin also
+  ends when the connection that set it closes. The editor sends everything through one ordered connection (`TrayLink`, async pipe,
+  bounded `Send`) with a heartbeat every 1.5 s, and its exit waits (bounded) for the queued `LIVE_CLEAR`. Whether the tray is there is decided by a
   `STATUS` round trip (`TrayPresence`, M13), never by a process name; a tray process that does not answer, or belongs to another
   account, is reported, and the editor does not fight it for the display.
 - Single tray app per session (mutex `Local\Glance.Runner`). It starts at sign-in from a shortcut in the common Startup folder (installer
