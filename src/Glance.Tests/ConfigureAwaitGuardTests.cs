@@ -115,4 +115,43 @@ public sealed class ConfigureAwaitGuardTests
     [InlineData("// await Task.Delay(1);\nint x = 1; /* await y; */ var s = \"await z;\";", 0)]
     public void The_scan_finds_awaits_without_ConfigureAwait_false(string code, int expected)
         => Assert.Equal(expected, AwaitsWithoutConfigureAwait(code).Count);
+
+    /// <summary>Blocking waits on tasks or events without a timeout, in <paramref name="source"/>: .Wait(), .Result, .GetResult().
+    /// A line may allow one with a "// sync-wait: why" comment (the task has finished, or the wait cannot need the caller).</summary>
+    internal static List<string> BlockingWaitsWithoutReason(string source)
+    {
+        var lines = source.Split('\n');
+        var code = StripCommentsAndStrings(source).Split('\n');
+        var found = new List<string>();
+        for (int i = 0; i < code.Length; i++)
+        {
+            bool hit = Regex.IsMatch(code[i], @"\.Wait\(\s*\)|\.GetResult\(\s*\)|\.Result\b(?!\s*[\w.(])");
+            if (hit && !lines[i].Contains("// sync-wait:")) found.Add($"line {i + 1}: {lines[i].Trim()}");
+        }
+        return found;
+    }
+
+    [Fact]
+    public void Every_blocking_wait_in_Glance_Core_has_a_timeout_or_a_stated_reason()
+    {
+        // the tray app and the editor call Core on their UI threads; a wait without a bound there is how 0.2.0 froze (review L3)
+        var problems = new List<string>();
+        foreach (var f in Directory.EnumerateFiles(CoreFolder(), "*.cs", SearchOption.AllDirectories)
+                     .Where(f => !f.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}") && !f.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}")))
+            problems.AddRange(BlockingWaitsWithoutReason(File.ReadAllText(f)).Select(p => $"{Path.GetRelativePath(CoreFolder(), f)} {p}"));
+        Assert.True(problems.Count == 0, "Blocking waits in Glance.Core without a timeout or a \"// sync-wait:\" reason:\n" + string.Join("\n", problems));
+    }
+
+    [Theory]
+    [InlineData("var r = task.Result;", 1)]
+    [InlineData("return t.Wait(500) ? t.Result : null;", 1)]
+    [InlineData("return t.Wait(500) ? t.Result : null;   // sync-wait: finished", 0)]
+    [InlineData("ready.Wait();", 1)]
+    [InlineData("ready.Wait(1000);", 0)]
+    [InlineData("x.SendAsync(m).GetAwaiter().GetResult();", 1)]
+    [InlineData("PowerBlank.Result r = PowerBlank.Result.Busy;", 0)]
+    [InlineData("public PowerBlank.Result BlankForPowerEvent(PowerEvent e)", 0)]
+    [InlineData("// task.Wait();\nvar s = \".Result\";", 0)]
+    public void The_scan_finds_blocking_waits(string code, int expected)
+        => Assert.Equal(expected, BlockingWaitsWithoutReason(code).Count);
 }

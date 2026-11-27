@@ -207,7 +207,8 @@ Glance.Runner (tray, normal user, one per session)          Glance.App (editor, 
   the source). The tray app and the editor call Core from their UI threads and block on it; an await that resumes on the caller's
   context deadlocks (that left the display black in 0.2.0, `docs/design/fix-tray-deadlock.md`). Never block on a task
   (`.Result`, `.Wait()`, `GetAwaiter().GetResult()`) without a timeout; test such code on `UiLikeContext` (tests), not only under xUnit.
-  The tray app opens the display with `BackgroundOpener`, never on its UI thread.
+  The tray app opens the display with `TrayDisplayOpener` (Core, tested), never on its UI thread; blocking waits in Core need a timeout
+  or a `// sync-wait: <why>` comment (`ConfigureAwaitGuardTests` scans for `.Wait()`, `.Result`, `GetResult()`).
 - Rendering races: the editor mutates the theme while a pusher renders it; renderers catch `InvalidOperationException` and retry next frame.
 
 ## Verifying changes
