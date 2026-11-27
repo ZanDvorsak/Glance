@@ -22,3 +22,16 @@
 - Exit the tray, then use the editor's Send to display: the theme appears and the editor stays responsive. Turning it off blanks the display.
 - Restart the Glance service while the tray runs: the display comes back within about 10 s, and the logs show one reopen, not a flood.
 - Stop the service and start the tray: the tray menu answers at once and the editor's Next page still works. Then sleep and wake once: the display goes black, then comes back.
+
+## Fixes after review
+- Each fix has a test first. Before the fix, the tray's open logic was moved unchanged into Core (`TrayDisplayOpener`, owner interface `ITrayDisplayOwner`) and the new tests failed against it. 5 of 12 failed; all pass after. Tests: 854/854, three runs.
+- **L1** → `TrayDisplayOpener` decides under the lock and stops the unwanted pusher outside it. Test `A_pusher_opened_while_paused_is_stopped_without_holding_the_trays_lock`. Before: "the tray's lock was held while a stalled pusher was being stopped". After: pass.
+- **L2** → `Quit` calls `TrayDisplayOpener.Close` (up to `QuickStopTimeout` + 2 s) before it disposes the sensors. An open still running is then blanked and closed, and the owner is not touched again. Tests `Quitting_waits_for_an_open_in_flight_and_blanks_what_it_opened` (before: "Close returned while the open was still running") and `An_open_that_finishes_after_quit_only_closes_its_display` (before: "the late display was never closed"). After: both pass.
+- **L3** → The decisions in `Opened` are tested in Core, on `UiLikeContext`: `An_opened_display_is_kept_only_when_nothing_changed_meanwhile` (4 cases) and `Starting_an_open_on_the_UI_thread_returns_at_once`.
+  - Source checks on `RunnerContext.cs`: `The_tray_app_starts_its_control_pipe_and_timers_before_the_first_open` and `The_tray_app_creates_pushers_only_through_the_background_opener`.
+  - Mutation checks: moving `Supervise()` above `Task.Run(ControlLoop)` fails the order test. Calling `OpenPusher` from `Supervise` fails the creation test.
+  - The guard now also flags `.Wait()`, `.Result` and `GetResult()` in Core unless the line says `// sync-wait: <why>`. Before the markers it reported exactly the 4 audited sites, which are now marked.
+  - `BackgroundOpener` is replaced by `TrayDisplayOpener`.
+- **Nit (pin)** → `DisplayPusher` takes `pinnedPage` in its constructor, set before the loop starts, and the tray passes it. Tests `The_page_pin_is_passed_to_the_open` (before: values differ) and `A_pusher_opened_with_a_page_pin_shows_that_page_in_its_first_frame` (new API, so no before-run).
+- **Nit (retry)** → A failed open is tried again after 0.5 s, not on the next 2 s tick. Test `A_failed_open_is_retried_within_a_second_not_on_the_next_2_s_tick`. Before: "no retry within 1.5 s (1 attempts)". After: pass.
+- Not changed: the editor still sets `PinnedPage` after it constructs its pusher (`MainWindow.OpenPusher`), and M7 is changing that file. The old `_blankOwed = false` in the tray's `Opened` is gone, because no open holds the lock any more. M1, M2 and L4 are for merge time, as the review says.

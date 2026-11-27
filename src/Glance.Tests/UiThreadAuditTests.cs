@@ -11,7 +11,7 @@ namespace Glance.Tests;
 /// <summary>
 /// The audit after the Glance 0.2.0 deadlock (docs/design/fix-tray-deadlock.md): every other place where the editor or the
 /// tray app waits synchronously on async or background work from its UI thread, run on a UI-like thread that is never pumped.
-/// Also the tray app's background open and the service's logging of refusals and failed opens.
+/// Also the service's logging of refusals and failed opens (the tray app's background open: TrayDisplayOpenerTests).
 /// </summary>
 public sealed class UiThreadAuditTests : IDisposable
 {
@@ -148,68 +148,6 @@ public sealed class UiThreadAuditTests : IDisposable
         AssertReturned(o, "DisplayPusher.Stop");
         Assert.True(stopped);
         Assert.True(Device(0).Blanks >= 1);
-    }
-
-    // ---- the tray app opens the display off its UI thread ---------------------------------------------------------------
-
-    [Fact]
-    public void The_tray_apps_background_open_never_blocks_its_UI_thread_and_runs_one_attempt_at_a_time()
-    {
-        var opener = new BackgroundOpener();
-        using var release = new ManualResetEventSlim();
-        DisplayPusher? got = null; Exception? gotError = null;
-        using var done = new ManualResetEventSlim();
-        int openThread = 0;
-        bool second = true;
-        var o = UiLikeContext.Run(() =>
-        {
-            Assert.True(opener.TryStart(() =>
-            {
-                openThread = Environment.CurrentManagedThreadId;
-                release.Wait(10_000);   // a service that takes its time
-                return new DisplayPusher(() => Theme.CreateDefault(null), new FakeSource(Array.Empty<SensorInfo>()), 4, new FakeDisplay(480, 320), Quick);
-            }, (p, e) => { got = p; gotError = e; done.Set(); }));
-            second = opener.TryStart(() => throw new InvalidOperationException("second attempt"), (_, _) => { });
-        }, Watchdog);
-        Assert.True(o.Finished);
-        Assert.Null(o.Error);
-        Assert.True(o.Took < TimeSpan.FromSeconds(2), $"the UI thread waited {o.Took.TotalSeconds:0.0} s");
-        Assert.False(second);              // one attempt at a time
-        Assert.True(opener.IsOpening);
-        release.Set();
-        Assert.True(done.Wait(10_000));
-        try
-        {
-            Assert.NotNull(got);
-            Assert.Null(gotError);
-            Assert.NotEqual(0, openThread);
-            Assert.True(SpinWait.SpinUntil(() => !opener.IsOpening, 5000));
-        }
-        finally { got?.Stop(blank: false, TimeSpan.FromSeconds(5)); }
-    }
-
-    [Fact]
-    public void A_failed_background_open_reports_its_error_and_allows_the_next_attempt()
-    {
-        var opener = new BackgroundOpener();
-        Exception? error = null;
-        using var done = new ManualResetEventSlim();
-        Assert.True(opener.TryStart(() => throw new DisplayServiceException("The Glance service is running but did not answer yet", denied: false),
-            (p, e) => { Assert.Null(p); error = e; done.Set(); }));
-        Assert.True(done.Wait(5000));
-        Assert.Contains("did not answer yet", error!.Message);
-        Assert.True(SpinWait.SpinUntil(() => !opener.IsOpening, 5000));
-        Assert.True(opener.TryStart(() => throw new IOException("again"), (_, _) => { }));
-    }
-
-    [Fact]
-    public void A_pusher_nobody_takes_is_stopped()
-    {
-        var opener = new BackgroundOpener();
-        var device = new FakeDisplay(480, 320);
-        Assert.True(opener.TryStart(() => new DisplayPusher(() => Theme.CreateDefault(null), new FakeSource(Array.Empty<SensorInfo>()), 4, device, Quick),
-            (_, _) => throw new InvalidOperationException("the owner failed")));
-        Assert.True(SpinWait.SpinUntil(() => device.Disposes == 1, 10_000), "the claimed display was never let go");
     }
 
     // ---- the service logs why a client gets nothing ------------------------------------------------------------------------

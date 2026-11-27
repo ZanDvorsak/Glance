@@ -836,7 +836,7 @@ public sealed class ThemeRenderer : IDisposable
                 started = true;
             }
             if (started ? !_pending.Wait(waitMs) : !_pending.IsCompleted) return null;
-            var (stamp, ms) = _pending.Result;
+            var (stamp, ms) = _pending.Result;   // sync-wait: finished (checked just above)
             _pending = null;
             _interval = ms > SlowStatMs ? Math.Min(_interval * 2, MaxStatIntervalMs) : StatIntervalMs;
             return stamp;
