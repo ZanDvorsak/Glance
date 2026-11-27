@@ -18,18 +18,24 @@ public sealed class LogLimiter
     }
 
     /// <summary>The text to write for <paramref name="message"/>, or null when it is a repeat inside the window.</summary>
-    public string? Filter(string message)
+    public string? Filter(string message) => Filter(message, message);
+
+    /// <summary>
+    /// As <see cref="Filter(string)"/>, but lines with the same <paramref name="key"/> count as repeats even when their text
+    /// differs (an error message that names a changing address or time); the text written is the newest one.
+    /// </summary>
+    public string? Filter(string key, string message)
     {
         lock (_seen)
         {
             long now = _now();
-            if (_seen.TryGetValue(message, out var seen) && now - seen.Since < _windowMs)
+            if (_seen.TryGetValue(key, out var seen) && now - seen.Since < _windowMs)
             {
-                _seen[message] = (seen.Since, seen.Suppressed + 1);
+                _seen[key] = (seen.Since, seen.Suppressed + 1);
                 return null;
             }
             if (_seen.Count > 200) _seen.Clear();   // many different lines: forget, never grow without limit
-            _seen[message] = (now, 0);
+            _seen[key] = (now, 0);
             return seen.Suppressed > 0 ? $"{message} (repeated {seen.Suppressed} more times before this)" : message;
         }
     }

@@ -8,14 +8,18 @@ public sealed class PipeSensorClient : ISensorSource, IDisposable
 {
     public const string PipeName = "Glance.Sensors";
 
-    /// <summary>The runner sends a snapshot every second; this long without one means it has stopped.</summary>
+    /// <summary>
+    /// The service publishes a new snapshot every second: a snapshot older than this means its sensor loop has stopped (or the
+    /// pipe has), even while the pipe stays connected and keeps re-sending it (review M8).
+    /// </summary>
     private readonly long _staleAfterMs;
     private readonly string _pipeName;
 
     private readonly CancellationTokenSource _cts = new();
     private readonly object _lock = new();
     private IReadOnlyList<SensorInfo> _snapshot = Array.Empty<SensorInfo>();
-    private long _lastUpdateMs;
+    private long _lastUpdateMs;   // when the service read the current snapshot, on this PC's tick clock
+    private long _sequence;
 
     private readonly IReadOnlyList<System.Security.Principal.SecurityIdentifier> _trustedOwners;
 
@@ -30,7 +34,10 @@ public sealed class PipeSensorClient : ISensorSource, IDisposable
 
     public IReadOnlyList<SensorInfo> Snapshot { get { lock (_lock) return _snapshot; } }
 
-    /// <summary>True only while snapshots are arriving. After the sender stops, the last values are stale and must not be shown as live.</summary>
+    /// <summary>
+    /// True only while new snapshots are arriving. After the sender stops, or stops publishing new snapshots, the last values
+    /// are stale and must not be shown as live.
+    /// </summary>
     public bool HasData
     {
         get { lock (_lock) return _snapshot.Count > 0 && Environment.TickCount64 - _lastUpdateMs < _staleAfterMs; }
@@ -50,8 +57,13 @@ public sealed class PipeSensorClient : ISensorSource, IDisposable
                 using var reader = new StreamReader(pipe);
                 while (!_cts.IsCancellationRequested && await reader.ReadLineAsync(_cts.Token).ConfigureAwait(false) is { } line)
                 {
-                    var list = JsonSerializer.Deserialize<List<SensorInfo>>(line);
-                    if (list is not null) lock (_lock) { _snapshot = list; _lastUpdateMs = Environment.TickCount64; }
+                    if (Parse(line) is not { } feed) continue;
+                    lock (_lock)
+                    {
+                        _snapshot = feed.Sensors;
+                        _sequence = feed.Seq;
+                        _lastUpdateMs = Environment.TickCount64 - feed.AgeMs;   // when the service read it, not when it was re-sent
+                    }
                 }
             }
             catch (OperationCanceledException) { return; }
@@ -61,6 +73,23 @@ public sealed class PipeSensorClient : ISensorSource, IDisposable
             try { await Task.Delay(1000, _cts.Token).ConfigureAwait(false); } catch (OperationCanceledException) { return; }
         }
     }
+
+    private sealed record FeedLine(long Seq, long AgeMs, List<SensorInfo>? Sensors);
+
+    /// <summary>
+    /// One line from <see cref="SensorPipeServer"/>: <c>{"Seq":n,"AgeMs":ms,"Sensors":[...]}</c>. A bare array (the format before
+    /// review M8) counts as just read. Null for a line that is not either.
+    /// </summary>
+    internal static (long Seq, long AgeMs, IReadOnlyList<SensorInfo> Sensors)? Parse(string line)
+    {
+        if (line.TrimStart().StartsWith('['))
+            return JsonSerializer.Deserialize<List<SensorInfo>>(line) is { } legacy ? (0, 0, legacy) : null;
+        if (JsonSerializer.Deserialize<FeedLine>(line) is not { Sensors: { } sensors } feed) return null;
+        return (feed.Seq, Math.Clamp(feed.AgeMs, 0, TimeSpan.FromDays(1).Ticks / TimeSpan.TicksPerMillisecond), sensors);
+    }
+
+    /// <summary>The number of the last snapshot received (it grows by one with each new snapshot the service publishes).</summary>
+    public long Sequence { get { lock (_lock) return _sequence; } }
 
     public void Dispose() => _cts.Cancel();
 }
