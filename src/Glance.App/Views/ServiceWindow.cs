@@ -5,6 +5,7 @@ using Avalonia.Media;
 using Avalonia.Threading;
 using Glance.App.Services;
 using Glance.Core.Service;
+using Glance.Core.Threading;
 
 namespace Glance.App.Views;
 
@@ -70,9 +71,9 @@ public sealed class ServiceWindow : Window
         timer.Tick += async (_, _) => await Refresh();
         timer.Start();
         Closed += (_, _) => timer.Stop();
-        Show(ServiceState.Unknown, null, null);   // "checking..." until Refresh has asked, off the UI thread
-        _ = Refresh();
-        _ = CheckOldTask();
+        Show(ServiceState.Unknown, null, null, false);   // "checking..." until Refresh has asked, off the UI thread
+        TaskObserver.Observe(Refresh(), ex => Say("Could not read the service state: " + ex.Message));
+        TaskObserver.Observe(CheckOldTask(), ex => Say("Could not look for the old sign-in task: " + ex.Message));
     }
 
     private async Task Refresh()
@@ -81,17 +82,17 @@ public sealed class ServiceWindow : Window
         _refreshing = true;
         try
         {
-            var (state, status, tray) = await Task.Run(() =>
+            var (state, status, tray, trayExe) = await Task.Run(() =>
             {
                 var s = ServiceControl.Query();
-                return (s, s == ServiceState.Running ? DisplayConnector.ServiceStatus() : null, RunnerClient.IsRunning);
+                return (s, s == ServiceState.Running ? DisplayConnector.ServiceStatus() : null, RunnerClient.IsRunning, AppPaths.FindTrayExe() is not null);
             });
-            Show(state, status, tray);
+            Show(state, status, tray, trayExe);
         }
         finally { _refreshing = false; }
     }
 
-    private void Show(ServiceState service, string? status, bool? trayKnown)
+    private void Show(ServiceState service, string? status, bool? trayKnown, bool trayExeFound)
     {
         var trayRunning = trayKnown == true;
         _service = service; _trayRunning = trayRunning;
@@ -120,7 +121,7 @@ public sealed class ServiceWindow : Window
         _trayDot.Background = new SolidColorBrush(Color.Parse(trayRunning ? "#34D399" : "#6B7280"));
         _trayState.Text = trayKnown is null ? "Tray app: checking..." : trayRunning ? "Tray app is running" : "Tray app is not running";
         _trayButton.Content = trayRunning ? "Stop the tray app" : "Start the tray app";
-        _trayButton.IsEnabled = !_busy && trayKnown is not null && (trayRunning || AppPaths.FindTrayExe() is not null);
+        _trayButton.IsEnabled = !_busy && trayKnown is not null && (trayRunning || trayExeFound);   // looked up in Refresh, off the UI thread
         _removeTask.IsEnabled = !_busy;
     }
 

@@ -184,7 +184,7 @@ public sealed class MainWindow : Window
             if (_fileBusy && e.CloseReason is not (WindowCloseReason.OSShutdown or WindowCloseReason.ApplicationShutdown))
             {
                 e.Cancel = true;
-                _status.Text = "Glance is still saving or importing; close it again when that has finished.";
+                _status.Text = "Glance is still saving, exporting or importing; close it again when that has finished.";
                 return;
             }
             Program.UiError -= OnUiError;
@@ -192,9 +192,13 @@ public sealed class MainWindow : Window
             _power.Handle(PowerEvent.Quit);   // nothing may reopen the display from here on
             // Avalonia also closes the window this way when Windows shuts down (WM_QUERYENDSESSION), so this is usually where the
             // session-end blank happens. It runs off the UI thread so the window closes at once; Program.Main waits for it (bounded).
-            if (_display.Current is not null) PendingExitBlank = Task.Run(() => _display.Release(blank: true, DisplayPusher.QuickStopTimeout));
+            // Always queued on _displayWork, behind a release or open still running (review M1): those already took the pusher
+            // out of _display.Current, so an empty slot does not mean the display is dark.
+            PendingExitBlank = _display.ReleaseOnExit(_displayWork);
             if (OperatingSystem.IsWindows()) _powerWatcher?.Dispose();
-            _renderer.Dispose(); _hub.Dispose(); _settings.Save();
+            _renderer.Dispose();
+            Observe(_displayWork.Run(_hub.Dispose), "Could not stop the sensors");   // after the blank: an open still running reads the sensors
+            _settings.Save();
         };
         StartPowerWatcher();   // blank the display at shutdown, sign-out and sleep while the editor drives it
     }
@@ -793,18 +797,25 @@ public sealed class MainWindow : Window
     /// <summary>Shares the current theme as one .glance file with its images and videos inside.</summary>
     private async Task ExportAsync()
     {
+        if (_fileBusy) { _status.Text = FileBusyText; return; }
         var file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
         {
             Title = "Export theme", SuggestedFileName = SafeName(_theme.Name) + ThemePackage.Extension, DefaultExtension = "glance",
             FileTypeChoices = new[] { new FilePickerFileType("Glance theme") { Patterns = new[] { "*.glance" } } },
         });
         if (file?.TryGetLocalPath() is not { } path) return;
-        try
+        if (_fileBusy) { _status.Text = FileBusyText; return; }   // a save started while the picker was open
+        // file work (review L4): no save can race it and closing waits; it zips a copy, because a save changes the live theme's paths
+        var copy = _theme.Detach();
+        using (BeginFileWork("Exporting " + path + "..."))
         {
-            await Task.Run(() => ThemePackage.Export(_theme, path));
-            _status.Text = $"Exported to {path} ({new FileInfo(path).Length / 1024.0 / 1024.0:0.0} MB). Anyone can open it with Glance.";
+            try
+            {
+                var size = await Task.Run(() => { ThemePackage.Export(copy, path); return new FileInfo(path).Length; });
+                _status.Text = $"Exported to {path} ({size / 1024.0 / 1024.0:0.0} MB). Anyone can open it with Glance.";
+            }
+            catch (Exception ex) { _status.Text = "Export failed: " + ex.Message; }
         }
-        catch (Exception ex) { _status.Text = "Export failed: " + ex.Message; }
     }
 
     /// <summary>Paths the last .glance import removed from the theme; shown once by <see cref="ShowRemovedImportPathsAsync"/>.</summary>
@@ -848,7 +859,19 @@ public sealed class MainWindow : Window
         }
     }
 
-    private const string FileBusyText = "Glance is still saving or importing; try again when it has finished.";
+    /// <summary>
+    /// Work started and not awaited (review L1): if it fails, the error goes to editor.log and the status bar, and
+    /// <paramref name="reset"/> puts the UI back first (for example unticks Send to display). Call on the UI thread; the handler
+    /// runs there too.
+    /// </summary>
+    private void Observe(Task task, string what, Action? reset = null) => TaskObserver.Observe(task, ex =>
+    {
+        Glance.Core.Diagnostics.CrashLog.Write(Program.CrashLogFile, what, ex, DateTime.Now);
+        try { reset?.Invoke(); } catch { /* the status below still says what happened */ }
+        _status.Text = what + ": " + ex.Message;
+    });
+
+    private const string FileBusyText = "Glance is still saving, exporting or importing; try again when it has finished.";
 
     /// <summary>Tells the user which file paths an imported theme pointed outside its own package and were removed.</summary>
     private async Task ShowRemovedImportPathsAsync()
@@ -1091,7 +1114,8 @@ public sealed class MainWindow : Window
 
     private async Task AddWidgetAsync(WidgetKind kind)
     {
-        var w = Widget.Create(kind, 30 + _theme.Widgets.Count % 8 * 10, 30 + _theme.Widgets.Count % 8 * 10);
+        var theme = _theme;   // the picker and the size read are awaited: another theme may be opened meanwhile
+        var w = Widget.Create(kind, 30 + theme.Widgets.Count % 8 * 10, 30 + theme.Widgets.Count % 8 * 10);
         if (kind == WidgetKind.Image)
         {
             var path = await PickImageAsync();
@@ -1108,6 +1132,7 @@ public sealed class MainWindow : Window
             }
             else { w.X = 0; w.Y = 0; w.Width = _theme.Width; w.Height = _theme.Height; w.Fit = ImageFit.Cover; }
         }
+        if (!ReferenceEquals(theme, _theme)) { _status.Text = "Another theme was opened meanwhile; add the widget again."; return; }   // a path may point into the old theme's folder
         _theme.Widgets.Add(w);
         RefreshLayers();
         SelectWidget(w);
@@ -1478,7 +1503,7 @@ public sealed class MainWindow : Window
         _trayProbe.Poke();                     // lists processes in the background; the answer is at most a tick old
         bool trayRunning = _trayProbe.Value;
 
-        if (_pusher is { IsAlive: false } && !_restarting) _ = RestartDeadPusherAsync();
+        if (_pusher is { IsAlive: false } && !_restarting) Observe(RestartDeadPusherAsync(), "Could not restart the display");
         if (_pusher is { } p)
         {
             _displayDot.Fill = p.LastError is not null ? Brush("#FF6B6B") : p.LastRenderError is not null ? Brush("#FF9F43") : Brush("#34D399");
@@ -1657,10 +1682,11 @@ public sealed class MainWindow : Window
     private void ToggleSend(bool on)
     {
         var generation = ++_sendGeneration;
-        _ = _displayWork.Run(() => _display.Release(blank: true, DisplayPusher.StopTimeout));   // also releases an open still running
+        Observe(_displayWork.Run(() => _display.Release(blank: true, DisplayPusher.StopTimeout)), "Could not stop the display");   // also releases an open still running
         StopLive();
         if (!on) { _status.Text = "Stopped sending."; return; }
-        _ = StartSendingOrLiveAsync(generation);
+        Observe(StartSendingOrLiveAsync(generation), "Could not start sending to the display",
+            reset: () => { if (generation == _sendGeneration) _send.IsChecked = false; });   // never left ticked on "Connecting..."
     }
 
     private async Task StartSendingOrLiveAsync(int generation)
@@ -1684,7 +1710,7 @@ public sealed class MainWindow : Window
 
     internal static void WaitForExitBlank()
     {
-        try { PendingExitBlank?.Wait(PowerBlank.SessionEndBudget); } catch { /* best effort */ }
+        try { PendingExitBlank?.Wait(PowerBlank.SessionEndBudget); } catch { /* best effort */ }   // ui-thread-ok: the message loop has ended; bounded
     }
 
     private void StartPowerWatcher()

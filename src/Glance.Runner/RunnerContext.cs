@@ -46,7 +46,7 @@ internal sealed class RunnerContext : ApplicationContext
     // M7: opening, stopping and blanking the display, and reading the theme, run on this worker, one at a time and in order,
     // never on the UI thread (the tray menu and the editor's control commands stay responsive while a transfer is stuck).
     private readonly SerialWork _work = new();
-    private int _superviseQueued;
+    private readonly CoalescedWork _supervise, _reload;   // the display check and Reload on _work; repeated requests collapse (2 s timer, clicks)
 
     private AppSettings _settings;
     private long _rereadSettingsAtTicks;  // settings.json was locked when last read: read it again then, UTC ticks, 0 = no (review L1)
@@ -68,6 +68,8 @@ internal sealed class RunnerContext : ApplicationContext
     public RunnerContext()
     {
         _ = _ui.Handle; // force handle creation so other threads can marshal onto the UI thread
+        _supervise = new CoalescedWork(_work, SuperviseNow);
+        _reload = new CoalescedWork(_work, ReloadNow);
         Log("Tray app starting as " + WindowsIdentity.GetCurrent().Name);
 
 
@@ -86,9 +88,9 @@ internal sealed class RunnerContext : ApplicationContext
         menu.Items.Add(_serviceItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_pauseItem);
-        // through the worker: the supervisor may hold _gate for seconds while a transfer is stuck, and the menu must not wait for it
-        menu.Items.Add("Next page", null, (_, _) => _work.Run(() => { lock (_gate) _pusher?.NextPage(); }));
-        menu.Items.Add("Previous page", null, (_, _) => _work.Run(() => { lock (_gate) _pusher?.PrevPage(); }));
+        // at once: NextPage/PrevPage are one Interlocked step, so neither the queue nor _gate (held for seconds by a stuck stop) is needed
+        menu.Items.Add("Next page", null, (_, _) => Volatile.Read(ref _pusher)?.NextPage());
+        menu.Items.Add("Previous page", null, (_, _) => Volatile.Read(ref _pusher)?.PrevPage());
         menu.Items.Add("Reload theme", null, (_, _) => { ClearStaleSleep(); Reload(); });
         menu.Items.Add("Open editor", null, (_, _) => OpenEditor());
         menu.Items.Add(new ToolStripSeparator());
@@ -144,7 +146,7 @@ internal sealed class RunnerContext : ApplicationContext
     /// <summary>Re-read settings and the theme, then restart the display so changed images are picked up. Returns at once.</summary>
     private void Reload()
     {
-        if (!_quitting) _work.Run(ReloadNow);
+        if (!_quitting) Observe(_reload.Request());
     }
 
     [WorkerThread]
@@ -208,8 +210,7 @@ internal sealed class RunnerContext : ApplicationContext
     /// </summary>
     private void Supervise()
     {
-        if (_quitting || Interlocked.Exchange(ref _superviseQueued, 1) == 1) return;
-        _work.Run(() => { Volatile.Write(ref _superviseQueued, 0); SuperviseNow(); });
+        if (!_quitting) Observe(_supervise.Request());
     }
 
     /// <summary>Opens the display when it is available, and reopens it if it keeps failing (unplugged, replugged, taken by another program).</summary>
@@ -408,7 +409,7 @@ internal sealed class RunnerContext : ApplicationContext
     /// </summary>
     private void MoveToServiceIfOnUsb()
     {
-        if (!_quitting) _work.Run(MoveToServiceNow);
+        if (!_quitting) Observe(_work.Run(MoveToServiceNow));
     }
 
     [WorkerThread]
@@ -439,6 +440,12 @@ internal sealed class RunnerContext : ApplicationContext
     }
 
     /// <summary>Called by the supervisor worker; the menu and the tray icon are updated on the UI thread.</summary>
+    /// <summary>Queued work nobody awaits (review L1): a failure is logged instead of vanishing.</summary>
+    private static void Observe(Task? work)
+    {
+        if (work is not null) TaskObserver.Observe(work, ex => Log("Background work failed: " + ex));
+    }
+
     private void SetStatus(string text)
     {
         try
@@ -491,6 +498,7 @@ internal sealed class RunnerContext : ApplicationContext
         Interlocked.Decrement(ref _controlInstances);
     }
 
+    [WorkerThread]   // a pipe thread (Task.Run in ControlLoop)
     private async Task Handle(NamedPipeServerStream pipe)
     {
         try
@@ -509,6 +517,7 @@ internal sealed class RunnerContext : ApplicationContext
         finally { ReleaseControl(pipe); }
     }
 
+    [WorkerThread]   // a pipe thread; its locks wait for the display check, never the UI thread
     private string Execute(string line)
     {
         // parsing and the wire format live in Glance.Core (ControlCommand) so the editor and tests share them
@@ -566,14 +575,20 @@ internal sealed class RunnerContext : ApplicationContext
         _cts.Cancel();
         _supervisor.Stop();
         lock (_watchers) foreach (var w in _watchers) w.Dispose();
-        // The worker sees _quitting and starts nothing new; if it is inside _gate right now (a stuck transfer), this waits for it,
-        // as it always did. The blank must finish before the process ends, so it stays here, on the way out.
-        lock (_gate)
+        _power.Handle(PowerEvent.Quit);   // nothing may reopen the display from here on (the policy has its own lock); an open
+                                          // still running in the background sees it in Opened and blanks what it opened
+        // The blank runs on the worker, behind anything it is doing, and the UI thread waits for it at most the session-end
+        // budget (review L2): a stuck transfer holds _gate for up to 18 s, and the old lock (_gate) here waited for all of it.
+        var exit = _work.Run(() =>
         {
-            _power.Handle(PowerEvent.Quit);   // nothing may reopen the display from here on
-            PayOwedBlank();                   // ui-thread-ok: exiting; a session end that found the display busy
-            DisposePusher();                  // ui-thread-ok: exiting; blanks it unless a session end already took and blanked it
-        }
+            lock (_gate)
+            {
+                PayOwedBlank();                                               // a session end that found the display busy
+                DisposePusher(blank: true, DisplayPusher.QuickStopTimeout);   // blanks it unless a session end already took and blanked it
+            }
+        });
+        try { if (!exit.Wait(PowerBlank.SessionEndBudget)) Log("The display did not blank in time; exiting anyway"); }   // ui-thread-ok: exiting; bounded
+        catch (Exception ex) { Log("Could not blank the display on exit: " + ex.GetBaseException().Message); }
         _powerWatcher?.Dispose();
         _sensors.Dispose();
         _tray.Visible = false;
