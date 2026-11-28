@@ -82,7 +82,7 @@ public class SensorFeedTests
         }));
         Assert.Null(ex);   // before: System.ArgumentException (.NET number values must be finite)
 
-        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromSeconds(3), trustedOwners: new[] { Me });
+        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromSeconds(3), trustedOwners: TestPipes.Own);
         Assert.True(await Eventually(() => client.HasData, 6000), "the snapshot with a NaN in it never arrived");
         var byId = client.Snapshot.ToDictionary(s => s.Id, s => s.Value);
         Assert.Null(byId["/nan"]);
@@ -97,7 +97,7 @@ public class SensorFeedTests
         using var server = new SensorPipeServer(name, ServicePipeSecurity.Build(Me));
         server.Start();
         server.Publish(new[] { new SensorInfo("/a", "hw", "A", "Load", 1f, "%"), new SensorInfo("/b", "hw", "B", "Load", 1f, "%") });
-        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromSeconds(3), trustedOwners: new[] { Me });
+        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromSeconds(3), trustedOwners: TestPipes.Own);
         Assert.True(await Eventually(() => client.HasData, 6000), "the first snapshot never arrived");
 
         for (int i = 2; i <= 3; i++)   // the service's update loop: /a has no reading any more, /b keeps changing
@@ -117,7 +117,7 @@ public class SensorFeedTests
         using var server = new SensorPipeServer(name, ServicePipeSecurity.Build(Me));
         server.Start();
         server.Publish(new[] { new SensorInfo("/a", "hw", "A", "Load", 1f, "%") });   // then the sensor loop hangs: nothing new
-        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromMilliseconds(1500), trustedOwners: new[] { Me });
+        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromMilliseconds(1500), trustedOwners: TestPipes.Own);
         Assert.True(await Eventually(() => client.HasData, 6000), "the first snapshot never arrived");
 
         await Task.Delay(3500);   // more than twice the stale time; the server keeps re-sending the old snapshot every second
@@ -134,7 +134,7 @@ public class SensorFeedTests
         server.Publish(new[] { new SensorInfo("/a", "hw", "A", "Load", 1f, "%") });
         await Task.Delay(2500);   // the sensor loop has been silent for longer than the client's stale time
 
-        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromMilliseconds(1500), trustedOwners: new[] { Me });
+        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromMilliseconds(1500), trustedOwners: TestPipes.Own);
         bool everLive = false;
         Assert.True(await Eventually(() => { everLive |= client.HasData; return client.Snapshot.Count > 0; }, 6000), "nothing arrived");
         var until = Environment.TickCount64 + 1500;
@@ -148,7 +148,7 @@ public class SensorFeedTests
         var name = PipeName();
         using var server = new SensorPipeServer(name, ServicePipeSecurity.Build(Me));
         server.Start();
-        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromMilliseconds(1500), trustedOwners: new[] { Me });
+        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromMilliseconds(1500), trustedOwners: TestPipes.Own);
         bool everStale = false, seen = false;
         var until = Environment.TickCount64 + 4500;
         int i = 0;
@@ -169,7 +169,7 @@ public class SensorFeedTests
         using var server = new SensorPipeServer(name, ServicePipeSecurity.Build(Me), null, TimeSpan.FromMinutes(1));
         server.Start();
         server.Publish(new[] { new SensorInfo("/a", "hw", "A", "Load", 1f, "%") });
-        using var client = new PipeSensorClient(name, trustedOwners: new[] { Me });
+        using var client = new PipeSensorClient(name, trustedOwners: TestPipes.Own);
         Assert.True(await Eventually(() => client.HasData, 6000), "the first snapshot never arrived");
         Assert.Equal(1, client.Sequence);
         await Task.Delay(300);   // the server is now waiting for its re-send
@@ -204,7 +204,7 @@ public class SensorFeedTests
         server.Start();
         server.Publish(new[] { new SensorInfo("/service", "hw", "S", "Load", 1f, "%") });   // and then nothing new
         var local = Device("local", ("/local", 2f));
-        var pipe = new PipeSensorClient(name, staleAfter: TimeSpan.FromMilliseconds(1500), trustedOwners: new[] { Me });
+        var pipe = new PipeSensorClient(name, staleAfter: TimeSpan.FromMilliseconds(1500), trustedOwners: TestPipes.Own);
         using var hub = new SensorHub(pipe, () => new SensorService(() => new[] { local }), NoDrives, TimeSpan.FromMilliseconds(200));
 
         Assert.True(await Eventually(() => hub.Snapshot.Any(s => s.Id == "/service"), 6000), "the service's feed never arrived");
@@ -343,7 +343,7 @@ public class SensorFeedTests
     {
         var (hw, release, closedDuringUpdate, closes, close) = Blocking();
         hw.OnUpdate = () => release.Wait(10000);   // the hub's first update already blocks
-        var pipe = new PipeSensorClient(PipeName(), trustedOwners: new[] { Me });   // nobody serves it: local sensors
+        var pipe = new PipeSensorClient(PipeName(), trustedOwners: TestPipes.Own);   // nobody serves it: local sensors
         var hub = new SensorHub(pipe, () => new SensorService(() => new[] { hw }, close), NoDrives, TimeSpan.FromMilliseconds(50));
         Assert.True(await Eventually(() => hw.Inside, 4000), "the hub never started reading its local sensors");
 
@@ -361,7 +361,7 @@ public class SensorFeedTests
         var opening = new ManualResetEventSlim(false);
         var release = new ManualResetEventSlim(false);
         int closes = 0;
-        var pipe = new PipeSensorClient(PipeName(), trustedOwners: new[] { Me });
+        var pipe = new PipeSensorClient(PipeName(), trustedOwners: TestPipes.Own);
         var hub = new SensorHub(pipe, () =>
         {
             opening.Set();
@@ -381,7 +381,7 @@ public class SensorFeedTests
     public async Task The_hub_tries_its_local_sensors_again_after_they_fail_to_open()
     {
         int opens = 0;
-        var pipe = new PipeSensorClient(PipeName(), trustedOwners: new[] { Me });   // no service
+        var pipe = new PipeSensorClient(PipeName(), trustedOwners: TestPipes.Own);   // no service
         using var hub = new SensorHub(pipe, () =>
         {
             if (Interlocked.Increment(ref opens) == 1) throw new InvalidOperationException("driver busy");

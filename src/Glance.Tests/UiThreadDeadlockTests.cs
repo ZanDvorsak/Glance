@@ -126,7 +126,7 @@ public sealed class UiThreadDeadlockTests : IDisposable
     {
         StartServer();
         RemoteFrameDisplay? display = null;
-        var o = UiLikeContext.Run(() => display = RemoteFrameDisplay.Connect(_pipe, new[] { Me }, connectTimeoutMs: 3000), Watchdog);
+        var o = UiLikeContext.Run(() => display = RemoteFrameDisplay.Connect(_pipe, TestPipes.Own, connectTimeoutMs: 3000), Watchdog);
         if (display is not null) _cleanup.Add(display);
 
         AssertNoDeadlock(o, "RemoteFrameDisplay.Connect (Hello)");
@@ -142,7 +142,7 @@ public sealed class UiThreadDeadlockTests : IDisposable
         StartServer();
         DisplayPusher? pusher = null;
         var o = UiLikeContext.Run(() => pusher = new DisplayPusher(() => Theme.CreateDefault(null), new FakeSource(Array.Empty<SensorInfo>()), 4,
-            DisplayConnector.Open(_pipe, new[] { Me }, () => throw new InvalidOperationException("must not fall back to USB"))), Watchdog);
+            DisplayConnector.Open(_pipe, TestPipes.Own, () => throw new InvalidOperationException("must not fall back to USB"))), Watchdog);
 
         AssertNoDeadlock(o, "Opening the display through the service");
         Assert.Null(o.Error);
@@ -161,7 +161,7 @@ public sealed class UiThreadDeadlockTests : IDisposable
     {
         // the editor's brightness slider and "turn the display off" run on its UI thread with a connection opened earlier
         StartServer();
-        var display = RemoteFrameDisplay.Connect(_pipe, new[] { Me }, connectTimeoutMs: 3000);
+        var display = RemoteFrameDisplay.Connect(_pipe, TestPipes.Own, connectTimeoutMs: 3000);
         _cleanup.Add(display);
         var o = UiLikeContext.Run(() =>
         {
@@ -180,7 +180,7 @@ public sealed class UiThreadDeadlockTests : IDisposable
     {
         StartServer();
         string? status = null;
-        var o = UiLikeContext.Run(() => status = RemoteFrameDisplay.QueryStatus(_pipe, new[] { Me }, 3000), Watchdog);
+        var o = UiLikeContext.Run(() => status = RemoteFrameDisplay.QueryStatus(_pipe, TestPipes.Own, 3000), Watchdog);
         AssertNoDeadlock(o, "RemoteFrameDisplay.QueryStatus");
         Assert.NotNull(status);
     }
@@ -189,7 +189,7 @@ public sealed class UiThreadDeadlockTests : IDisposable
     public void A_service_that_never_answers_times_out_on_a_UI_thread_instead_of_hanging_for_ever()
     {
         StartSilentServer();
-        var o = UiLikeContext.Run(() => RemoteFrameDisplay.Connect(_pipe, new[] { Me }, connectTimeoutMs: 3000, replyTimeout: TimeSpan.FromSeconds(1)), Watchdog);
+        var o = UiLikeContext.Run(() => RemoteFrameDisplay.Connect(_pipe, TestPipes.Own, connectTimeoutMs: 3000, replyTimeout: TimeSpan.FromSeconds(1)), Watchdog);
 
         AssertNoDeadlock(o, "The reply timeout");
         var io = Assert.IsAssignableFrom<IOException>(o.Error);
@@ -202,7 +202,7 @@ public sealed class UiThreadDeadlockTests : IDisposable
     {
         StartSilentServer();
         var sw = Stopwatch.StartNew();
-        var ex = Assert.ThrowsAny<IOException>(() => RemoteFrameDisplay.Connect(_pipe, new[] { Me }, connectTimeoutMs: 3000, replyTimeout: TimeSpan.FromSeconds(1)));
+        var ex = Assert.ThrowsAny<IOException>(() => RemoteFrameDisplay.Connect(_pipe, TestPipes.Own, connectTimeoutMs: 3000, replyTimeout: TimeSpan.FromSeconds(1)));
         Assert.Contains("did not answer in time", ex.Message);
         Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"took {sw.Elapsed.TotalSeconds:0.0} s for a 1 s reply timeout");
     }

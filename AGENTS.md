@@ -239,7 +239,7 @@ dotnet test src/Glance.Tests -c Release      # ~610 tests, about 15 seconds, no 
   `TestSupport.cs` has `Fake.Typical()` (a realistic LibreHardwareMonitor-style sensor list) and helpers to render a theme to a bitmap.
 - Tests never use the real pipe names (`SensorPipeServer`, `PipeSensorClient`, `DisplayServer`, `RemoteFrameDisplay` and `ControlPipeClient` take a
   name) so they cannot collide with a running service or tray app. `DisplayServiceTests` runs the display server and client over real pipes with
-  `FakeDisplay`, fake session lookups and a fake clock; the server then runs as the test user, so tests pass that user as the trusted pipe owner.
+  `FakeDisplay`, fake session lookups and a fake clock; the test servers run as the test process, so tests trust the owner Windows gives their own pipes (`TestPipes.Own` = the token's default owner, `TokenOwner`: the user, or Administrators when elevated as on GitHub's CI), and a server that plays a squatter names the user as owner (`TestPipes.UserOwned`); see `docs/design/fix-elevated-pipe-owner.md`.
 - **Not testable here (needs an installed service):** the service entry (`NativeService`), its real start before sign-in, PRESHUTDOWN timing,
   the installer's `sc.exe` steps, upgrade from 0.1.1. `ServiceLayoutTests` only check that the installer text matches the tested rules.
 - CI (`.github/workflows/ci.yml`) builds the solution and runs the tests on every push.

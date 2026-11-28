@@ -48,7 +48,7 @@ public sealed class UiThreadAuditTests : IDisposable
     }
 
     private DisplayPusher OpenThroughService() => new(() => Theme.CreateDefault(null), new FakeSource(Array.Empty<SensorInfo>()), 4,
-        DisplayConnector.Open(_pipe, new[] { Me }, () => throw new InvalidOperationException("must not fall back to USB")), Quick);
+        DisplayConnector.Open(_pipe, TestPipes.Own, () => throw new InvalidOperationException("must not fall back to USB")), Quick);
 
     private static void AssertReturned(UiLikeContext.Outcome o, string what)
     {
@@ -157,7 +157,7 @@ public sealed class UiThreadAuditTests : IDisposable
     {
         StartServer();
         _clientSession = ThisSession + 1;   // not the console session
-        for (int i = 0; i < 3; i++) Assert.Throws<DisplayServiceException>(() => RemoteFrameDisplay.Connect(_pipe, new[] { Me }, 3000));
+        for (int i = 0; i < 3; i++) Assert.Throws<DisplayServiceException>(() => RemoteFrameDisplay.Connect(_pipe, TestPipes.Own, 3000));
         var refused = LogLines.Where(l => l.StartsWith("Refused Hello from session " + (ThisSession + 1))).ToList();
         Assert.Single(refused);
         Assert.Contains("console", refused[0]);
@@ -168,7 +168,7 @@ public sealed class UiThreadAuditTests : IDisposable
     {
         _device = () => throw new IOException("No display found (USB 1908:0102).");
         StartServer();
-        using var c = RemoteFrameDisplay.Connect(_pipe, new[] { Me }, 3000);
+        using var c = RemoteFrameDisplay.Connect(_pipe, TestPipes.Own, 3000);
         for (int i = 0; i < 3; i++)
             Assert.Throws<DisplayServiceException>(() => c.Blit(0, 0, 480, 320, new byte[DisplayWire.FrameBytes]));
         var lines = LogLines.Where(l => l.StartsWith($"Could not open the display for session {ThisSession}")).ToList();

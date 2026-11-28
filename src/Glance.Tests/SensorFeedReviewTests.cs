@@ -123,7 +123,7 @@ public class SensorFeedReviewTests
                 try { await Task.Delay(200, stop.Token); } catch (OperationCanceledException) { return; }
             }
         });
-        var pipe = new PipeSensorClient(name, staleAfter: TimeSpan.FromMilliseconds(1500), trustedOwners: new[] { Me });
+        var pipe = new PipeSensorClient(name, staleAfter: TimeSpan.FromMilliseconds(1500), trustedOwners: TestPipes.Own);
         Assert.True(await Eventually(() => pipe.HasData, 6000), "the service's feed never arrived");
         int opens = 0;
         using var hub = new SensorHub(pipe, () => { Interlocked.Increment(ref opens); return new SensorService(() => new[] { Device("local", "/local", 2f) }); },
@@ -178,7 +178,7 @@ public class SensorFeedReviewTests
         var hw = Device("cpu", "/cpu", 1f);
         hw.OnUpdate = () => release.Wait(15000);   // a slow local update while the user closes the editor
         bool closedDuring = false; int closes = 0;
-        var pipe = new PipeSensorClient(PipeName(), trustedOwners: new[] { Me });   // no service
+        var pipe = new PipeSensorClient(PipeName(), trustedOwners: TestPipes.Own);   // no service
         var hub = new SensorHub(pipe, () => new SensorService(() => new[] { hw }, () => { if (hw.Inside) closedDuring = true; Interlocked.Increment(ref closes); }),
             NoDrives, TimeSpan.FromMilliseconds(50));
         Assert.True(await Eventually(() => hw.Inside, 4000), "the hub never started reading its local sensors");
