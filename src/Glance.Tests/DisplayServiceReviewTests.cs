@@ -45,7 +45,7 @@ public sealed partial class DisplayServiceTests
 
         Assert.True(await Eventually(() => { lock (log) return log.Any(l => l.Contains("taken")); }, 4000), "the squatted sensor pipe was not reported");
         squatter.Dispose();
-        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromSeconds(3), trustedOwners: new[] { Me });
+        using var client = new PipeSensorClient(name, staleAfter: TimeSpan.FromSeconds(3), trustedOwners: TestPipes.Own);
         Assert.True(await Eventually(() => client.HasData, 8000), "the sensor pipe was not served after the squatter left");
     }
 
@@ -77,7 +77,7 @@ public sealed partial class DisplayServiceTests
             }
             _clientSession = ThisSession;
             var sw = Stopwatch.StartNew();
-            var display = RemoteFrameDisplay.Connect(_pipe, new[] { Me }, connectTimeoutMs: 2000);
+            var display = RemoteFrameDisplay.Connect(_pipe, TestPipes.Own, connectTimeoutMs: 2000);
             _cleanup.Add(display);
             display.Blit(0, 0, 480, 320, Frame(1));
             Assert.True(sw.ElapsedMilliseconds < 2500, $"the console user waited {sw.ElapsedMilliseconds} ms");
@@ -182,7 +182,7 @@ public sealed partial class DisplayServiceTests
     public void L3_an_installed_service_that_does_not_answer_yet_is_waited_for_not_bypassed()
     {
         int usb = 0;
-        var ex = Assert.ThrowsAny<IOException>(() => DisplayConnector.Open(_pipe, new[] { Me }, () => { usb++; return new FakeDisplay(480, 320); }, () => ServiceState.Running));
+        var ex = Assert.ThrowsAny<IOException>(() => DisplayConnector.Open(_pipe, TestPipes.Own, () => { usb++; return new FakeDisplay(480, 320); }, () => ServiceState.Running));
         Assert.Equal(0, usb);
         Assert.Contains("service", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
@@ -193,7 +193,7 @@ public sealed partial class DisplayServiceTests
     public void L3_without_a_running_service_the_connector_opens_usb(ServiceState state)
     {
         int usb = 0;
-        using var d = DisplayConnector.Open(_pipe, new[] { Me }, () => { usb++; return new FakeDisplay(480, 320); }, () => state);
+        using var d = DisplayConnector.Open(_pipe, TestPipes.Own, () => { usb++; return new FakeDisplay(480, 320); }, () => state);
         Assert.Equal(1, usb);
     }
 

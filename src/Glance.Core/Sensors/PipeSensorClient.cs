@@ -23,7 +23,7 @@ public sealed class PipeSensorClient : ISensorSource, IDisposable
 
     private readonly IReadOnlyList<System.Security.Principal.SecurityIdentifier> _trustedOwners;
 
-    /// <param name="trustedOwners">Who may serve the pipe: default SYSTEM or Administrators (the Glance service). Tests pass the current user.</param>
+    /// <param name="trustedOwners">Who may serve the pipe: default SYSTEM or Administrators (the Glance service). Tests pass the owner of their own test pipes (TestPipes.Own).</param>
     public PipeSensorClient(string? pipeName = null, TimeSpan? staleAfter = null, IEnumerable<System.Security.Principal.SecurityIdentifier>? trustedOwners = null)
     {
         _pipeName = pipeName ?? PipeName;

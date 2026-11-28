@@ -38,12 +38,14 @@ public sealed partial class DisplayServiceTests : IDisposable
     private int Opens { get { lock (_devices) return _devices.Count; } }
     private FakeDisplay Device(int i) { lock (_devices) return _devices[i]; }
 
-    private DisplayServer StartServer(TimeSpan? idle = null, TimeSpan? idleTimeout = null)
+    /// <param name="asSquatter">Serve as a normal user's program would (owned by the user SID), also when the tests run elevated.</param>
+    private DisplayServer StartServer(TimeSpan? idle = null, TimeSpan? idleTimeout = null, bool asSquatter = false)
     {
+        var security = ServicePipeSecurity.Build(Me);
         var server = new DisplayServer(OpenFake, new DisplayServerOptions
         {
             PipeName = _pipe,
-            Security = ServicePipeSecurity.Build(Me),
+            Security = asSquatter ? TestPipes.UserOwned(security) : security,
             ClientSession = _ => _clientSession,
             ConsoleSession = () => _console,
             NowMs = () => Interlocked.Read(ref _now),
@@ -58,7 +60,7 @@ public sealed partial class DisplayServiceTests : IDisposable
 
     private RemoteFrameDisplay Connect()
     {
-        var c = RemoteFrameDisplay.Connect(_pipe, new[] { Me }, connectTimeoutMs: 3000);
+        var c = RemoteFrameDisplay.Connect(_pipe, TestPipes.Own, connectTimeoutMs: 3000);
         _cleanup.Add(c);
         return c;
     }
@@ -148,7 +150,7 @@ public sealed partial class DisplayServiceTests : IDisposable
     [Fact]
     public void A_squatted_display_pipe_is_not_used()
     {
-        StartServer();   // served by the test user, not by SYSTEM or Administrators
+        StartServer(asSquatter: true);   // served by the test user, not by SYSTEM or Administrators
         Assert.Throws<UnauthorizedAccessException>(() => RemoteFrameDisplay.Connect(_pipe, trustedOwners: null, connectTimeoutMs: 3000));
     }
 
@@ -158,7 +160,7 @@ public sealed partial class DisplayServiceTests : IDisposable
         using var silent = new NamedPipeServerStream(_pipe, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
         _ = silent.WaitForConnectionAsync();
         var sw = Stopwatch.StartNew();
-        Assert.ThrowsAny<IOException>(() => RemoteFrameDisplay.Connect(_pipe, new[] { Me }, 3000, TimeSpan.FromMilliseconds(500)));
+        Assert.ThrowsAny<IOException>(() => RemoteFrameDisplay.Connect(_pipe, TestPipes.Own, 3000, TimeSpan.FromMilliseconds(500)));
         Assert.True(sw.ElapsedMilliseconds < 4000, $"took {sw.ElapsedMilliseconds} ms");
     }
 
@@ -313,7 +315,7 @@ public sealed partial class DisplayServiceTests : IDisposable
     {
         StartServer();
         int usb = 0;
-        using var d = DisplayConnector.Open(_pipe, new[] { Me }, () => { usb++; return new FakeDisplay(480, 320); });
+        using var d = DisplayConnector.Open(_pipe, TestPipes.Own, () => { usb++; return new FakeDisplay(480, 320); });
         Assert.IsType<RemoteFrameDisplay>(d);
         Assert.Equal(0, usb);
     }
@@ -322,11 +324,11 @@ public sealed partial class DisplayServiceTests : IDisposable
     public void The_connector_opens_usb_directly_without_a_service_or_with_a_squatter()
     {
         int usb = 0;
-        using (var d = DisplayConnector.Open(_pipe, new[] { Me }, () => { usb++; return new FakeDisplay(480, 320); }))
+        using (var d = DisplayConnector.Open(_pipe, TestPipes.Own, () => { usb++; return new FakeDisplay(480, 320); }))
             Assert.IsType<FakeDisplay>(d);
         Assert.Equal(1, usb);
 
-        StartServer();   // served by the test user: with the product's trust rule it is a squatter
+        StartServer(asSquatter: true);   // served by the test user: with the product's trust rule it is a squatter
         using (var d = DisplayConnector.Open(_pipe, null, () => { usb++; return new FakeDisplay(480, 320); }))
             Assert.IsType<FakeDisplay>(d);
         Assert.Equal(2, usb);
@@ -338,7 +340,7 @@ public sealed partial class DisplayServiceTests : IDisposable
         StartServer();
         _clientSession = ThisSession + 1;
         int usb = 0;
-        var ex = Assert.Throws<DisplayServiceException>(() => DisplayConnector.Open(_pipe, new[] { Me }, () => { usb++; return new FakeDisplay(480, 320); }));
+        var ex = Assert.Throws<DisplayServiceException>(() => DisplayConnector.Open(_pipe, TestPipes.Own, () => { usb++; return new FakeDisplay(480, 320); }));
         Assert.True(ex.Denied);
         Assert.Equal(0, usb);
     }
@@ -380,7 +382,7 @@ public sealed partial class DisplayServiceTests : IDisposable
     [Fact]
     public async Task A_squatter_on_the_display_pipe_cannot_act_as_the_user()
     {
-        var actedAs = await ImpersonateFirstClient(() => RemoteFrameDisplay.Connect(_pipe, new[] { Me }, 3000, TimeSpan.FromSeconds(1)), DisplayWire.HeaderBytes);
+        var actedAs = await ImpersonateFirstClient(() => RemoteFrameDisplay.Connect(_pipe, TestPipes.Own, 3000, TimeSpan.FromSeconds(1)), DisplayWire.HeaderBytes);
         Assert.NotEqual(Me.Value, actedAs);
     }
 
@@ -397,12 +399,12 @@ public sealed partial class DisplayServiceTests : IDisposable
     public async Task The_sensor_client_ignores_a_feed_that_is_not_served_by_the_service()
     {
         var name = "glance-test-" + Guid.NewGuid().ToString("N");
-        using var server = new SensorPipeServer(name, ServicePipeSecurity.Build(Me));
+        using var server = new SensorPipeServer(name, TestPipes.UserOwned(ServicePipeSecurity.Build(Me)));   // a normal user's feed, also when elevated
         server.Start();
         server.Publish(new[] { new SensorInfo("/a", "hw", "A", "Load", 1, "%") });
 
         using var squatted = new PipeSensorClient(name, staleAfter: TimeSpan.FromSeconds(2));   // trusts only SYSTEM/Administrators
-        using var trusting = new PipeSensorClient(name, staleAfter: TimeSpan.FromSeconds(2), trustedOwners: new[] { Me });
+        using var trusting = new PipeSensorClient(name, staleAfter: TimeSpan.FromSeconds(2), trustedOwners: new[] { TestPipes.User });
         var until = Environment.TickCount64 + 6000;
         while (!trusting.HasData && Environment.TickCount64 < until) await Task.Delay(50);
         Assert.True(trusting.HasData, "the trusting client never got data, so the test proves nothing");
